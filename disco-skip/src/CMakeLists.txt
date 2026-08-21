@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.9)
-project(chimera CXX)
+project(disco-skip CXX)
 
 # 1. Macro Toggles (1 to Enable, 0 to Disable)
 set(CHIMERA_CACHE_ENABLED 1)
@@ -22,6 +22,6 @@ endif()
 include(${CMAKE_BINARY_DIR}/setup.cmake)
 dory_setup_cmake()
 
-add_executable(chimera ${HEADER_TIDER} main.cpp)
+add_executable(disco-skip ${HEADER_TIDER} main.cpp)
 
-target_link_libraries(chimera ${CONAN_LIBS})
+target_link_libraries(disco-skip ${CONAN_LIBS})
