@@ -52,13 +52,49 @@ class skipvector {
   /// TARGET_IDX_RATIO, we use 2 when a special value is provided.
   static constexpr size_t TARGET_DATA_RATIO = exp_to_ratio(DATA_EXP);
 
+  using addr_t = uint64_t;
+
   /// node_t is used for both the data layer and the index layer(s)
-  template <typename T, int64_t EXP,
-            template <typename, typename, size_t> typename VEC>
   struct node_t : public hp_deletable {
     /// A lock to protect this node.  sv_lock is a sequence lock with a
     /// few stolen bits
     sv_lock lock;
+
+    /// Identifies the remote node this local node mirrors
+    const addr_t remote_addr; // todo: do I want to store struct ver too to detect when structural changes occur? or unnec.?
+
+    /// A pointer to the next node in this layer.
+    rlx_atomic<node_t *> next;
+
+    /// Default constructor; creates node as orphan. This constructor is only
+    /// ever used to create leftmost nodes, which are always orphans.
+    node_t(uint64_t r_addr) :
+            remote_addr(r_addr), lock(true), v(), next(nullptr) {}
+    /// Constructor; creates node, and stitches it in after prev.
+    /// Requires that prev is locked.
+    node_t(node_t *prev, bool orphan, uint64_t r_addr) :
+            remote_addr(r_addr), lock(orphan), v(), next(prev->next.load()) {
+      prev->next = this;
+    }
+
+    ~node_t() override = default;
+
+    /// Sequential code for checking if a node is an orphan
+    ///
+    /// NB: Concurrent methods should read the orphan bit from the seqlock
+    [[nodiscard]] bool is_orphan_seq() const {
+      return sv_lock::is_orphan(lock.get_value());
+    }
+
+    void dump() const {
+      lock.dump();
+      v.dump();
+    }
+  };
+
+  template <typename T, int64_t EXP,
+            template <typename, typename, size_t> typename VEC>
+  struct index_node_t : public node_t {
 
     static constexpr size_t get_vector_size() {
       static_assert(EXP <= 64);
@@ -74,28 +110,17 @@ class skipvector {
     /// A vector of key/value pairs.
     VEC<K, T, get_vector_size()> v;
 
-    /// A pointer to the next node in this layer.
-    rlx_atomic<node_t *> next;
-
-    /// Remote metadata
-    const uint64_t remote_addr;     // identifies the remote node this local node mirrors
-    uint32_t cached_struct_ver;     // protected by sv_lock
-    uint32_t cached_content_ver;    // protected by sv_lock
-
     /// Default constructor; creates node as orphan. This constructor is only
     /// ever used to create leftmost nodes, which are always orphans.
-    node_t(uint64_t r_addr, uint32_t s_ver, uint32_t c_ver) :
-            remote_addr(r_addr), lock(true), v(), next(nullptr),
-            cached_struct_ver(s_ver), cached_content_ver(c_ver) {}
+    index_node_t(uint64_t r_addr) : node_t(r_addr) {}
+    
     /// Constructor; creates node, and stitches it in after prev.
     /// Requires that prev is locked.
-    node_t(node_t *prev, bool orphan, uint64_t r_addr, uint32_t s_ver, uint32_t c_ver)
-        : remote_addr(r_addr), lock(orphan), v(), next(prev->next.load()),
-          cached_struct_ver(s_ver), cached_content_ver(c_ver) {
+    index_node_t(node_t *prev, bool orphan, uint64_t r_addr) : node_t(prev, orphan, r_addr) {
       prev->next = this;
     }
 
-    ~node_t() override = default;
+    ~index_node_t() override = default;
 
     /// Checks to see if this node's successor should be merged into it.
     /// This is the case if next is an orphan and the sum of the sizes is under
@@ -155,54 +180,63 @@ class skipvector {
       return result;
     }
 
-    /// Sequential code for checking if a node is an orphan
-    ///
-    /// NB: Concurrent methods should read the orphan bit from the seqlock
-    [[nodiscard]] bool is_orphan_seq() const {
-      return sv_lock::is_orphan(lock.get_value());
-    }
-
-    void dump() const {
-      lock.dump();
-      v.dump();
-    }
   };
 
-  /// Used to communicate descent-time state from the cache to the orchestrator,
-  /// and back to the cache during mirror updates
-  struct prev_info {
-    uint64_t remote_addr;        // remote node this level's target maps to
-    uint32_t cached_struct_ver;  // versions observed at gather time
-    uint32_t cached_content_ver;
+  struct data_node_t : public node_t {
+    /// Minimum key stored in this data node
+    K k_min; // todo: const?
+
+    /// Default constructor; creates node as orphan. This constructor is only
+    /// ever used to create leftmost nodes, which are always orphans.
+    data_node_t(uint64_t r_addr, K k_min_) : node_t(r_addr), k_min(k_min_) {}
+
+    /// Constructor; creates node, and stitches it in after prev.
+    /// Requires that prev is locked.
+    data_node_t(node_t *prev, bool orphan, uint64_t r_addr, K k_min_) : node_t(prev, orphan, r_addr), k_min(k_min_) {
+      prev->next = this;
+    }
+
+    ~data_node_t() override = default;
+
+    /// Merge the next node into this node, and unlink next node
+    ///
+    /// NB: The caller is expected to handle reclamation of unlinked node
+    void merge() {
+      node_t *zombie = next;
+      next = zombie->next.load();
+      zombie->lock.die();
+    }
   };
 
   /// Represents fresh remote state that the orchestrator has observed and wants the cache to install
   /// Used by refresh and structural-update calls.
+  template <int64_t EXP, template <typename, typename, size_t> typename VEC>
   struct remote_node_snapshot {
-    uint64_t remote_addr;
-    uint32_t struct_ver;
-    uint32_t content_ver;
-    K k_min;
-    uint64_t next_remote_addr;  // remote address of the sibling
-    // Contents of the vector (for cache to install)
-    std::vector<std::pair<K, uint64_t>> entries;  // (key, down_addr) // TODO: should this be the type of one of the vector classes provided, or "converted" to that later?
-  };
+    static constexpr size_t get_vector_size() {
+      static_assert(EXP <= 64);
+      if (EXP > 0) {
+        // General case: choose a size that can hold 2 * 2^EXP elements.
+        return 2 << EXP;
+      } else {
+        // Special case: if EXP <= 0, set the capacity to 1.
+        return 1;
+      }
+    }
 
-  /// Used to indicate to orchestrator where remote data node for k lies
-  struct locate_result {
-    uint64_t remote_addr;
-    uint32_t cached_struct_ver;
-    uint32_t cached_content_ver;
+    addr_t remote_addr;
+    K k_min;
+    addr_t next_remote_addr;  // remote address of the sibling
+    // Contents of the vector (for cache to install)
+    VEC<K, addr_t, get_vector_size()> entries;  // (key, down_addr) // TODO: should this be the type of one of the vector classes provided, or "converted" to that later?
   };
 
   /// type of index nodes.  Since an index node can reference either another
   /// index node, or a data node, we use a generic void*.  Thus the map holds
   /// K/ptr pairs
-  using index_t = node_t<void *, IDX_EXP, IDX_VEC>;
+  using index_t = index_node_t<void *, IDX_EXP, IDX_VEC>;
 
   /// type of data nodes.  A data node's vector holds k/v pairs
-  using data_t = node_t<V, DATA_EXP, DATA_VEC>;
-  using data_t = node_t<uint64_t, DATA_EXP, DATA_VEC>;
+  using data_t = data_node_t;
 
   /// The threshold at which to merge chunks of the skipvector
   const double merge_threshold;
@@ -363,6 +397,52 @@ class skipvector {
       // At this point we know that we have a nonempty next.
       if (k < next->v.first()) {
         // Next's first element is after k, so we have ruled out next.
+        // Now we just need to check its sequence lock.
+        // Return true if the check succeeds, false if it fails.
+        bool const result = next->lock.confirm_read(next_lock);
+        HP::drop_next();
+        return result;
+      }
+
+      // Next's first element is before (or equal to) the sought key,
+      // so we to go to next and repeat from there. We're done with curr,
+      // so we just need to confirm its sequence lock hasn't changed.
+      if (!curr->lock.confirm_read(curr_lock)) {
+        HP::drop_next();
+        return false;
+      }
+
+      curr = next;
+      curr_lock = next_lock;
+      next = curr->next;
+      HP::drop_curr();
+    }
+
+    // We ruled out next, so return true.
+    return true;
+  }
+
+  template <typename T>
+  bool check_next_dl(T *&curr, uint64_t &curr_lock, K const &k) {
+    // The fastest way out of this loop is when next is nullptr or curr's last
+    // element is >= k.  Finding these early avoids taking a hazard pointer on
+    // next or reading its seqlock.  If the /while/ condition fails, we will
+    // return true.
+    T *next = curr->next;
+    K last = k;
+    while (next != nullptr) { // todo - why would next ever be a nullptr?
+      // Take a hazard pointer on next, then make sure curr hasn't changed
+      HP::take_next(next);
+      if (!curr->lock.confirm_read(curr_lock)) {
+        HP::drop_next();
+        return false;
+      }
+
+      uint64_t next_lock = next->lock.begin_read();
+
+      // At this point we know that we have a nonempty next.
+      if (k < next->k_min) {
+        // Next's min element is after k, so we have ruled out next.
         // Now we just need to check its sequence lock.
         // Return true if the check succeeds, false if it fails.
         bool const result = next->lock.confirm_read(next_lock);
@@ -560,9 +640,10 @@ public:
   static void tear_down() { HP::tear_down(); }
 
   /// Search for a key in the skipvector
-  /// Returns true if found, false if not found
-  /// "val" parameter is used to pass back the value if found
-  bool locate_data(K const &k) {
+  /// Returns remote address of node which may contain k
+  addr_t locate_data(K const &k) {
+    // TODO: once figure out merging, update check_next()
+
     init_context(); // hazard pointers
 
   top:
@@ -596,7 +677,7 @@ public:
     }
 
     // Finally, read the data layer.
-    if (!check_next<false>(curr_dl, curr_lock, k)) {
+    if (!check_next_dl(curr_dl, curr_lock, k)) {
       HP::drop_curr();
       goto top;
     }
@@ -608,8 +689,7 @@ public:
     // This scenario would yield the somewhat undesirable result that this
     // method returns false but overwrites v with an outdated value.
     // To prevent this, we use a temporary intermediate variable, tmp.
-    V tmp = v;
-    bool const result = curr_dl->v.contains(k, tmp); // todo: add simd vectorization here
+    addr_t const r_addr = curr_dl->remote_addr;
 
     // Confirm curr's sequence lock.
     if (!curr_dl->lock.confirm_read(curr_lock)) {
@@ -619,10 +699,71 @@ public:
 
     HP::drop_curr();
 
-    if (result)
-      v = tmp;
+    return r_addr;
+  }
 
-    return result;
+  /// Gather prev info for every level <= height
+  bool gather_prevs(K const &k, uint32_t const height, addr_t*& prev_addrs) {
+
+    init_context(); // hazard pointers
+
+  top:
+    // Start from the head node (leftmost node in topmost layer.)
+    int layer = layers - 1;
+    index_t *curr = &(index_head.at(layer));
+
+    // Read head node's sequence lock.
+    HP::take_first(curr);
+    uint64_t curr_lock = curr->lock.begin_read();
+
+    // Skip through all index layers but the last.
+    for (; layer >= 1; --layer) {
+      // If follow() doesn't find a suitable down pointer,
+      // default to next index layer's head.
+      index_t *down = &index_head.at(layer - 1);
+      if (!follow(curr, curr_lock, k, down)) {
+        // Sequence lock check failed
+        HP::drop_curr();
+        goto top;
+      }
+      curr = down;
+      if (layer <= height) {
+        prev_addrs[]
+      }
+    }
+
+    // Skip through the last index layer.
+    data_t *curr_dl = &data_head;
+    if (!follow(curr, curr_lock, k, curr_dl)) {
+      // Sequence lock check failed
+      HP::drop_curr();
+      goto top;
+    }
+
+    // Finally, read the data layer.
+    if (!check_next_dl(curr_dl, curr_lock, k)) {
+      HP::drop_curr();
+      goto top;
+    }
+
+    // Scan curr_dl for the sought value.
+    // NB: There is a chance that this contains() will find a value,
+    // but the final sequence lock checks will fail, making us start over,
+    // and the element will be gone by the time we get back here.
+    // This scenario would yield the somewhat undesirable result that this
+    // method returns false but overwrites v with an outdated value.
+    // To prevent this, we use a temporary intermediate variable, tmp.
+    addr_t const r_addr = curr_dl->remote_addr;
+
+    // Confirm curr's sequence lock.
+    if (!curr_dl->lock.confirm_read(curr_lock)) {
+      HP::drop_curr();
+      goto top;
+    }
+
+    HP::drop_curr();
+
+    return r_addr;
   }
 
   /// Insert a new element into the map
