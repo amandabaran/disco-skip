@@ -290,7 +290,7 @@ deps_export_dir = os.path.join(current_dir, ".deps", "exports")
 if not os.path.exists(deps_export_dir):
     os.makedirs(deps_export_dir, exist_ok=True)
     os.makedirs(os.path.join(current_dir, ".deps", "gcc", "relwithdebinfo"), exist_ok=True)
-    tracked_libs = ["conn", "ctrl", "shared", "memory", "special", "memstore", "extern", "third-party", "swarm-kv", "fusee", "chimera"]
+    tracked_libs = ["conn", "ctrl", "shared", "memory", "special", "memstore", "extern", "third-party", "swarm-kv", "fusee", "chimera", "disco-skip"]
     for lib in tracked_libs:
         open(os.path.join(deps_export_dir, f"{lib}.conanbuild"), 'a').close()
 

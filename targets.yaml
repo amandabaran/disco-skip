@@ -11,5 +11,4 @@ conn : [ctrl, memstore]
 
 fusee : [conn]
 swarm-kv : [conn]
-chimera : [conn]
 disco-skip : [conn]
