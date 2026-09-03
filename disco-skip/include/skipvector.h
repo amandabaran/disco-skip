@@ -23,14 +23,14 @@
 /// skipvector lazily merges orphans and uses non-resizable vectors.
 ///
 /// Template Parameters:
-/// @param K          - The type of the key for k/v pairs.
-/// @param V          - The type of the value for k/v pairs.
-/// @param IDX_VEC    - A vector type that can hold pairs for the index layer.
-/// @param DATA_VEC   - A vector type that can hold pairs for the data layer.
-/// @param IDX_EXP    - The log_2 of the target chunk size for index vectors.
-/// @param DATA_EXP   - The log_2 of the target chunk size for data vectors.
-/// @param MAX_LAYERS - The maximum number of index layers.
-/// @param HP         - The class responsible for managing hazard pointers.
+/// @param K           - The type of the key for k/v pairs.
+/// @param V           - The type of the value for k/v pairs.
+/// @param IDX_VEC     - A vector type that can hold pairs for the index layer.
+/// @param DATA_VEC    - A vector type that can hold pairs for the data layer.
+/// @param IDX_EXP     - The log_2 of the target chunk size for index vectors.
+/// @param DATA_EXP    - The log_2 of the target chunk size for data vectors.
+/// @param MAX_LAYERS  - The maximum number of index layers.
+/// @param HP          - The class responsible for managing hazard pointers.
 template <typename K, typename V,
           template <typename, typename, size_t> typename IDX_VEC,
           template <typename, typename, size_t> typename DATA_VEC,
@@ -377,6 +377,8 @@ class skipvector {
       next = curr->next;
     }
   }
+
+
 
   /// Given a node /curr/ that is read locked, give up that lock, and replace it
   /// with a read lock on new_node.  Also drops HP on curr, takes HP on new_node
@@ -756,6 +758,8 @@ public:
       HP::drop_curr();
       return result;
     }
+
+    //! HERE Aug 26, 2026 //!
 
     // Generated height is at least 1, so we need to partition the data node.
     // First we must manually check if the key is present in the data node.
