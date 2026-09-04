@@ -1,10 +1,10 @@
-// test_mirror_insert.cc
+// test.cc
 //
 // A concurrent test for the skipvector local cache's mirror_insert API.
 // Spawns N threads, each performing a configurable number of mirror_insert
 // operations with random keys and heights, then verifies invariants.
 //
-// Usage: ./test_mirror_insert [num_threads] [ops_per_thread] [key_range] [max_height]
+// Usage: ./test [num_threads] [ops_per_thread] [key_range] [num_layers]
 
 #include <atomic>
 #include <cassert>
@@ -35,16 +35,19 @@ struct test_config {
   size_t num_threads   = 4;
   size_t ops_per_thread = 10000;
   uint64_t key_range   = 100000;
-  int max_height       = 4;
-  unsigned base_seed   = 42;
+  int num_layers       = 4;
+  unsigned base_seed   = std::random_device{}();;
 };
+
+size_t const MAX_LAYERS = 8;
+size_t const IDX_EXP = 3; // 2^3 = 8 (capacity 16)
 
 static test_config parse_args(int argc, char** argv) {
   test_config cfg;
   if (argc > 1) cfg.num_threads    = std::stoul(argv[1]);
   if (argc > 2) cfg.ops_per_thread = std::stoul(argv[2]);
   if (argc > 3) cfg.key_range      = std::stoull(argv[3]);
-  if (argc > 4) cfg.max_height     = std::stoi(argv[4]);
+  if (argc > 4) cfg.num_layers     = std::stoi(argv[4]);
   return cfg;
 }
 
@@ -84,8 +87,8 @@ using ValueType = uint64_t;  // unused since values live remotely, but the templ
 //
 using SkipVec = skipvector<KeyType, ValueType, mock_remote_addr,
                            vector_sfra, vector_umfra,
-                           /*IDX_EXP=*/5, /*DATA_EXP=*/5,
-                           /*MAX_LAYERS=*/8, /*HP=*/hp_manager<MAX_THREADS>>;
+                           /*IDX_EXP=*/IDX_EXP, /*DATA_EXP=*/IDX_EXP,
+                           /*MAX_LAYERS=*/MAX_LAYERS, /*HP=*/hp_manager<MAX_THREADS>>;
 
 // For this test file, we assume SkipVec is defined. Fill in the type alias
 // according to your project.
@@ -94,16 +97,16 @@ using SkipVec = skipvector<KeyType, ValueType, mock_remote_addr,
 // Height generation
 // ============================================================================
 
-// Geometric distribution height, capped at max_height.
+// Geometric distribution height, capped at num_layers.
 // P(height=0) = 1 - 1/T
 // P(height=h) = (1/T)^h * (1 - 1/T)
-static int random_height(std::mt19937_64& rng, int max_height) {
-  // Simple: uniform 0..max_height with bias toward 0.
+static int random_height(std::mt19937_64& rng, int num_layers) {
+  // Simple: uniform 0..num_layers with bias toward 0.
   // For a real test, use a geometric distribution matching your skipvector's
   // TARGET_DATA_RATIO / TARGET_IDX_RATIO.
   std::uniform_real_distribution<double> uniform(0.0, 1.0);
   int h = 0;
-  while (h < max_height && uniform(rng) < 0.25) {
+  while (h < num_layers && uniform(rng) < 0.25) {
     ++h;
   }
   return h;
@@ -126,14 +129,14 @@ static void worker(SkipVec* sv, test_config cfg, unsigned thread_id,
 
   for (size_t i = 0; i < cfg.ops_per_thread; ++i) {
     KeyType k = key_dist(rng);
-    int height = random_height(rng, cfg.max_height);
+    int height = random_height(rng, cfg.num_layers);
 
     // Fabricate the "remote result" that would normally come from the remote
     // layer. In this test, we allocate fresh addresses for each new node that
     // mirror_insert will install.
 
     mock_remote_addr new_remote_data_addr = fresh_addr();
-    std::array<mock_remote_addr, /*MAX_LAYERS+1=*/16> new_remote_index_addrs{};
+    std::array<mock_remote_addr, /*MAX_LAYERS+1=*/MAX_LAYERS> new_remote_index_addrs{};
 
     // For levels 0..height-2, a new remote index node is created (split-at-K).
     // For level height-1 (top), an orphan address is provided only if the top
@@ -150,8 +153,11 @@ static void worker(SkipVec* sv, test_config cfg, unsigned thread_id,
     // Skip if height is 0 (no mirror update needed).
     if (height == 0) continue;
 
+    std::cout << "Inserting " << k << " to level " << height << "\n";
+
     // Call the API under test.
     sv->mirror_insert(k, height, new_remote_data_addr, new_remote_index_addrs);
+    std::cout << "Done.\n";
     stats->inserts_succeeded++;
   }
 }
@@ -167,7 +173,7 @@ int main(int argc, char** argv) {
             << "  threads:        " << cfg.num_threads << "\n"
             << "  ops per thread: " << cfg.ops_per_thread << "\n"
             << "  key range:      " << cfg.key_range << "\n"
-            << "  max height:     " << cfg.max_height << "\n"
+            << "  max height:     " << cfg.num_layers << "\n"
             << "  base seed:      " << cfg.base_seed << "\n\n";
 
   // Construct the skipvector. The constructor signature you have takes a
@@ -181,12 +187,12 @@ int main(int argc, char** argv) {
   //
   // Fill in as appropriate.
 
-  config cfg = config("bench", "skipvector tests *with iteration*",
+  config cfg_sv = config("bench", "skipvector tests *with iteration*",
                       {"normal"}, "");
-  cfg.merge_threshold = 1.0;
-  cfg.layers = cfg.max_height;
+  cfg_sv.merge_threshold = 1.0;
+  cfg_sv.layers = cfg.num_layers;
 
-  SkipVec sv(&cfg);
+  SkipVec sv(&cfg_sv);
 
   std::vector<thread_stats> stats(cfg.num_threads);
   std::vector<std::thread> threads;
@@ -204,7 +210,11 @@ int main(int argc, char** argv) {
   auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                         end - start).count();
 
+  std::cout << "Verifying index...\n";
   sv.verify();
+  std::cout << "Done verifying index.\n\n";
+
+  sv.verbose_analysis();
 
   // Aggregate stats.
   size_t total_attempted = 0;
@@ -227,7 +237,7 @@ int main(int argc, char** argv) {
             << " ops/sec\n\n";
 
   std::cout << "Height distribution:\n";
-  for (int h = 0; h <= cfg.max_height; ++h) {
+  for (int h = 0; h <= cfg.num_layers; ++h) {
     std::cout << "  height " << h << ": " << height_totals[h] << "\n";
   }
 

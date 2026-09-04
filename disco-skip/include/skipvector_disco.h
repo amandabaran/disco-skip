@@ -71,6 +71,17 @@ class skipvector {
     /// Minimum key stored in this data node
     K k_min; // todo: const? //! should I even have this field still?
 
+    static constexpr size_t get_vector_size() {
+      static_assert(EXP <= 64);
+      if (EXP > 0) {
+        // General case: choose a size that can hold 2 * 2^EXP elements.
+        return 2 << EXP;
+      } else {
+        // Special case: if EXP <= 0, set the capacity to 1.
+        return 1;
+      }
+    }
+
     /// A vector of key/value pairs.
     VEC<K, T, get_vector_size()> v;
 
@@ -105,7 +116,7 @@ class skipvector {
       if (!next_is_orphan)
         return false;
 
-      int const nextsize = static_cast<index_node_t*>(next)->v.get_size();
+      int const nextsize = static_cast<index_t*>(next)->v.get_size();
 
       if (nextsize == 0)
         // If next is totally empty, always merge.
@@ -127,7 +138,7 @@ class skipvector {
     ///
     /// NB: The caller is expected to handle reclamation of unlinked node
     void merge() {
-      index_node_t *zombie = static_cast<index_node_t*>(next.load());
+      index_t *zombie = static_cast<index_t*>(next.load());
       v.merge(&(zombie->v));
       next = zombie->next.load();
       zombie->lock.die();
@@ -198,13 +209,12 @@ class skipvector {
   /// Create a context for the thread, if one doesn't exist
   void init_context() const { HP::init_context(); }
 
-  bool is_head(const directory_t *node) {
-    return node == &directory_head;
-  }
-
   // layer is the "proper layer" (not the )
-  bool is_head(const index_t *node, int layer) {
-    return node == &index_head.at(layer-1);
+  bool is_head(void* node, int layer) {
+    if (layer == 0) { 
+      return static_cast<directory_t*>(node) == &directory_head;
+    }
+    return static_cast<index_t*>(node) == &index_head.at(layer-1);
   }
 
   /// Generate height using a geometric distribution from 0 to layers.
@@ -257,15 +267,16 @@ class skipvector {
   /// called, and when it returns.
   ///
   /// @returns true if successful, false on a seqlock verification failure
-  template <bool CLEANUP, typename T>
-  bool check_next(T *&curr, uint64_t &curr_lock, K const &k) {
+  //template <bool CLEANUP, typename T>
+  template <typename T>
+  bool check_next(T *&curr, uint64_t &curr_lock, K const &k, size_t layer) {
     // The fastest way out of this loop is when next is nullptr or curr's last
     // element is >= k.  Finding these early avoids taking a hazard pointer on
     // next or reading its seqlock.  If the /while/ condition fails, we will
     // return true.
     T *next = curr->next;
     K last = k;
-    while (next != nullptr && (is_head(curr) || !curr->v.last(last) || k > last)) {
+    while (next != nullptr && (is_head(curr, layer) || !curr->v.last(last) || k > last)) {
       // Take a hazard pointer on next, then make sure curr hasn't changed
       HP::take_next(next);
       if (!curr->lock.confirm_read(curr_lock)) {
@@ -284,6 +295,9 @@ class skipvector {
       // [mfs] The guard for this /if/ is the same as the guard for the
       //       do/while.  It's probably possible to refactor into a single
       //       /while/ loop
+
+      //!
+      /*
       if (curr->template should_merge<CLEANUP>(merge_threshold, next,
                                                next->lock.is_orphan())) {
 
@@ -346,6 +360,7 @@ class skipvector {
           curr_lock = curr->lock.release();
         }
       }
+      */
 
       // At this point we know that we have a nonempty next.
       if (k < next->v.first()) {
@@ -481,68 +496,19 @@ class skipvector {
   /// follow() is used by contains to find the correct down pointer from curr.
   /// follow() also swaps the lock on curr for a lock on the new down node
   template <typename T>
-  bool follow(index_t *curr, uint64_t &curr_lock, K const &k, T *&down, uint32_t cur_lvl) {
+  bool follow(index_t *curr, uint64_t &curr_lock, K const &k, T *&down, uint32_t layer) {
     // if check_next() fails, start over
-    if (!check_next<false>(curr, curr_lock, k))
+    if (!check_next(curr, curr_lock, k, layer))
       return false;
 
     // Find down pointer in curr, confirm curr's sequence lock (and next's, if
     // next was read), and take a seqlock on down.
     void *down_void = nullptr;
-    if (!is_head(curr, cur_lvl) && curr->v.find_lte(k, down_void)) {
+    if (!is_head(curr, layer) && curr->v.find_lte(k, down_void)) {
       down = static_cast<T *>(down_void);
     }
 
     return reader_swap<T>(curr, curr_lock, down);
-  }
-
-  /// skip_to is used by range operations to find the correct starting point in
-  /// the data layer
-  data_t *skip_to(K const &k) {
-    // [mfs] Instead of goto, can we use recursion?
-  top:
-    // Start from the head node (leftmost node in topmost layer.)
-    int layer = layers - 1;
-    index_t *curr = &(index_head.at(layer));
-
-    // Read head node's sequence lock.
-    HP::take_first(curr);
-    uint64_t curr_lock = curr->lock.begin_read();
-
-    // Skip through all index layers but the last.
-    for (; layer >= 1; --layer) {
-      // If follow() doesn't find a suitable down pointer,
-      // default to next index layer's head.
-      index_t *down = &index_head.at(layer - 1);
-      if (!follow(curr, curr_lock, k, down)) {
-        // Sequence lock check failed
-        HP::drop_curr();
-        goto top;
-      }
-      curr = down;
-    }
-
-    // Skip through the last index layer.
-    data_t *curr_dl = &data_head;
-    if (!follow(curr, curr_lock, k, curr_dl)) {
-      // Sequence lock check failed
-      HP::drop_curr();
-      goto top;
-    }
-
-    // Upgrade curr_dl's lock from reader to writer.
-    if (!curr_dl->lock.try_upgrade(curr_lock)) {
-      // Sequence lock check failed
-      HP::drop_curr();
-      goto top;
-    }
-
-    // We now have a true mutex on curr_dl,
-    // so we can drop all of our hazard pointers.
-    HP::drop_curr();
-
-    // curr_dl is now locked by the traversal.
-    return curr_dl;
   }
 
 public:
@@ -567,8 +533,8 @@ public:
   /// Sequential-only destructor
   ~skipvector() {
     // First, free all index layer nodes BUT the leftmost ones.
-    for (size_t i = 0; i < layers; ++i) {
-      index_t *curr = index_head.at(i).next;
+    for (size_t i = 1; i < layers; ++i) {
+      index_t *curr = index_head.at(i-1).next;
       while (curr != nullptr) {
         index_t *next = curr->next;
         delete curr;
@@ -578,9 +544,9 @@ public:
 
     // Free each node in data layer but the leftmost,
     // which was statically allocated
-    data_t *data_curr = data_head.next;
+    directory_t *data_curr = directory_head.next;
     while (data_curr != nullptr) {
-      data_t *next = data_curr->next;
+      directory_t *next = data_curr->next;
       delete data_curr;
       data_curr = next;
     }
@@ -614,7 +580,7 @@ public:
       // If follow() doesn't find a suitable down pointer,
       // default to next index layer's head.
       index_t *down = &index_head.at(layer - 1);
-      if (!follow(curr, curr_lock, k, down)) {
+      if (!follow(curr, curr_lock, k, down, layer)) {
         // Sequence lock check failed
         HP::drop_curr();
         goto top;
@@ -623,8 +589,8 @@ public:
     }
 
     // Skip through the last index layer.
-    data_t *curr_dl = &data_head;
-    if (!follow(curr, curr_lock, k, curr_dl)) {
+    directory_t *curr_dl = &directory_head;
+    if (!follow(curr, curr_lock, k, curr_dl, 0)) {
       // Sequence lock check failed
       HP::drop_curr();
       goto top;
@@ -675,7 +641,7 @@ public:
       // If follow() doesn't find a suitable down pointer,
       // default to next index layer's head.
       index_t *down = &index_head.at(layer - 1);
-      if (!follow(curr, curr_lock, k, down)) {
+      if (!follow(curr, curr_lock, k, down, layer)) {
         // Sequence lock check failed
         HP::drop_curr();
         goto top;
@@ -687,8 +653,8 @@ public:
     }
 
     // Skip through the last index layer.
-    data_t *curr_dl = &data_head;
-    if (!follow(curr, curr_lock, k, curr_dl)) {
+    directory_t *curr_dl = &directory_head;
+    if (!follow(curr, curr_lock, k, curr_dl, 0)) {
       // Sequence lock check failed
       HP::drop_curr();
       goto top;
@@ -740,7 +706,7 @@ public:
     for (; layer > 1; --layer) {
       // At each level, find the correct node and follow the down pointer.
       index_t* down = &index_head.at(layer - 2);
-      if (!follow(curr, curr_lock, k, down)) {
+      if (!follow(curr, curr_lock, k, down, layer)) {
         HP::drop_curr();
         goto top;
       }
@@ -749,13 +715,13 @@ public:
 
     // From index level 1, descend to directory level 0
     directory_t* curr_0 = &directory_head;
-    if (!follow(curr, curr_lock, k, curr_0)) {
+    if (!follow(curr, curr_lock, k, curr_0, 0)) {
       HP::drop_curr();
       goto top;
     }
 
     // At level 0, walk right until finding the directory node covering k
-    if (!check_next(curr_0, curr_lock, k)) {
+    if (!check_next(curr_0, curr_lock, k, layer)) {
       HP::drop_curr();
       goto top;
     }
@@ -779,7 +745,7 @@ public:
     for (; layer > target_level; --layer) {
       // At each level, find the correct node and follow the down pointer.
       index_t* down = &index_head.at(layer - 2);
-      if (!follow(curr, curr_lock, k, down)) {
+      if (!follow(curr, curr_lock, k, down, layer)) {
         HP::drop_curr();
         goto top;
       }
@@ -787,7 +753,7 @@ public:
     }
 
     // At target_level, walk right until we find the node covering k
-    if (!check_next(curr, curr_lock, k)) {
+    if (!check_next(curr, curr_lock, k, target_level)) {
       HP::drop_curr();
       goto top;
     }
@@ -798,6 +764,7 @@ public:
 
   /// Gather prev info for every level <= height
   /// prev_addrs[] capacity is (height + 1), which covers index layers and data layer
+  /*
   std::vector<REMOTE_ADDR> collect_range_addrs(K const &k_from, K const &k_to) {
     init_context(); // hazard pointers
 
@@ -824,7 +791,7 @@ public:
     }
 
     // Skip through the last index layer.
-    data_t *curr_dl = &data_head;
+    directory_t *curr_dl = &directory_head;
     if (!follow(curr, curr_lock, k_from, curr_dl)) {
       // Sequence lock check failed
       HP::drop_curr();
@@ -840,7 +807,7 @@ public:
     std::vector<REMOTE_ADDR> remote_addrs = {curr_dl->remote_addr};
 
     // staring with curr_dl, collect remote addresses in range of [k_from, k_to]
-    data_t *next_dl = curr_dl->next;
+    directory_t *next_dl = curr_dl->next;
     while (next_dl != nullptr) {
       // Take a hazard pointer on next, then make sure curr hasn't changed
       HP::take_next(next_dl);
@@ -877,6 +844,7 @@ public:
 
     return remote_addrs;
   }
+  */
 
   // Descends to the local node at `level` covering k, then splits it at k.
   // - The current local node keeps entries < k.
@@ -893,8 +861,8 @@ public:
   retry:
     // Descend read-only to find the local node covering k at this level.
     uint64_t curr_lock;
-    T* curr;
-    if constexpr (std::is_same_v<T, directory_t>) {
+    NodeT* curr;
+    if constexpr (std::is_same_v<NodeT, directory_t>) {
       curr = descend_to_directory(curr_lock, k);
     } else {
       curr = descend_to_index_level(curr_lock, k, level);
@@ -910,7 +878,7 @@ public:
     // If a local node whose remote_addr matches new_remote_addr
     // already exists as curr->next (or somewhere), skip.
     // Do not need hp because I have lock on curr
-    T* existing_next = curr->next;
+    NodeT* existing_next = curr->next;
     if (existing_next != nullptr && 
         existing_next->remote_addr == new_remote_addr) {
       // Already installed by someone else. Nothing to do here.
@@ -920,7 +888,7 @@ public:
     }
 
     // Create the new local node
-    T* new_local = new T(curr, false, new_remote_addr);
+    NodeT* new_local = new NodeT(curr, false, new_remote_addr);
     new_local->lock.acquire();
     // Move entries > k from curr to new_local
     new_local->v.split_insert(&curr->v, {k, down_ptr_k});
@@ -950,6 +918,9 @@ public:
       curr = descend_to_index_level(curr_lock, k, level);
     }
 
+    // todo: if curr is head, don't want to insert to it
+    if (is_head())
+
     if (!curr->lock.try_upgrade(curr_lock)) {
       HP::drop_curr();
       goto retry;
@@ -971,28 +942,34 @@ public:
   // todo: consider how height correlates to level here, update below (level < height in for loop, and elsewhere) as needed
   void mirror_insert(K const& k, int height,
                     REMOTE_ADDR &new_remote_data_addr,
-                    std::array<REMOTE_ADDR, MAX_LAYERS+1> const& new_remote_index_addrs) {
+                    std::array<REMOTE_ADDR, MAX_LAYERS> const& new_remote_index_addrs) {
     init_context();
     assert(height > 0);
 
     int const top_level = height - 1;
-    node_t* new_local_below = nullptr;  // unused at level 0
+    index_t* new_local_below = nullptr;  // unused at level 0
+    directory_t* new_local_below_dir = nullptr;
     
     // Levels 0..top_level-1: split-at-K at each level
     for (int level = 0; level < top_level; ++level) {
       if (level == 0) {
-        new_local_below = mirror_split_at_level_0(k, new_remote_data_addr, new_remote_index_addrs[0]);
+        new_local_below_dir = mirror_split_at_level<directory_t>(k, 0, new_remote_data_addr, new_remote_index_addrs[0]);
+      } else if (level == 1) {
+        new_local_below = mirror_split_at_level<index_t>(k, level, new_local_below_dir, new_remote_index_addrs[level]);
       } else {
-        new_local_below = mirror_split_at_level(k, level, new_local_below, new_remote_index_addrs[level]);
+        new_local_below = mirror_split_at_level<index_t>(k, level, new_local_below, new_remote_index_addrs[level]);
       }
     }
 
     // Top level: insert into existing
     if (top_level == 0) {
       // Height 1: no splits happened; top-level insert with remote data addr
-      mirror_insert_at_top_level<directory_t>(k, new_remote_data_addr, new_remote_index_addrs[0]);
+      mirror_insert_at_top_level<directory_t>(k, 0, new_remote_data_addr, new_remote_index_addrs[0]);
+    } else if (top_level == 1) {
+      // Height 2: pass the newly created directory node from level 0
+      mirror_insert_at_top_level<index_t>(k, top_level, new_local_below_dir, new_remote_index_addrs[top_level]);
     } else {
-      // Height >= 2: top-level insert with local pointer
+      // Height >= 3: pass the newly created index node from the previous level
       mirror_insert_at_top_level<index_t>(k, top_level, new_local_below, new_remote_index_addrs[top_level]);
     }
   }
@@ -1011,7 +988,7 @@ public:
     // Start at the topmost index layer.
     int layer = layers - 1;
     index_t *curr = &(index_head.at(layer));
-    data_t *curr_dl = &data_head;
+    directory_t *curr_dl = &directory_head;
 
     // Skip through index layers.
     while (layer >= 0) {
@@ -1034,7 +1011,7 @@ public:
         if (layer > 0)
           down_idx = static_cast<index_t *>(down);
         else
-          curr_dl = static_cast<data_t *>(down);
+          curr_dl = static_cast<directory_t *>(down);
 
       } else {
         // No appropriate down pointer was found,
@@ -1042,7 +1019,7 @@ public:
         if (layer > 0)
           down_idx = &(index_head.at(layer - 1));
         else
-          curr_dl = &data_head;
+          curr_dl = &directory_head;
       }
 
       if (layer > 0)
@@ -1072,11 +1049,11 @@ public:
     // If this is the case, we must first partition curr_dl.
     if (curr_dl->v.get_size() == curr_dl->v.get_capacity() &&
         k < curr_dl->v.first()) {
-      auto *new_orphan = new data_t(curr_dl, true);
+      auto *new_orphan = new directory_t(curr_dl, true);
       new_orphan->v.steal_half(&(curr_dl->v));
     }
 
-    auto *new_data_node = new data_t(curr_dl, false);
+    auto *new_data_node = new directory_t(curr_dl, false);
     new_data_node->v.split_insert(&(curr_dl->v), pair);
 
     void *down_ptr = new_data_node;
@@ -1106,221 +1083,6 @@ public:
     prev_nodes.at(new_height - 1)->insert(std::make_pair(k, down_ptr));
 
     return true;
-  }
-
-  /// Remove an element from the map
-  bool remove(K const &k) {
-    init_context();
-
-    // First, search for the uppermost instance of k in the data structure.
-    // Clean up after other lazy removes along the way.
-
-  top:
-
-    // Start at the topmost index layer.
-    int layer = layers - 1;
-    index_t *curr = &(index_head.at(layer));
-    uint64_t curr_lock = curr->lock.begin_read();
-    HP::take_first(curr);
-    data_t *curr_dl = &data_head;
-
-    // Skip through index layers.
-    while (layer >= 0) {
-      // Check next, as it may need to be maintained or followed.
-      if (!check_next<true>(curr, curr_lock, k)) {
-        HP::drop_curr();
-        goto top;
-      }
-
-      // Now, search the vector we arrived at for the right down pointer.
-      void *down = nullptr;
-      index_t *down_idx = nullptr;
-      K found_k = k;
-
-      if (curr->v.find_lte(k, found_k, down)) {
-        if (found_k == k) {
-          // If we find the uppermost instance of k in the skipvector, then lock
-          // it and proceed to remove it.
-
-          // NB: Here we must confirm that this is the uppermost instance of k.
-          // If curr is not an orphan, and k is the first element in this list,
-          // then this is NOT the uppermost instance of k, so start over.
-          // Otherwise, it is safe to proceed. This can happen if this remove()
-          // call interleaves with an insert() call on the same k.
-          if (!sv_lock::is_orphan(curr_lock) && curr->v.first() == k) {
-            HP::drop_curr();
-            goto top;
-          }
-
-          if (!curr->lock.try_upgrade(curr_lock)) {
-            HP::drop_curr();
-            goto top;
-          }
-
-          // We have a write lock on curr now, so we don't need the hazard
-          // pointer anymore.
-          HP::drop_curr();
-          break;
-        }
-
-        // Otherwise, we found an appropriate down pointer, so follow it.
-        if (layer > 0) {
-          down_idx = static_cast<index_t *>(down);
-        } else {
-          curr_dl = static_cast<data_t *>(down);
-        }
-      } else {
-        // No appropriate down pointer was found,
-        // so start at the leftmost node at the next layer.
-        if (layer > 0) {
-          down_idx = &(index_head.at(layer - 1));
-        } else {
-          curr_dl = &data_head;
-        }
-      }
-
-      // Exchange curr's lock for down's lock.
-      if (layer > 0) {
-        if (!reader_swap(curr, curr_lock, down_idx)) {
-          HP::drop_curr();
-          goto top;
-        }
-        curr = down_idx;
-      } else {
-        if (!reader_swap(curr, curr_lock, curr_dl)) {
-          HP::drop_curr();
-          goto top;
-        }
-      }
-
-      --layer;
-    }
-
-    // Normal case: k wasn't found in upper levels, so check data layer.
-    if (layer == -1) {
-      // Check if we have to follow any next pointers.
-      bool const skip_success = check_next<true>(curr_dl, curr_lock, k);
-
-      // Now, acquire curr_dl as a writer.
-      if (!skip_success || !curr_dl->lock.try_upgrade(curr_lock)) {
-        HP::drop_curr();
-        goto top;
-      }
-
-      // Edge case: Same as above; this may not be the uppermost instance of k,
-      // if this call interleaves with an insert() call on k.
-      // Double-check that it is.
-      if (!sv_lock::is_orphan(curr_lock) && curr_dl->v.first() == k) {
-        curr_dl->lock.release_unchanged();
-        HP::drop_curr();
-        goto top;
-      }
-
-      // At this point, simply try to remove from the data node we arrived at.
-      bool const result = curr_dl->v.remove(k);
-      curr_dl->lock.release_changed_if(result);
-      HP::drop_curr();
-      return result;
-    }
-
-    // remove() starts being lazy here.
-    // We broke out of loop early, so lock all the way down.
-    // NB: For each new node we access here, we have its parent locked as a
-    // writer, so there is no need to take a hazard pointer on them.
-
-    for (int i = layer; i > 0; --i) {
-      void *down_void = nullptr;
-      curr->v.remove(k, down_void);
-      auto *down_idx = static_cast<index_t *>(down_void);
-      down_idx->lock.acquire();
-
-      // Release first node normally, subsequent nodes as orphans.
-      if (i == layer) {
-        curr->lock.release();
-      } else {
-        curr->lock.release_as_orphan();
-      }
-
-      curr = down_idx;
-    }
-
-    // And do it once more for the last index layer.
-    void *down_void = nullptr;
-    curr->v.remove(k, down_void);
-    curr_dl = static_cast<data_t *>(down_void);
-    curr_dl->lock.acquire();
-    if (layer == 0) {
-      // NB: This check covers the edge case where
-      // the loop above iterates zero times.
-      curr->lock.release();
-    } else {
-      curr->lock.release_as_orphan();
-    }
-
-    // Finally, remove the element from the data layer.
-    curr_dl->v.remove(k);
-    curr_dl->lock.release_as_orphan();
-
-    return true;
-  }
-
-  /// for_each() applies an elemental function f() to each element in the map.
-  /// This implementation is linearizable.
-  void for_each(std::function<void(const K &, V &, bool &)> f) {
-    data_t *curr = &data_head;
-    bool exit_flag = false;
-
-    // Acquiring locks and traversing
-    while (curr != nullptr && !exit_flag) {
-      curr->lock.acquire();
-      curr->v.for_each(f, exit_flag);
-      curr = curr->next;
-    }
-
-    // Lock-releasing phase
-    data_t *last = curr;
-    curr = &data_head;
-    while (curr != last) {
-      data_t *next = curr->next;
-      curr->lock.release();
-      curr = next;
-    }
-  }
-
-  /// Perform a range operation by applying f to the keys between from and to,
-  /// inclusive
-  void range(K const &from, K const &to,
-             std::function<void(const K &, V &, bool &)> f) {
-    init_context();
-
-    // Validate input parameters
-    if (from > to)
-      return;
-
-    data_t *first_locked = skip_to(from);
-    data_t *curr = first_locked;
-    bool done = false;
-    bool exit_flag = false;
-
-    // Process the first node.
-    done = curr->v.range(from, to, f, exit_flag);
-    curr = curr->next;
-
-    // Process the nodes.
-    while (curr != nullptr && !done && !exit_flag) {
-      curr->lock.acquire();
-      done = curr->v.range(from, to, f, exit_flag);
-      curr = curr->next;
-    }
-
-    // Lock-releasing phase
-    data_t *last = curr;
-    curr = first_locked;
-    while (curr != last) {
-      data_t *next = curr->next;
-      curr->lock.release();
-      curr = next;
-    }
   }
 
   /// In debug mode, dump the state of the data structure and throw an error to
@@ -1361,8 +1123,8 @@ public:
 
     while (curr != nullptr) {
       int const curr_size = curr->v.get_size();
-      data_t *next = curr->next;
-      verify_lock<data_t>(curr);
+      directory_t *next = curr->next;
+      verify_lock<directory_t>(curr);
 
       // Verify the node's vector, delegating to its own verify function.
       if (!curr->v.verify()) {
@@ -1373,7 +1135,7 @@ public:
       // next is found.
       while (next != nullptr && next->v.get_size() == 0) {
         // But still check the sequence lock.
-        verify_lock<data_t>(next);
+        verify_lock<directory_t>(next);
         if (!next->is_orphan_seq()) {
           cout << "Verify failure: empty node not orphan!" << endl;
           return fail();
@@ -1409,7 +1171,7 @@ public:
   // SEQUENTIAL-ONLY size function
   [[nodiscard]] size_t get_size() const {
     size_t result = 0;
-    data_t *curr = &data_head;
+    directory_t *curr = &directory_head;
 
     while (curr != nullptr) {
       result += curr->v.get_size();
@@ -1427,9 +1189,9 @@ public:
     cout << "Index vector exponent: " << IDX_EXP << endl;
     cout << "Index vector size: " << index_head[0].v.get_capacity() << endl;
 
-    cout << "Data vector type: " << data_head.v.get_name() << endl;
+    cout << "Data vector type: " << directory_head.v.get_name() << endl;
     cout << "Data vector exponent: " << DATA_EXP << endl;
-    cout << "Data vector size: " << data_head.v.get_capacity() << endl;
+    cout << "Data vector size: " << directory_head.v.get_capacity() << endl;
 
     cout << "Layers: " << layers << endl;
     cout << "Layer Array Capacity: " << MAX_LAYERS << endl;
@@ -1442,7 +1204,7 @@ public:
     // Number of elements on previous layer.
     size_t last_elts = 0;
 
-    for (int i = layers - 1; i >= 0; --i) {
+    for (int i = layers - 2; i >= 0; --i) {
       size_t count = 0;
       size_t elements = 0;
       const index_t *curr = &(index_head.at(i));
@@ -1452,21 +1214,21 @@ public:
         curr = curr->next;
       }
       size_t const orphans = count - last_elts;
-      cout << i << ": " << count << " nodes (" << orphans << " orphans)"
+      cout << i+1 << ": " << count << " nodes (" << orphans << " orphans)"
            << endl;
       last_elts = elements;
     }
 
     size_t count = 0;
     size_t elements = 0;
-    const data_t *curr = &data_head;
+    const directory_t *curr = &directory_head;
     while (curr != nullptr) {
       elements += curr->v.get_size();
       ++count;
       curr = curr->next;
     }
     size_t const orphans = count - last_elts;
-    cout << "D: " << count << " nodes (" << orphans << " orphans)" << endl;
+    cout << "D: " << count << " nodes (" << orphans << " orphans) \t (Directory level)" << endl;
     cout << "Elements: " << elements << endl;
   }
 
@@ -1487,7 +1249,7 @@ public:
     }
 
     cout << "Data: ";
-    const data_t *curr = &data_head;
+    const directory_t *curr = &directory_head;
     while (curr != nullptr) {
       curr->dump();
       curr = curr->next;
@@ -1509,7 +1271,7 @@ public:
   }
 
   // Helper method to verify(). Verifies nodes in the index layer.
-  // The layer below may consist of index_t nodes or data_t nodes, so this
+  // The layer below may consist of index_t nodes or directory_t nodes, so this
   // method is templated.
   template <typename T> bool verify_index(int layer_idx, const T *trace) {
     using std::cout;

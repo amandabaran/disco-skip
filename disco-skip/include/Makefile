@@ -10,8 +10,8 @@ INCLUDES := -I. -I./include-cache
 # If you have architecture-specific flags:
 # CXXFLAGS += -march=native
 
-TARGET   := test_mirror_insert
-SRCS     := test_mirror_insert.cc
+TARGET   := test
+SRCS     := test.cc
 
 .PHONY: all clean run debug
 
