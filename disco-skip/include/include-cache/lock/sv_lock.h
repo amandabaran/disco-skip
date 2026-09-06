@@ -166,6 +166,24 @@ public:
     return lock.fetch_add(LOCK_BIT + ORPHAN_BIT) + LOCK_BIT + ORPHAN_BIT;
   }
 
+  /// Release the sequence lock and clear the orphan bit in one step, marking
+  /// this node as having acquired a parent in the layer above.
+  /// Should only be called by the thread that acquired, on a node that is
+  /// currently an orphan.
+  ///
+  /// NB: The net change is (LOCK_BIT - ORPHAN_BIT) = +3, which clears both the
+  /// lock bit and the orphan bit while carrying into the counter. It is still
+  /// an increase, so the sequence counter stays monotonic and any reader
+  /// straddling this still fails its confirm_read().
+  uint64_t release_and_adopt() {
+#ifndef NDEBUG
+    uint64_t const val = lock.load();
+    assert(is_locked(val));
+    assert(is_orphan(val));
+#endif
+    return lock.fetch_add(LOCK_BIT - ORPHAN_BIT) + (LOCK_BIT - ORPHAN_BIT);
+  }
+
   /// Atomically set the freeze bit.
   /// If lock is already locked or frozen, spin until it is unlocked and
   /// unfrozen.

@@ -58,7 +58,11 @@
 ## 6. Cache staleness
 - C1: Cache may be stale.
 - C2: On version mismatch in Get -> follow old_ver*.
-- C3: On version mismatch in Insert/Delete -> restart, refresh cache.
+- C3: On struct_ver mismatch in Insert/Delete -> restart, refresh cache.
+      On content_ver mismatch -> restart only, no refresh: k_min is unchanged
+      (V1), so the cache's structural picture is still valid and refreshing
+      would add traffic proportional to total write load rather than to
+      structural churn. V3 makes the two cases separable.
 - C4: On k_min mismatch (k not in [k_min, next.k_min)) -> invalidate cache,
       remote traverse from cached ancestor.
 - C5: Never cache with cross-op TTL; entries live until version-mismatch invalidation.

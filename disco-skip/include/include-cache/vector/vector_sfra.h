@@ -121,6 +121,36 @@ public:
     return true;
   }
 
+  /// Populate by stealing every entry >= k from another chunk, leaving the
+  /// entries below k behind.
+  ///
+  /// Unlike split_insert(), k is expected to be ALREADY PRESENT in the victim:
+  /// this splits an existing vector at an existing key rather than inserting a
+  /// new one. It is what lets a cache node be partitioned at a boundary it has
+  /// already recorded as an ordinary entry.
+  /// This method overwrites the contents of the current vector; it is assumed
+  /// it is called when the current vector is empty.
+  ///
+  /// @returns false, having done nothing, if the victim holds nothing >= k
+  ///          (in which case there is no split to make).
+  bool split_at(vector_sfra *victim, K const &k) {
+    size_t const start_pos = victim->find(k);
+
+    if (start_pos >= victim->size)
+      return false; // nothing at or above k to steal
+
+    size_t const entries_to_steal = victim->size - start_pos;
+    assert(entries_to_steal <= CAPACITY);
+
+    asm volatile("" ::: "memory"); // ensure everything is flushed to RAM
+    std::memcpy(list, victim->list + start_pos, entries_to_steal * ENTRY_SIZE);
+    asm volatile("" ::: "memory"); // ensure everything is flushed to RAM
+
+    size = entries_to_steal;
+    victim->size -= entries_to_steal;
+    return true;
+  }
+
   /// Construct and populate by stealing the latter half of the elements from
   /// another chunk. Also insert (k,v) into either the victim or the newly
   /// constructed vector as appropriate.

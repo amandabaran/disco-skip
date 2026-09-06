@@ -178,7 +178,14 @@ class skipvector {
     ///
     /// @returns true if the pair was installed (with or without a split),
     ///          false if this node already contained the key
-    bool insert(const std::pair<const K, T> &pair, REMOTE_ADDR const &r_addr) {
+    ///
+    /// If a split occurs and new_orphan_out is non-null, the newly created
+    /// orphan is reported through it. Callers that can promote the orphan into
+    /// the layer above should do so -- an unpromoted orphan is reachable only
+    /// by walking /next/, and letting them accumulate is what turns a layer
+    /// into a linked list.
+    bool insert(const std::pair<const K, T> &pair, REMOTE_ADDR const &r_addr,
+                node_t **new_orphan_out) {
       bool overfull = false;
       bool const result = v.insert(pair, overfull);
       if (overfull) {
@@ -187,9 +194,15 @@ class skipvector {
         // Note: the orphan's constructor will stitch itself in.
         auto *new_orphan = new node_t(this, true, r_addr);
         new_orphan->v.steal_half_and_insert(&v, pair);
+        if (new_orphan_out != nullptr)
+          *new_orphan_out = new_orphan;
         return true;
       }
       return result;
+    }
+
+    bool insert(const std::pair<const K, T> &pair, REMOTE_ADDR const &r_addr) {
+      return insert(pair, r_addr, nullptr);
     }
   };
 
@@ -236,6 +249,12 @@ class skipvector {
 
   /// Leftmost data vector.
   directory_t directory_head{};
+
+  /// Set once set_head_remote_addrs() has run. Until then the heads carry null
+  /// remote addresses, which is safe but silently degrades every gather_prevs()
+  /// that lands on a head into a per-level miss -- so it is worth being able to
+  /// ask, rather than discovering it as unexplained remote traffic.
+  bool heads_bootstrapped_ = false;
 
   /// Create a context for the thread, if one doesn't exist
   void init_context() const { HP::init_context(); }
@@ -343,8 +362,31 @@ class skipvector {
 
       uint64_t next_lock = next->lock.begin_read();
 
-      // TODO: move logic to remove empty orphan to update path (currently even if CLEANUP is False, merge if next is empty)
-      // TODO: can we encounter an empty orphan once ^ applied?
+      // NB: The merge block below stays disabled. It was evaluated (2026-09) and
+      // left off deliberately; if you re-enable it, read this first.
+      //
+      //  - It does not solve the local-bloat problem it looks like it solves.
+      //    should_merge() bails on non-orphans, but structure the remote side
+      //    removed and the cache never heard about leaves stale *non-orphans*.
+      //  - It is mildly divergent as written. An orphan created by the overflow
+      //    path in node_t::insert can carry a real remote address, and absorbing
+      //    it discards the knowledge that a second remote node exists. That
+      //    degrades gather_prevs(), though not locate_data(), which reads entry
+      //    values rather than node identities. A safe version must merge only
+      //    orphans whose remote_addr is null, plus empty ones -- which would
+      //    newly require REMOTE_ADDR to be null-testable, something the cache
+      //    otherwise never does.
+      //  - check_next() is the shared read path. Merging here makes every reader
+      //    a writer, bumping seqlocks and forcing concurrent descenders to
+      //    restart. That is what the original CLEANUP template parameter existed
+      //    to avoid. It belongs on the update paths, which already hold write
+      //    locks and run far less often.
+      //  - The payoff is small: the directory-level orphan fraction measures a
+      //    stable ~21% across a 64x range of workload size, i.e. a bounded
+      //    constant, and a few extra cache lines is nothing against an RDMA.
+      //
+      // NB: check_next_sequential() below still merges, so insert_seq() does
+      // compact. Only the concurrent path is disabled.
       // Check if /next/ needs to be removed (and possibly merged first)
       // - remove if it's an empty orphan
       // - merge+remove if it's an orphan and cleanup == should_merge() == true
@@ -574,15 +616,25 @@ public:
   /// called, heads carry null remote addresses, which callers reading
   /// remote_addr must treat as a cache miss.
   ///
-  /// TODO: the remote layer needs to expose these at bootstrap. Until it does,
-  /// leaving this uncalled is safe but makes any lookup that lands on a head
-  /// report a miss.
+  /// Leaving this uncalled is safe but makes any gather_prevs() that lands on a
+  /// head report a miss for that level, so call it as part of bootstrap.
+  ///
+  /// Write-once: calling it twice is a bug, since a head's correspondence to
+  /// its remote leftmost node is fixed for the life of the structure.
   void set_head_remote_addrs(std::array<REMOTE_ADDR, MAX_LAYERS> const &addrs) {
+    assert(!heads_bootstrapped_ &&
+           "set_head_remote_addrs() is write-once; heads never move");
     directory_head.remote_addr = addrs.at(0);
     for (size_t n = 1; n < layers; ++n) {
       index_head.at(n - 1).remote_addr = addrs.at(n);
     }
+    heads_bootstrapped_ = true;
   }
+
+  /// Have the head remote addresses been installed? Lets the orchestrator (or a
+  /// test) confirm bootstrap actually ran, instead of inferring it from a
+  /// higher-than-expected miss rate.
+  [[nodiscard]] bool heads_bootstrapped() const { return heads_bootstrapped_; }
 
   /// Sequential-only destructor
   ~skipvector() {
@@ -649,51 +701,300 @@ public:
     }
   }
 
-  /// Install the routing entry for a remote data node the caller learned about
-  /// by remote traversal, after locate_data() reported a miss or the read
-  /// showed a k_min mismatch (C4).
-  ///
-  /// This is the *entry repair* path, and it is all that a plain miss needs.
-  /// Level 0 staleness is purely additive: remote node addresses are stable
-  /// (CoW replaces a node's vector and updates its offset; a split creates a
-  /// new node while the existing one keeps its address and its lower range),
-  /// so a cached entry never becomes wrong -- only incomplete. Hence a bare
-  /// insert suffices, no invalidation or upsert is needed, and repeating the
-  /// call is a no-op.
-  ///
-  /// Structural repair -- a remote *index* boundary the cache does not know
-  /// about -- is a different operation: install that boundary key with
-  /// mirror_insert(), which already handles the "already present" cases.
-  ///
-  /// @param data_k_min  k_min of the remote data node
-  /// @param data_addr   that node's remote address
-  void mirror_reconcile(K const &data_k_min, REMOTE_ADDR const &data_addr) {
-    init_context();
+  /// One level of what a remote descent saw: the node covering the sought key
+  /// at that level, and its remote address. The orchestrator already holds this
+  /// for every level it descended through -- with passive memory servers the
+  /// client performs the descent itself and must read each node to follow the
+  /// pointer down -- so collecting it costs no extra RDMA.
+  struct path_step {
+    K k_min{};             ///< k_min of the remote node covering the sought key
+    REMOTE_ADDR addr{};    ///< that node's remote address
 
+    /// LEVEL 0 ONLY: the value of that node's first entry, i.e. the remote
+    /// address of the data node whose k_min is /k_min/.
+    ///
+    /// Needed because creating a local directory node with minimum /k_min/
+    /// requires a value for that entry, and at level 0 the value is a remote
+    /// address only the descent has seen. At levels >= 1 the value is a local
+    /// node pointer, which the cache resolves for itself, so this is unused
+    /// there.
+    REMOTE_ADDR first_down{};
+  };
+
+private:
+  /// Whether an index-layer node that overflows during reconcile has its
+  /// split-off orphan promoted into the layer above.
+  ///
+  /// Off by default. Promotion invents a boundary at a key whose remote height
+  /// may be too low to deserve one, which is a deviation from mirroring that
+  /// the faithful path below does not need. Left compiled in so the residual
+  /// index-layer orphan rate can be measured with it on and off.
+  static constexpr bool PROMOTE_INDEX_ORPHANS = false;
+
+
+  /// Promote one orphan into the layer above, and report any orphan that
+  /// promotion created there in turn.
+  ///
+  /// @returns the new orphan at parent_level if the parent overflowed, else
+  ///          nullptr. Returns nullptr without acting if there is no layer
+  ///          above, if the child is empty, or if the parent layer already
+  ///          routes the child's key.
+  template <typename ChildT>
+  index_t *promote_one(ChildT *child, int child_level, path_step const *path,
+                       uint32_t levels) {
+    int const parent_level = child_level + 1;
+    if (parent_level >= static_cast<int>(layers))
+      return nullptr; // nothing above the top layer to route from
+
+    // Read the child's minimum -- the key that will route to it.
+    //
+    // NB: safe without holding the child's lock, because a node's minimum never
+    // decreases. A descent only lands on a node whose first key is <= the sought
+    // key, so no smaller key can be inserted; and a split leaves the lower part
+    // behind. It can only grow by losing its upper half, which does not move the
+    // minimum.
+    K child_min{};
+    while (true) {
+      uint64_t const l = child->lock.begin_read();
+      if (child->v.get_size() == 0)
+        return nullptr; // nothing to route to yet
+      child_min = child->v.first();
+      if (child->lock.confirm_read(l))
+        break;
+    }
+
+    // A node created by overflow at parent_level covers a sub-range of the node
+    // it split from, so the remote node covering the sought key at that level
+    // also covers it. Null above the path we were given.
+    REMOTE_ADDR const parent_orphan_addr =
+        (static_cast<uint32_t>(parent_level) < levels) ? path[parent_level].addr
+                                                       : REMOTE_ADDR{};
+
+    index_t *made = nullptr;
+    bool installed = false;
     while (true) {
       uint64_t curr_lock = 0;
-      directory_t *curr = descend_to_directory(curr_lock, data_k_min);
-
+      index_t *curr = descend_to_index_level(curr_lock, child_min, parent_level);
       if (!curr->lock.try_upgrade(curr_lock)) {
         HP::drop_curr();
         continue;
       }
+      installed = curr->insert({child_min, static_cast<void *>(child)},
+                               parent_orphan_addr, &made);
+      curr->lock.release_changed_if(installed);
+      HP::drop_curr();
+      break;
+    }
 
-      // A false return means the entry is already present. By the additivity
-      // argument above its value is still correct, so there is nothing to do.
-      //
-      // The one way a present-but-wrong value could arise is a data node being
-      // removed and its k_min later reused by a different node -- which needs
-      // the delete path that does not exist yet. Left alone deliberately.
-      //
-      // A null orphan address is the documented local-overflow case: local
-      // vector capacity is not a remote property, so a local split here has no
-      // remote counterpart.
-      bool const changed = curr->insert({data_k_min, data_addr}, REMOTE_ADDR{});
+    if (!installed) {
+      // Some other node at parent_level already routes this key. Leave the
+      // child an orphan rather than creating a second down pointer for it.
+      return nullptr;
+    }
+
+    // The child now has a parent, so it must stop being an orphan --
+    // verify_index() rejects a down pointer that targets one.
+    child->lock.acquire();
+    if (child->lock.is_orphan())
+      child->lock.release_and_adopt();
+    else
+      child->lock.release_unchanged();
+
+    return made;
+  }
+
+  /// Make a newly split-off orphan reachable by descent rather than only by
+  /// walking /next/, recursing while each promotion overflows the layer above.
+  ///
+  /// The first hop may cross node types (directory -> index); everything above
+  /// is index-to-index, which is why this is a recurse-then-loop rather than a
+  /// single loop.
+  template <typename ChildT>
+  void promote_orphan(ChildT *child, int child_level, path_step const *path,
+                      uint32_t levels) {
+    index_t *next_orphan = promote_one(child, child_level, path, levels);
+    int level = child_level + 1;
+    while (next_orphan != nullptr) {
+      next_orphan = promote_one(next_orphan, level, path, levels);
+      ++level;
+    }
+  }
+
+public:
+  /// Repair the cache after locate_data() reported a miss, or after a remote
+  /// read showed a k_min mismatch (C4).
+  ///
+  /// Does two things, and both matter:
+  ///
+  /// 1. Installs the routing entry for the data node. Level-0 entries are
+  ///    purely additive -- remote node addresses are stable, since CoW replaces
+  ///    a node's vector and updates its offset while a split leaves the
+  ///    original node holding its address and its lower range -- so a cached
+  ///    entry never becomes wrong, only missing. A bare insert suffices; no
+  ///    invalidation, no upsert, and repeating the call is a no-op.
+  ///
+  /// 2. Splits the local structure at the remote boundaries the descent
+  ///    actually saw. This is what keeps the cache from degenerating: entries
+  ///    accumulate at level 0 while node *boundaries* would otherwise arrive
+  ///    only via mirror_insert(), so a read-mostly client would fill the
+  ///    directory with unindexed overflow nodes -- measured at 1771 directory
+  ///    nodes, all orphans, every index layer still empty, which is worse than
+  ///    having no cache at all.
+  ///
+  /// Step 2 installs only boundaries the remote really has, so the local
+  /// partition stays a coarsening of the remote one and never invents a
+  /// boundary of its own. It also repairs the coarse case: a local node that
+  /// recorded a boundary as an ordinary entry, because some other client
+  /// created it, gets split there and stops spanning two remote nodes.
+  ///
+  /// How far up it can go is limited by what one descent sees. The covering
+  /// boundary is coarser at each level -- for k = 350 the level-0 node may
+  /// start at 300 while the level-1 node starts at 100 -- so the chain hanging
+  /// below a higher boundary passes through nodes this descent never read. We
+  /// therefore climb only while the same key is a boundary at the next level
+  /// up, and otherwise install the entry and stop. Later reconciles fill in the
+  /// rest: path[0].k_min equals path[1].k_min whenever the key falls in the
+  /// first sub-node, roughly one lookup in TARGET_IDX_RATIO.
+  ///
+  /// @param data_k_min  k_min of the remote data node covering the sought key
+  /// @param data_addr   that node's remote address
+  /// @param path        what the descent saw, path[L] describing level L
+  /// @param levels      number of valid entries in path; 0 for entry repair only
+  void mirror_reconcile(K const &data_k_min, REMOTE_ADDR const &data_addr,
+                        path_step const *path, uint32_t levels) {
+    init_context();
+
+    REMOTE_ADDR const dir_orphan_addr =
+        (levels > 0) ? path[0].addr : REMOTE_ADDR{};
+
+    // 1. The data routing entry. Always safe, always useful.
+    install_data_entry(data_k_min, data_addr, dir_orphan_addr);
+
+    if (levels == 0 || path == nullptr)
+      return;
+
+    // 2. Line the local partition up with the remote one, bottom-up.
+    K const b = path[0].k_min;
+    directory_t *d = mirror_split_at_level<directory_t>(b, 0, path[0].first_down,
+                                                        path[0].addr);
+    if (d == nullptr)
+      return;
+
+    // Climb while b is a boundary at the next level too. Creating the node with
+    // minimum b at level L installs (b -> child) as its first entry, which is
+    // what gives /child/ its parent.
+    void *child = d;
+    uint32_t L = 1;
+    uint32_t const top =
+        std::min<uint32_t>(levels, static_cast<uint32_t>(layers));
+    while (L < top && path[L].k_min == b) {
+      index_t *n = mirror_split_at_level<index_t>(b, static_cast<int>(L), child,
+                                                  path[L].addr);
+      if (n == nullptr)
+        break; // could not build this level; child still needs a parent
+      child = n;
+      ++L;
+    }
+
+    // Whatever we stopped on is a non-orphan with no parent yet, and
+    // verify_index() requires every non-orphan to be the target of a down
+    // pointer. Install its entry one level up. That is still faithful: b is a
+    // boundary at level L-1, so the remote node covering b at level L really
+    // does hold an entry keyed b.
+    //
+    // Nothing is needed above the top layer -- there is no layer to route from,
+    // and verify() does not require parents there.
+    if (L < layers) {
+      install_index_entry(static_cast<int>(L), b, child,
+                          (L < levels) ? path[L].addr : REMOTE_ADDR{});
+    }
+  }
+
+private:
+  /// Insert one (key -> data address) routing entry at level 0.
+  void install_data_entry(K const &key, REMOTE_ADDR const &addr,
+                          REMOTE_ADDR const &orphan_addr) {
+    while (true) {
+      uint64_t curr_lock = 0;
+      directory_t *curr = descend_to_directory(curr_lock, key);
+      if (!curr->lock.try_upgrade(curr_lock)) {
+        HP::drop_curr();
+        continue;
+      }
+      directory_t *made = nullptr;
+      bool const changed = curr->insert({key, addr}, orphan_addr, &made);
       curr->lock.release_changed_if(changed);
       HP::drop_curr();
+      if (made != nullptr && PROMOTE_INDEX_ORPHANS)
+        promote_orphan(made, 0, nullptr, 0);
       return;
     }
+  }
+
+  /// Insert one (key -> local node) routing entry at an index level.
+  void install_index_entry(int level, K const &key, void *down,
+                           REMOTE_ADDR const &orphan_addr) {
+    while (true) {
+      uint64_t curr_lock = 0;
+      index_t *curr = descend_to_index_level(curr_lock, key, level);
+      if (!curr->lock.try_upgrade(curr_lock)) {
+        HP::drop_curr();
+        continue;
+      }
+      index_t *made = nullptr;
+      bool const changed = curr->insert({key, down}, orphan_addr, &made);
+      curr->lock.release_changed_if(changed);
+      HP::drop_curr();
+      if (made != nullptr && PROMOTE_INDEX_ORPHANS)
+        promote_orphan(made, level, nullptr, 0);
+      return;
+    }
+  }
+
+public:
+  /// Convenience overload for callers with no descent path. Repairs the level-0
+  /// entry but cannot give promoted nodes a remote address, so they come out
+  /// null and read as cache misses.
+  void mirror_reconcile(K const &data_k_min, REMOTE_ADDR const &data_addr) {
+    mirror_reconcile(data_k_min, data_addr, nullptr, 0);
+  }
+
+  /// Visit every node at /level/, head first, calling
+  /// f(minimum_key, is_orphan, entry_count). The head is reported with a
+  /// default-constructed key when it is empty.
+  ///
+  /// SEQUENTIAL-ONLY. Exposed so a test can check the property that matters for
+  /// mirroring fidelity: every node that something points down to must have a
+  /// minimum that is a real remote boundary.
+  template <typename F> void for_each_node(int level, F &&f) const {
+    auto visit = [&f](auto const *c) {
+      K const m = c->v.get_size() > 0 ? c->v.first() : K{};
+      f(m, c->is_orphan_seq(), c->v.get_size());
+    };
+    if (level == 0) {
+      for (const directory_t *c = &directory_head; c != nullptr; c = c->next)
+        visit(c);
+    } else {
+      for (const index_t *c = &index_head.at(level - 1); c != nullptr;
+           c = c->next)
+        visit(c);
+    }
+  }
+
+  /// Number of local nodes at /level/, 0 being the directory layer.
+  /// SEQUENTIAL-ONLY. Exposed for tests and for the local-to-remote node ratio
+  /// metric, which is what detects cache bloat.
+  [[nodiscard]] size_t node_count(int level) const {
+    size_t n = 0;
+    if (level == 0) {
+      for (const directory_t *c = &directory_head; c != nullptr; c = c->next)
+        ++n;
+    } else {
+      for (const index_t *c = &index_head.at(level - 1); c != nullptr;
+           c = c->next)
+        ++n;
+    }
+    return n;
   }
 
   /// Gather the remote address of the node covering k at each level the key
@@ -706,7 +1007,7 @@ public:
   /// Any entry may come back null, meaning the covering node at that level has
   /// no known remote counterpart; the caller must treat that as a cache miss
   /// for that level.
-  bool gather_prevs(K const &k, uint32_t const height, REMOTE_ADDR *&prev_addrs) {
+  bool gather_prevs(K const &k, uint32_t const height, REMOTE_ADDR *prev_addrs) {
     init_context(); // hazard pointers
 
     while (true) {
@@ -984,18 +1285,38 @@ public:
       if (curr->v.get_size() > 0 && curr->v.first() == k) {
         // Safe to read the orphan bit directly: we hold the write lock.
         bool const usable = !curr->lock.is_orphan();
-        curr->lock.release_unchanged();
+        // Adopt the caller's remote address: this local node and the remote
+        // node share a minimum, so they are the same logical node.
+        bool changed = false;
+        if (usable) {
+          curr->remote_addr = new_remote_addr;
+          changed = true;
+        }
+        curr->lock.release_changed_if(changed);
         HP::drop_curr();
         return usable ? curr : nullptr;
       }
 
-      // k is present at this level but is not a node minimum. That violates
-      // the invariant this function maintains, so the mirror is in a state we
-      // did not create and should not patch; leave it for a refresh.
+      // k is present at this level but is not a node minimum. That happens when
+      // the local node is *coarser* than the remote one -- the cache recorded k
+      // as an ordinary entry without ever learning it was a node boundary,
+      // which is the normal state for a boundary some other client created.
+      // Split the node at the entry it already holds, so it lines up with the
+      // remote partition again.
       if (curr->v.contains(k)) {
-        curr->lock.release_unchanged();
+        NodeT *split = new NodeT(curr, false, new_remote_addr);
+        if (!split->v.split_at(&curr->v, k)) {
+          // Nothing at or above k after all; undo and give up rather than
+          // leave an empty non-orphan linked in.
+          curr->next = split->next.load();
+          delete split;
+          curr->lock.release_unchanged();
+          HP::drop_curr();
+          return nullptr;
+        }
+        curr->lock.release();
         HP::drop_curr();
-        return nullptr;
+        return split;
       }
 
       // Edge case: curr is full and k is below its minimum, so the new node
@@ -1073,39 +1394,46 @@ public:
     assert(height > 0);
 
     int const top_level = height - 1;
-    index_t* new_local_below = nullptr;  // unused at level 0
-    directory_t* new_local_below_dir = nullptr;
 
-    // Levels 0..top_level-1: split-at-K at each level
-    for (int level = 0; level < top_level; ++level) {
-      if (level == 0) {
-        new_local_below_dir = mirror_split_at_level<directory_t>(k, 0, new_remote_data_addr, new_remote_index_addrs[0]);
-        // The mirror is not in a state that this update applies to. Bail out
-        // rather than install a down pointer we cannot compute; a later
-        // refresh will reconcile.
-        if (new_local_below_dir == nullptr)
-          return;
-      } else if (level == 1) {
-        new_local_below = mirror_split_at_level<index_t>(k, level, new_local_below_dir, new_remote_index_addrs[level]);
-        if (new_local_below == nullptr)
-          return;
-      } else {
-        new_local_below = mirror_split_at_level<index_t>(k, level, new_local_below, new_remote_index_addrs[level]);
-        if (new_local_below == nullptr)
-          return;
-      }
+    // Height 1: nothing to split. k simply joins the directory node covering it.
+    if (top_level == 0) {
+      mirror_insert_at_top_level<directory_t>(k, 0, new_remote_data_addr,
+                                              new_remote_index_addrs[0]);
+      return;
     }
 
-    // Top level: insert into the existing node that covers k.
-    if (top_level == 0) {
-      // Height 1: no splits happened; top-level insert with remote data addr
-      mirror_insert_at_top_level<directory_t>(k, 0, new_remote_data_addr, new_remote_index_addrs[0]);
-    } else if (top_level == 1) {
-      // Height 2: pass the newly created directory node from level 0
-      mirror_insert_at_top_level<index_t>(k, top_level, new_local_below_dir, new_remote_index_addrs[top_level]);
-    } else {
-      // Height >= 3: pass the newly created index node from the previous level
-      mirror_insert_at_top_level<index_t>(k, top_level, new_local_below, new_remote_index_addrs[top_level]);
+    // Level 0: k becomes the minimum of a new directory node.
+    directory_t *d = mirror_split_at_level<directory_t>(
+        k, 0, new_remote_data_addr, new_remote_index_addrs[0]);
+    if (d == nullptr)
+      return; // nothing was created, so there is nothing to parent
+
+    // Levels 1..top_level-1: the same, each pointing at the level below. Each
+    // node created here installs (k -> the level below) as its first entry,
+    // which is what parents the node beneath it.
+    void *child = d;
+    int level = 1;
+    for (; level < top_level; ++level) {
+      index_t *n = mirror_split_at_level<index_t>(k, level, child,
+                                                  new_remote_index_addrs[level]);
+      if (n == nullptr)
+        break; // could not build this level; child still needs a parent
+      child = n;
+    }
+
+    // Whatever we stopped on is a non-orphan with no parent yet: at top_level
+    // in the normal case, or at the level we broke out on. verify_index()
+    // requires every non-orphan to be the target of a down pointer, so install
+    // its entry one level up either way.
+    //
+    // NB: the boundary-nesting invariant -- a key that is a boundary at level L
+    // is a boundary at every level below -- probably makes the break case
+    // unreachable, since it would need k to be a level-L boundary while not
+    // being a level-0 one. That reasoning is delicate under concurrency and the
+    // guard is free, so we do not rely on it.
+    if (level < static_cast<int>(layers)) {
+      mirror_insert_at_top_level<index_t>(k, level, child,
+                                          new_remote_index_addrs[level]);
     }
   }
 
