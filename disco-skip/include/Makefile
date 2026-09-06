@@ -13,12 +13,28 @@ INCLUDES := -I. -I./include-cache
 TARGET   := test
 SRCS     := test.cc
 
-.PHONY: all clean run debug
+# Single-threaded, assertion-driven coverage of locate_data() and
+# mirror_reconcile(), which the concurrent harness does not exercise.
+RECON    := test_reconcile
 
-all: $(TARGET)
+# This is a header-only data structure, so the targets have to depend on the
+# headers too -- otherwise editing skipvector_disco.h leaves a stale binary.
+HDRS     := $(wildcard *.h) $(wildcard include-cache/*/*.h)
 
-$(TARGET): $(SRCS)
+.PHONY: all clean run debug check
+
+all: $(TARGET) $(RECON)
+
+$(TARGET): $(SRCS) $(HDRS)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) $(SRCS) -o $(TARGET) $(LDFLAGS)
+
+$(RECON): $(RECON).cc $(HDRS)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) $(RECON).cc -o $(RECON) $(LDFLAGS)
+
+# Run both suites. Exits nonzero if either fails.
+check: $(TARGET) $(RECON)
+	./$(RECON)
+	./$(TARGET) 8 20000 100000 6
 
 debug: CXXFLAGS := -std=c++17 -O0 -g3 -Wall -Wextra -Wpedantic -pthread -fsanitize=address,undefined
 debug: LDFLAGS  := -pthread -fsanitize=address,undefined
@@ -33,4 +49,4 @@ stress: $(TARGET)
 	./$(TARGET) 16 100000 1000000 6
 
 clean:
-	rm -f $(TARGET)
+	rm -f $(TARGET) $(RECON)

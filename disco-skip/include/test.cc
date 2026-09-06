@@ -17,9 +17,11 @@
 #include <thread>
 #include <vector>
 
+// NB: deliberately not including common/tests.h. Nothing here uses it, and it
+// pulls in x86intrin.h and Linux-only affinity APIs, which makes this test
+// unbuildable off an x86 Linux box.
 #include "include-cache/common/config.h"
 #include "include-cache/common/machine_defines.h"
-#include "include-cache/common/tests.h"
 #include "include-cache/hp/hp_manager.h"
 #include "include-cache/hp/hp_manager_leaky.h"
 #include "include-cache/vector/vector_sfra.h"
@@ -153,11 +155,10 @@ static void worker(SkipVec* sv, test_config cfg, unsigned thread_id,
     // Skip if height is 0 (no mirror update needed).
     if (height == 0) continue;
 
-    std::cout << "Inserting " << k << " to level " << height << "\n";
-
-    // Call the API under test.
+    // NB: no per-op logging here. Unsynchronised cout from every thread
+    // interleaves into unreadable output and dominates the runtime, which
+    // also hides real contention.
     sv->mirror_insert(k, height, new_remote_data_addr, new_remote_index_addrs);
-    std::cout << "Done.\n";
     stats->inserts_succeeded++;
   }
 }

@@ -3,7 +3,9 @@
 #include <atomic>
 #include <cassert>
 #include <cstddef>
+#include <cstring>
 #include <functional>
+#include <pthread.h>
 #include <stdexcept>
 
 #include "include-cache/common/config.h"
@@ -61,15 +63,24 @@ class skipvector {
     /// few stolen bits
     sv_lock lock;
 
-    /// Identifies the remote node this local node mirrors
-    const REMOTE_ADDR remote_addr; // todo: do I want to store struct ver too to detect when structural changes occur? or unnec.?
+    /// Identifies the remote node this local node mirrors.
+    ///
+    /// NB: This is write-once. Nodes created during a mirror update receive
+    /// their address at construction and never change it. The only exception
+    /// is a leftmost (head) node: heads are constructed before the remote
+    /// leftmost addresses are known, so they are filled in exactly once by
+    /// set_head_remote_addrs() during bootstrap, before any concurrent use.
+    /// (Hence not const.)
+    ///
+    /// A default-constructed (null) address means "this local node has no
+    /// known remote counterpart" -- either a head that has not been bootstrapped
+    /// or a local-only orphan created because a local vector hit its capacity
+    /// when the remote had not split. Callers must treat null as a cache miss.
+    REMOTE_ADDR remote_addr;
     uint32_t cached_struct_ver;
 
     /// A pointer to the next node in this layer.
     rlx_atomic<node_t *> next;
-
-    /// Minimum key stored in this data node
-    K k_min; // todo: const? //! should I even have this field still?
 
     static constexpr size_t get_vector_size() {
       static_assert(EXP <= 64);
@@ -86,12 +97,18 @@ class skipvector {
     VEC<K, T, get_vector_size()> v;
 
     /// Default constructor; creates node as orphan. This constructor is only
-    /// ever used to create leftmost nodes, which are always orphans.
-    node_t() : remote_addr{}, cached_struct_ver(0), lock(false), next(nullptr) {}
+    /// ever used to create leftmost (head) nodes, which are always orphans.
+    ///
+    /// NB: Heads MUST be orphans. A head is never the target of a down pointer
+    /// from the layer above, and verify_index() only tolerates an unreferenced
+    /// node in a layer if that node is an orphan.
+    node_t() : lock(true), remote_addr{}, cached_struct_ver(0), next(nullptr) {}
+
     /// Constructor; creates node, and stitches it in after prev.
     /// Requires that prev is locked.
-    node_t(node_t *prev, bool orphan, REMOTE_ADDR const& r_addr /*, uint32_t cached_struct_ver_*/) : 
-            remote_addr(r_addr),  lock(orphan), v(), next(prev->next.load()) { //cached_struct_ver(cached_struct_ver_),
+    node_t(node_t *prev, bool orphan, REMOTE_ADDR const &r_addr)
+        : lock(orphan), remote_addr(r_addr), cached_struct_ver(0),
+          next(prev->next.load()), v() {
       prev->next = this;
     }
 
@@ -116,7 +133,7 @@ class skipvector {
       if (!next_is_orphan)
         return false;
 
-      int const nextsize = static_cast<index_t*>(next)->v.get_size();
+      int const nextsize = next->v.get_size();
 
       if (nextsize == 0)
         // If next is totally empty, always merge.
@@ -138,7 +155,7 @@ class skipvector {
     ///
     /// NB: The caller is expected to handle reclamation of unlinked node
     void merge() {
-      index_t *zombie = static_cast<index_t*>(next.load());
+      node_t *zombie = next.load();
       v.merge(&(zombie->v));
       next = zombie->next.load();
       zombie->lock.die();
@@ -147,7 +164,21 @@ class skipvector {
     /// Insert a K/V pair into this node
     ///
     /// NB: May split this node if it is full
-    bool insert(const std::pair<const K, T> &pair, REMOTE_ADDR r_addr) {
+    ///
+    /// r_addr is used only if a split occurs, as the remote address of the
+    /// newly created orphan. It may legitimately be null: local vector
+    /// capacity is a purely local property, so a local vector can overflow at
+    /// a point where the remote did not split and therefore reported no new
+    /// remote address. The resulting orphan is then a local-only node with no
+    /// remote counterpart, which is sound -- it is still reachable by walking
+    /// /next/, and any caller that reads its null remote_addr must treat it as
+    /// a cache miss. We deliberately still perform the split rather than
+    /// skipping it, because skipping would leave the down pointers created at
+    /// the levels below this one without a parent.
+    ///
+    /// @returns true if the pair was installed (with or without a split),
+    ///          false if this node already contained the key
+    bool insert(const std::pair<const K, T> &pair, REMOTE_ADDR const &r_addr) {
       bool overfull = false;
       bool const result = v.insert(pair, overfull);
       if (overfull) {
@@ -209,12 +240,34 @@ class skipvector {
   /// Create a context for the thread, if one doesn't exist
   void init_context() const { HP::init_context(); }
 
-  // layer is the "proper layer" (not the )
-  bool is_head(void* node, int layer) {
-    if (layer == 0) { 
-      return static_cast<directory_t*>(node) == &directory_head;
+  /// Is /node/ the leftmost (head) node of /layer/?
+  ///
+  /// /layer/ is the "proper layer": 0 is the directory layer, and index layer
+  /// n lives at index_head[n-1].
+  ///
+  /// NB: Heads participate in traversal like any other node -- they hold
+  /// entries and are searched normally -- so the traversal path does not need
+  /// this. It is here for callers that need to distinguish "the region left of
+  /// every remote boundary" from an ordinary node, e.g. to decide whether a
+  /// remote_addr is meaningful.
+  bool is_head(void *node, int layer) const {
+    if (layer == 0) {
+      return static_cast<directory_t *>(node) == &directory_head;
     }
-    return static_cast<index_t*>(node) == &index_head.at(layer-1);
+    return static_cast<index_t *>(node) == &index_head.at(layer - 1);
+  }
+
+  /// A thread-identity value usable as a PRNG seed.
+  ///
+  /// NB: pthread_t is an integer on Linux but an opaque pointer on macOS, so
+  /// copy its representation rather than assuming it converts to an integer.
+  static uint64_t thread_seed() {
+    pthread_t const self = pthread_self();
+    static_assert(sizeof(self) <= sizeof(uint64_t),
+                  "pthread_t does not fit in a uint64_t seed");
+    uint64_t bits = 0;
+    std::memcpy(&bits, &self, sizeof(self));
+    return bits;
   }
 
   /// Generate height using a geometric distribution from 0 to layers.
@@ -228,7 +281,7 @@ class skipvector {
     }
 
     static thread_local __uint128_t g_lehmer64_state =
-        lehmer64_seed(pthread_self());
+        lehmer64_seed(thread_seed());
     uint64_t r = lehmer64(g_lehmer64_state);
     size_t h = 0;
 
@@ -269,14 +322,18 @@ class skipvector {
   /// @returns true if successful, false on a seqlock verification failure
   //template <bool CLEANUP, typename T>
   template <typename T>
-  bool check_next(T *&curr, uint64_t &curr_lock, K const &k, size_t layer) {
+  bool check_next(T *&curr, uint64_t &curr_lock, K const &k) {
     // The fastest way out of this loop is when next is nullptr or curr's last
     // element is >= k.  Finding these early avoids taking a hazard pointer on
     // next or reading its seqlock.  If the /while/ condition fails, we will
     // return true.
+    //
+    // NB: An empty node (including an as-yet-unpopulated head) makes
+    // v.last() return false, which forces us to advance -- so heads need no
+    // special case here.
     T *next = curr->next;
     K last = k;
-    while (next != nullptr && (is_head(curr, layer) || !curr->v.last(last) || k > last)) {
+    while (next != nullptr && (!curr->v.last(last) || k > last)) {
       // Take a hazard pointer on next, then make sure curr hasn't changed
       HP::take_next(next);
       if (!curr->lock.confirm_read(curr_lock)) {
@@ -390,52 +447,6 @@ class skipvector {
     return true;
   }
 
-  template <typename T>
-  bool check_next_dl(T *&curr, uint64_t &curr_lock, K const &k) {
-    // The fastest way out of this loop is when next is nullptr or curr's last
-    // element is >= k.  Finding these early avoids taking a hazard pointer on
-    // next or reading its seqlock.  If the /while/ condition fails, we will
-    // return true.
-    T *next = curr->next;
-    while (next != nullptr) {
-      // Take a hazard pointer on next, then make sure curr hasn't changed
-      HP::take_next(next);
-      if (!curr->lock.confirm_read(curr_lock)) {
-        HP::drop_next();
-        return false;
-      }
-
-      uint64_t next_lock = next->lock.begin_read();
-
-      // At this point we know that we have a nonempty next. // todo: could we see an empty (now that not merging) or no?
-      if (k < next->k_min) {
-        // Next's min element is after k, so we have ruled out next.
-        // Now we just need to check its sequence lock.
-        // Return true if the check succeeds, false if it fails.
-        bool const result = next->lock.confirm_read(next_lock);
-        HP::drop_next();
-        return result;
-      }
-
-      // Next's first element is before (or equal to) the sought key,
-      // so we to go to next and repeat from there. We're done with curr,
-      // so we just need to confirm its sequence lock hasn't changed.
-      //! I don't think this if statement is necessary anymore since we do not attempt to merge anything
-      // if (!curr->lock.confirm_read(curr_lock)) {
-      //   HP::drop_next();
-      //   return false;
-      // }
-
-      curr = next;
-      curr_lock = next_lock;
-      next = curr->next;
-      HP::drop_curr();
-    }
-
-    // We ruled out next, so return true.
-    return true;
-  }
-
   /// Sequential-only variant of check_next.
   template <typename T> void check_next_sequential(T *&curr, K const &k) {
     T *next = curr->next;
@@ -495,18 +506,35 @@ class skipvector {
 
   /// follow() is used by contains to find the correct down pointer from curr.
   /// follow() also swaps the lock on curr for a lock on the new down node
+  ///
+  /// If prev_addr_out is non-null, the remote address of the node we descend
+  /// *from* is written there. This has to happen inside follow(): after
+  /// follow() returns, reader_swap() has already dropped the hazard pointer on
+  /// curr, so the caller can no longer safely dereference it.
   template <typename T>
-  bool follow(index_t *curr, uint64_t &curr_lock, K const &k, T *&down, uint32_t layer) {
+  bool follow(index_t *curr, uint64_t &curr_lock, K const &k, T *&down,
+              REMOTE_ADDR *prev_addr_out = nullptr) {
     // if check_next() fails, start over
-    if (!check_next(curr, curr_lock, k, layer))
+    if (!check_next(curr, curr_lock, k))
       return false;
 
     // Find down pointer in curr, confirm curr's sequence lock (and next's, if
     // next was read), and take a seqlock on down.
+    //
+    // NB: find_lte() returns false on an empty vector and when no entry is
+    // <= k, in which case /down/ keeps the caller-supplied default: the head
+    // of the layer below. So a key that is left of every boundary at this
+    // layer descends via heads, which is exactly right.
     void *down_void = nullptr;
-    if (!is_head(curr, layer) && curr->v.find_lte(k, down_void)) {
+    if (curr->v.find_lte(k, down_void)) {
       down = static_cast<T *>(down_void);
     }
+
+    // Snapshot curr's remote address if the caller asked for it. reader_swap()
+    // confirms curr's sequence lock, which validates this read along with the
+    // down pointer.
+    if (prev_addr_out != nullptr)
+      *prev_addr_out = curr->remote_addr;
 
     return reader_swap<T>(curr, curr_lock, down);
   }
@@ -528,6 +556,32 @@ public:
     // We use a single 64-bit random number on insert(), so make sure that's
     // enough for the chosen configuration.
     assert(DATA_EXP + (cfg->layers * IDX_EXP) <= 64);
+  }
+
+  /// Bootstrap the head nodes' remote addresses.
+  ///
+  /// A local head node mirrors the remote leftmost node at its layer: the node
+  /// covering [-inf, first remote boundary). Those remote nodes are fixed for
+  /// the lifetime of the structure -- a head is never unlinked, and a remote
+  /// split of the leftmost node maps to "head keeps entries < K, a new local
+  /// node after head takes entries >= K", which preserves the correspondence.
+  /// So their addresses can be installed once, here.
+  ///
+  /// addrs[0] is the remote directory-layer leftmost node; addrs[n] is the
+  /// remote leftmost node of index layer n.
+  ///
+  /// SEQUENTIAL-ONLY: must be called before any concurrent use. Until it is
+  /// called, heads carry null remote addresses, which callers reading
+  /// remote_addr must treat as a cache miss.
+  ///
+  /// TODO: the remote layer needs to expose these at bootstrap. Until it does,
+  /// leaving this uncalled is safe but makes any lookup that lands on a head
+  /// report a miss.
+  void set_head_remote_addrs(std::array<REMOTE_ADDR, MAX_LAYERS> const &addrs) {
+    directory_head.remote_addr = addrs.at(0);
+    for (size_t n = 1; n < layers; ++n) {
+      index_head.at(n - 1).remote_addr = addrs.at(n);
+    }
   }
 
   /// Sequential-only destructor
@@ -559,207 +613,241 @@ public:
   // Sequential-only teardown method.
   static void tear_down() { HP::tear_down(); }
 
-  /// Search for a key in the skipvector
-  /// Returns remote address of node which may contain k
+  /// Search for a key in the skipvector.
+  ///
+  /// NB: A directory node carries two unrelated remote addresses. Its own
+  /// remote_addr identifies the remote level-0 *index* node it mirrors; its
+  /// vector entries map keys to remote *data* node addresses. This returns the
+  /// latter, so the caller can read the data node directly instead of reading
+  /// the remote index node and resolving k against its entries.
+  ///
+  /// @returns the remote address of the data node that may contain k, or a
+  ///          null address if no covering entry is cached, which the caller
+  ///          must treat as a miss and resolve by remote traversal (then feed
+  ///          back through mirror_reconcile).
   REMOTE_ADDR locate_data(K const &k) {
-    // TODO: once figure out merging, update check_next()
-
     init_context(); // hazard pointers
 
-  top:
-    // Start from the head node (leftmost node in topmost layer.)
-    int layer = layers - 1;
-    index_t *curr = &(index_head.at(layer));
+    while (true) {
+      uint64_t curr_lock = 0;
+      directory_t *curr_dl = descend_to_directory(curr_lock, k);
 
-    // Read head node's sequence lock.
-    HP::take_first(curr);
-    uint64_t curr_lock = curr->lock.begin_read();
+      // Read into a local before the final verification: if the verification
+      // fails we must not have already handed a torn value to the caller.
+      //
+      // NB: find_lte() leaves r_addr untouched when the vector is empty or
+      // holds no entry <= k, so a miss falls through as the null address.
+      // This read is optimistic, exactly as in follow(); the confirm_read()
+      // below is what makes it meaningful.
+      REMOTE_ADDR r_addr{};
+      curr_dl->v.find_lte(k, r_addr);
 
-    // Skip through all index layers but the last.
-    for (; layer >= 1; --layer) {
-      // If follow() doesn't find a suitable down pointer,
-      // default to next index layer's head.
-      index_t *down = &index_head.at(layer - 1);
-      if (!follow(curr, curr_lock, k, down, layer)) {
-        // Sequence lock check failed
-        HP::drop_curr();
-        goto top;
-      }
-      curr = down;
-    }
-
-    // Skip through the last index layer.
-    directory_t *curr_dl = &directory_head;
-    if (!follow(curr, curr_lock, k, curr_dl, 0)) {
-      // Sequence lock check failed
+      bool const ok = curr_dl->lock.confirm_read(curr_lock);
       HP::drop_curr();
-      goto top;
+      if (ok)
+        return r_addr;
     }
-
-    // Finally, read the data layer.
-    if (!check_next_dl(curr_dl, curr_lock, k)) {
-      HP::drop_curr();
-      goto top;
-    }
-
-    // Scan curr_dl for the sought value.
-    // NB: There is a chance that this contains() will find a value,
-    // but the final sequence lock checks will fail, making us start over,
-    // and the element will be gone by the time we get back here.
-    // This scenario would yield the somewhat undesirable result that this
-    // method returns false but overwrites v with an outdated value.
-    // To prevent this, we use a temporary intermediate variable, tmp.
-    REMOTE_ADDR const r_addr = curr_dl->remote_addr;
-
-    // Confirm curr's sequence lock.
-    if (!curr_dl->lock.confirm_read(curr_lock)) {
-      HP::drop_curr();
-      goto top;
-    }
-
-    HP::drop_curr();
-
-    return r_addr;
   }
 
-  /// Gather prev info for every level <= height
-  /// prev_addrs[] capacity is (height + 1), which covers index layers and data layer
-  bool gather_prevs(K const &k, uint32_t const height, REMOTE_ADDR*& prev_addrs) {
+  /// Install the routing entry for a remote data node the caller learned about
+  /// by remote traversal, after locate_data() reported a miss or the read
+  /// showed a k_min mismatch (C4).
+  ///
+  /// This is the *entry repair* path, and it is all that a plain miss needs.
+  /// Level 0 staleness is purely additive: remote node addresses are stable
+  /// (CoW replaces a node's vector and updates its offset; a split creates a
+  /// new node while the existing one keeps its address and its lower range),
+  /// so a cached entry never becomes wrong -- only incomplete. Hence a bare
+  /// insert suffices, no invalidation or upsert is needed, and repeating the
+  /// call is a no-op.
+  ///
+  /// Structural repair -- a remote *index* boundary the cache does not know
+  /// about -- is a different operation: install that boundary key with
+  /// mirror_insert(), which already handles the "already present" cases.
+  ///
+  /// @param data_k_min  k_min of the remote data node
+  /// @param data_addr   that node's remote address
+  void mirror_reconcile(K const &data_k_min, REMOTE_ADDR const &data_addr) {
+    init_context();
+
+    while (true) {
+      uint64_t curr_lock = 0;
+      directory_t *curr = descend_to_directory(curr_lock, data_k_min);
+
+      if (!curr->lock.try_upgrade(curr_lock)) {
+        HP::drop_curr();
+        continue;
+      }
+
+      // A false return means the entry is already present. By the additivity
+      // argument above its value is still correct, so there is nothing to do.
+      //
+      // The one way a present-but-wrong value could arise is a data node being
+      // removed and its k_min later reused by a different node -- which needs
+      // the delete path that does not exist yet. Left alone deliberately.
+      //
+      // A null orphan address is the documented local-overflow case: local
+      // vector capacity is not a remote property, so a local split here has no
+      // remote counterpart.
+      bool const changed = curr->insert({data_k_min, data_addr}, REMOTE_ADDR{});
+      curr->lock.release_changed_if(changed);
+      HP::drop_curr();
+      return;
+    }
+  }
+
+  /// Gather the remote address of the node covering k at each level the key
+  /// will occupy.
+  ///
+  /// A key of height h occupies levels 0..h-1 (level 0 being the directory
+  /// layer), matching mirror_insert(). So prev_addrs[] must have /height/
+  /// entries, and prev_addrs[L] receives the address for level L.
+  ///
+  /// Any entry may come back null, meaning the covering node at that level has
+  /// no known remote counterpart; the caller must treat that as a cache miss
+  /// for that level.
+  bool gather_prevs(K const &k, uint32_t const height, REMOTE_ADDR *&prev_addrs) {
     init_context(); // hazard pointers
 
-  top:
-    // Start from the head node (leftmost node in topmost layer.)
-    int layer = layers - 1;
-    index_t *curr = &(index_head.at(layer));
+    while (true) {
+      // Start from the head node (leftmost node in the topmost index layer.)
+      // NB: index layer n lives at index_head[n-1].
+      int layer = static_cast<int>(layers) - 1;
+      index_t *curr = &index_head.at(layer - 1);
 
-    // Read head node's sequence lock.
-    HP::take_first(curr);
-    uint64_t curr_lock = curr->lock.begin_read();
+      // Read head node's sequence lock.
+      HP::take_first(curr);
+      uint64_t curr_lock = curr->lock.begin_read();
 
-    // Skip through all index layers but the last.
-    for (; layer >= 1; --layer) {
-      // If follow() doesn't find a suitable down pointer,
-      // default to next index layer's head.
-      index_t *down = &index_head.at(layer - 1);
-      if (!follow(curr, curr_lock, k, down, layer)) {
-        // Sequence lock check failed
+      // Descend index layers layers-1 .. 2, recording prevs on the way.
+      bool restart = false;
+      for (; layer >= 2; --layer) {
+        // If follow() doesn't find a suitable down pointer, default to the
+        // next index layer's head.
+        index_t *down = &index_head.at(layer - 2);
+        REMOTE_ADDR *out = (static_cast<uint32_t>(layer) < height)
+                               ? &prev_addrs[layer]
+                               : nullptr;
+        if (!follow(curr, curr_lock, k, down, out)) {
+          // Sequence lock check failed
+          HP::drop_curr();
+          restart = true;
+          break;
+        }
+        curr = down;
+      }
+      if (restart)
+        continue;
+
+      // From index layer 1, descend to the directory layer.
+      directory_t *curr_dl = &directory_head;
+      REMOTE_ADDR *out = (1u < height) ? &prev_addrs[1] : nullptr;
+      if (!follow(curr, curr_lock, k, curr_dl, out)) {
         HP::drop_curr();
-        goto top;
+        continue;
       }
-      if (layer < height) {
-        prev_addrs[layer+1] = curr->remote_addr;
+
+      // Walk right at the directory layer to the node covering k.
+      if (!check_next(curr_dl, curr_lock, k)) {
+        HP::drop_curr();
+        continue;
       }
-      curr = down;
-    }
 
-    // Skip through the last index layer.
-    directory_t *curr_dl = &directory_head;
-    if (!follow(curr, curr_lock, k, curr_dl, 0)) {
-      // Sequence lock check failed
+      prev_addrs[0] = curr_dl->remote_addr;
+
+      bool const ok = curr_dl->lock.confirm_read(curr_lock);
       HP::drop_curr();
-      goto top;
+      if (ok)
+        return true;
     }
-
-    if (layer < height) {
-      prev_addrs[layer+1] = curr->remote_addr;
-    }
-
-    // Finally, read the data layer.
-    if (!check_next_dl(curr_dl, curr_lock, k)) {
-      HP::drop_curr();
-      goto top;
-    }
-
-    // Scan curr_dl for the sought value.
-    // NB: There is a chance that this contains() will find a value,
-    // but the final sequence lock checks will fail, making us start over,
-    // and the element will be gone by the time we get back here.
-    // This scenario would yield the somewhat undesirable result that this
-    // method returns false but overwrites v with an outdated value.
-    // To prevent this, we use a temporary intermediate variable, tmp.
-    prev_addrs[0] = curr_dl->remote_addr;
-
-    // Confirm curr's sequence lock.
-    if (!curr_dl->lock.confirm_read(curr_lock)) {
-      HP::drop_curr();
-      goto top;
-    }
-
-    HP::drop_curr();
-
-    return true;
   }
 
-  // Returns a node at `target_level` covering key k.
-  // The node is protected by an HP in the curr slot.
-  // On any sequence-lock verification failure, restarts internally.
-  // //! HERE 9/1/26 - todo: apply the following function to mirror_insert_at_lvl, and then mirror_insert
-  directory_t* descend_to_directory(uint64_t &target_lock, K const& k) {
+  /// Returns the directory-layer (level 0) node covering key k.
+  /// The node is protected by an HP in the curr slot, and target_lock receives
+  /// its read-lock context. On any sequence-lock verification failure, this
+  /// restarts internally.
+  directory_t *descend_to_directory(uint64_t &target_lock, K const &k) {
     assert(layers >= 2);
-  top:
-    int layer = layers - 1;
-    index_t* curr = &(index_head.at(layer-1)); // -1 again bc layer n corresponds to index n-1, since directory_head is not included in index_head array
-    HP::take_first(curr);
-    uint64_t curr_lock = curr->lock.begin_read();
 
-    // Descend through index levels above target_level
-    for (; layer > 1; --layer) {
-      // At each level, find the correct node and follow the down pointer.
-      index_t* down = &index_head.at(layer - 2);
-      if (!follow(curr, curr_lock, k, down, layer)) {
-        HP::drop_curr();
-        goto top;
+    while (true) {
+      // NB: index layer n lives at index_head[n-1], because directory_head is
+      // not part of the index_head array.
+      int layer = static_cast<int>(layers) - 1;
+      index_t *curr = &index_head.at(layer - 1);
+      HP::take_first(curr);
+      uint64_t curr_lock = curr->lock.begin_read();
+
+      // Descend index layers layers-1 .. 2.
+      bool restart = false;
+      for (; layer >= 2; --layer) {
+        index_t *down = &index_head.at(layer - 2);
+        if (!follow(curr, curr_lock, k, down)) {
+          HP::drop_curr();
+          restart = true;
+          break;
+        }
+        curr = down;
       }
-      curr = down;
-    }
+      if (restart)
+        continue;
 
-    // From index level 1, descend to directory level 0
-    directory_t* curr_0 = &directory_head;
-    if (!follow(curr, curr_lock, k, curr_0, 0)) {
-      HP::drop_curr();
-      goto top;
-    }
+      // From index layer 1, descend to directory layer 0.
+      directory_t *curr_0 = &directory_head;
+      if (!follow(curr, curr_lock, k, curr_0)) {
+        HP::drop_curr();
+        continue;
+      }
 
-    // At level 0, walk right until finding the directory node covering k
-    if (!check_next(curr_0, curr_lock, k, layer)) {
-      HP::drop_curr();
-      goto top;
-    }
+      // At layer 0, walk right until we find the directory node covering k.
+      if (!check_next(curr_0, curr_lock, k)) {
+        HP::drop_curr();
+        continue;
+      }
 
-    target_lock = curr_lock;
-    return curr_0;
-    // Caller inherits the HP on curr, and the read lock context (curr_lock)
+      target_lock = curr_lock;
+      return curr_0;
+      // Caller inherits the HP on curr, and the read lock context.
+    }
   }
 
-  index_t* descend_to_index_level(uint64_t &target_lock, K const& k, uint target_level) { // target_level > 0
+  /// Returns the index-layer node at target_level covering key k, with the
+  /// same HP / lock-context contract as descend_to_directory().
+  index_t *descend_to_index_level(uint64_t &target_lock, K const &k,
+                                  int target_level) {
     assert(layers >= 2);
     assert(target_level >= 1);
-    assert(target_level < layers);
-  top:
-    int layer = layers - 1;
-    index_t* curr = &(index_head.at(layer-1)); // -1 again bc layer n corresponds to index n-1, since directory_head is not included in index_head array
-    HP::take_first(curr);
-    uint64_t curr_lock = curr->lock.begin_read();
+    assert(target_level < static_cast<int>(layers));
 
-    // Descend through index levels above target_level
-    for (; layer > target_level; --layer) {
-      // At each level, find the correct node and follow the down pointer.
-      index_t* down = &index_head.at(layer - 2);
-      if (!follow(curr, curr_lock, k, down, layer)) {
-        HP::drop_curr();
-        goto top;
+    while (true) {
+      int layer = static_cast<int>(layers) - 1;
+      index_t *curr = &index_head.at(layer - 1);
+      HP::take_first(curr);
+      uint64_t curr_lock = curr->lock.begin_read();
+
+      // Descend index layers above target_level.
+      bool restart = false;
+      for (; layer > target_level; --layer) {
+        index_t *down = &index_head.at(layer - 2);
+        if (!follow(curr, curr_lock, k, down)) {
+          HP::drop_curr();
+          restart = true;
+          break;
+        }
+        curr = down;
       }
-      curr = down;
-    }
+      if (restart)
+        continue;
 
-    // At target_level, walk right until we find the node covering k
-    if (!check_next(curr, curr_lock, k, target_level)) {
-      HP::drop_curr();
-      goto top;
+      // At target_level, walk right until we find the node covering k.
+      if (!check_next(curr, curr_lock, k)) {
+        HP::drop_curr();
+        continue;
+      }
+
+      target_lock = curr_lock;
+      return curr;
+      // Caller inherits the HP on curr, and the read lock context.
     }
-    target_lock = curr_lock;
-    return curr;
-    // Caller inherits the HP on curr, and the read lock context (curr_lock)
   }
 
   /// Gather prev info for every level <= height
@@ -846,102 +934,140 @@ public:
   }
   */
 
-  // Descends to the local node at `level` covering k, then splits it at k.
-  // - The current local node keeps entries < k.
-  // - A new local node is created holding K and entries > k.
-  // - The new local node is stitched in as `curr->next`.
-  // - The new local node's remote_addr is set to `new_remote_addr`.
-  // - Returns the new local node (which will be the down_ptr for level+1).
+  /// Descend to the local node at `level` covering k, then split it at k.
+  /// - The current local node keeps entries < k.
+  /// - A new local node is created holding k and entries > k.
+  /// - The new local node is stitched in as `curr->next`.
+  /// - The new local node's remote_addr is set to `new_remote_addr`.
+  ///
+  /// This implements the skip vector invariant for every level *below* a key's
+  /// height: at those levels, k becomes the minimum of a newly created node.
+  ///
+  /// @returns the new local node (the down pointer for level+1), or nullptr if
+  ///          the local mirror is in a state where this split does not apply,
+  ///          in which case the caller must abandon the whole mirror update.
   template <typename NodeT, typename ValueT>
-  NodeT* mirror_split_at_level(
-      K const& k, int level,
-      ValueT const& down_ptr_k,      // remote_addr for level 0, local ptr for level ≥ 1
-      REMOTE_ADDR const& new_remote_addr) {
+  NodeT *mirror_split_at_level(
+      K const &k, int level,
+      ValueT const &down_ptr_k, // remote_addr for level 0, local ptr for level >= 1
+      REMOTE_ADDR const &new_remote_addr) {
 
-  retry:
-    // Descend read-only to find the local node covering k at this level.
-    uint64_t curr_lock;
-    NodeT* curr;
-    if constexpr (std::is_same_v<NodeT, directory_t>) {
-      curr = descend_to_directory(curr_lock, k);
-    } else {
-      curr = descend_to_index_level(curr_lock, k, level);
-    }
+    while (true) {
+      // Descend read-only to find the local node covering k at this level.
+      uint64_t curr_lock = 0;
+      NodeT *curr;
+      if constexpr (std::is_same_v<NodeT, directory_t>) {
+        curr = descend_to_directory(curr_lock, k);
+      } else {
+        curr = descend_to_index_level(curr_lock, k, level);
+      }
 
-    // Try to upgrade to write lock. On failure, restart.
-    if (!curr->lock.try_upgrade(curr_lock)) {
+      // Try to upgrade to write lock. On failure, restart.
+      if (!curr->lock.try_upgrade(curr_lock)) {
+        HP::drop_curr();
+        continue;
+      }
+
+      // Idempotency: if k is already curr's minimum, this split has already
+      // been installed -- by a duplicate mirror update, or by another thread
+      // that got here first. Note that we detect it by landing *on* the
+      // already-created node, since a node whose minimum is k is exactly what
+      // the descent for k finds.
+      //
+      // We can only hand that node up as a down pointer if it is a legal
+      // down-pointer target, which orphans (heads included) are not. A node
+      // with minimum k can be an orphan two ways: k was previously inserted
+      // at the top level into a head, making k the head's minimum; or an
+      // overflow split at this level left k as the minimum of the new orphan.
+      // Both mean the mirror does not currently have a representable chain for
+      // k, so abandon the update and let a refresh reconcile it.
+      if (curr->v.get_size() > 0 && curr->v.first() == k) {
+        // Safe to read the orphan bit directly: we hold the write lock.
+        bool const usable = !curr->lock.is_orphan();
+        curr->lock.release_unchanged();
+        HP::drop_curr();
+        return usable ? curr : nullptr;
+      }
+
+      // k is present at this level but is not a node minimum. That violates
+      // the invariant this function maintains, so the mirror is in a state we
+      // did not create and should not patch; leave it for a refresh.
+      if (curr->v.contains(k)) {
+        curr->lock.release_unchanged();
+        HP::drop_curr();
+        return nullptr;
+      }
+
+      // Edge case: curr is full and k is below its minimum, so the new node
+      // would have to take all of curr's entries plus k -- one too many.
+      // Shed the upper half into an orphan first. (This mirrors the same case
+      // in insert_seq(). It can only arise when curr is a head: any node
+      // reached through a down pointer has a minimum <= k.)
+      //
+      // NB: The orphan is a local-only node -- local vector capacity is not a
+      // remote property -- so it gets a null remote address.
+      if (curr->v.get_size() == curr->v.get_capacity() &&
+          k < curr->v.first()) {
+        auto *shed = new NodeT(curr, true, REMOTE_ADDR{});
+        shed->v.steal_half(&curr->v);
+      }
+
+      // Create the new local node and move entries > k into it.
+      //
+      // NB: The constructor stitches new_local in while we hold curr's write
+      // lock, so a reader can briefly see it with an empty vector -- but such
+      // a reader reached it through curr and will fail its confirm_read() on
+      // curr, so it discards whatever it saw.
+      NodeT *new_local = new NodeT(curr, false, new_remote_addr);
+      new_local->v.split_insert(&curr->v, {k, down_ptr_k});
+      curr->lock.release();
       HP::drop_curr();
-      goto retry;
+
+      return new_local;
     }
-
-    // Idempotency check: has another thread already installed this split?
-    // If a local node whose remote_addr matches new_remote_addr
-    // already exists as curr->next (or somewhere), skip.
-    // Do not need hp because I have lock on curr
-    NodeT* existing_next = curr->next;
-    if (existing_next != nullptr && 
-        existing_next->remote_addr == new_remote_addr) {
-      // Already installed by someone else. Nothing to do here.
-      curr->lock.release_unchanged();
-      HP::drop_curr();
-      return existing_next;
-    }
-
-    // Create the new local node
-    NodeT* new_local = new NodeT(curr, false, new_remote_addr);
-    new_local->lock.acquire();
-    // Move entries > k from curr to new_local
-    new_local->v.split_insert(&curr->v, {k, down_ptr_k});
-    new_local->lock.release();
-    curr->lock.release();
-    HP::drop_curr();
-
-    return new_local;
   }
 
-  // Descends to the local node at `level` covering k, and inserts (k, down_ptr).
-  // If the insert causes overflow, splits into an orphan.
-  // - orphan_remote_addr is used only if a split occurs; if no split, ignored.
-  // - down_ptr_k: what K's entry's value should be.
+  /// Descend to the local node at `level` covering k, and insert (k, down_ptr)
+  /// into it. If the insert overflows the node, it splits into an orphan.
+  ///
+  /// This implements the skip vector invariant at the *top* level of a key's
+  /// height: there, k joins an existing node rather than becoming a new node's
+  /// minimum. Head nodes hold entries like any other node, so the node the
+  /// descent lands on is always a valid target -- including the head, which is
+  /// the covering node for any key left of every boundary at this level.
+  ///
+  /// orphan_remote_addr is used only if the insert overflows; see
+  /// node_t::insert() for why it may legitimately be null.
   template <typename NodeT, typename ValueT>
-  void mirror_insert_at_top_level(
-      K const& k, int level,
-      ValueT const& down_ptr,
-      REMOTE_ADDR const& orphan_remote_addr) {  // may be null if no remote split expected
+  void mirror_insert_at_top_level(K const &k, int level, ValueT const &down_ptr,
+                                  REMOTE_ADDR const &orphan_remote_addr) {
 
-  retry:
-    uint64_t curr_lock;
-    NodeT* curr;
-    if constexpr (std::is_same_v<NodeT, directory_t>) {
-      curr = descend_to_directory(curr_lock, k);
-    } else {
-      curr = descend_to_index_level(curr_lock, k, level);
-    }
+    while (true) {
+      uint64_t curr_lock = 0;
+      NodeT *curr;
+      if constexpr (std::is_same_v<NodeT, directory_t>) {
+        curr = descend_to_directory(curr_lock, k);
+      } else {
+        curr = descend_to_index_level(curr_lock, k, level);
+      }
 
-    // todo: if curr is head, don't want to insert to it
-    if (is_head())
+      if (!curr->lock.try_upgrade(curr_lock)) {
+        HP::drop_curr();
+        continue;
+      }
 
-    if (!curr->lock.try_upgrade(curr_lock)) {
-      HP::drop_curr();
-      goto retry;
-    }
-
-    // Insert (k, down_ptr_k) into curr
-    if (!curr->insert({k, down_ptr}, orphan_remote_addr)) { // todo: is it possible that orphan_remote_addr is null, but a split happens anyway?
-      // False if already exists
-      // Someone else already updated the cache, safe to return
-      curr->lock.release_unchanged();
+      // Insert (k, down_ptr) into curr. A false return means the key was
+      // already there, i.e. someone else already applied this update.
+      bool const changed = curr->insert({k, down_ptr}, orphan_remote_addr);
+      curr->lock.release_changed_if(changed);
       HP::drop_curr();
       return;
     }
-
-    curr->lock.release();
-    HP::drop_curr();
   }
 
   // todo: consider how height correlates to level here, update below (level < height in for loop, and elsewhere) as needed
   void mirror_insert(K const& k, int height,
-                    REMOTE_ADDR &new_remote_data_addr,
+                    REMOTE_ADDR const &new_remote_data_addr,
                     std::array<REMOTE_ADDR, MAX_LAYERS> const& new_remote_index_addrs) {
     init_context();
     assert(height > 0);
@@ -949,19 +1075,28 @@ public:
     int const top_level = height - 1;
     index_t* new_local_below = nullptr;  // unused at level 0
     directory_t* new_local_below_dir = nullptr;
-    
+
     // Levels 0..top_level-1: split-at-K at each level
     for (int level = 0; level < top_level; ++level) {
       if (level == 0) {
         new_local_below_dir = mirror_split_at_level<directory_t>(k, 0, new_remote_data_addr, new_remote_index_addrs[0]);
+        // The mirror is not in a state that this update applies to. Bail out
+        // rather than install a down pointer we cannot compute; a later
+        // refresh will reconcile.
+        if (new_local_below_dir == nullptr)
+          return;
       } else if (level == 1) {
         new_local_below = mirror_split_at_level<index_t>(k, level, new_local_below_dir, new_remote_index_addrs[level]);
+        if (new_local_below == nullptr)
+          return;
       } else {
         new_local_below = mirror_split_at_level<index_t>(k, level, new_local_below, new_remote_index_addrs[level]);
+        if (new_local_below == nullptr)
+          return;
       }
     }
 
-    // Top level: insert into existing
+    // Top level: insert into the existing node that covers k.
     if (top_level == 0) {
       // Height 1: no splits happened; top-level insert with remote data addr
       mirror_insert_at_top_level<directory_t>(k, 0, new_remote_data_addr, new_remote_index_addrs[0]);
@@ -1118,8 +1253,9 @@ public:
     }
 
     // Verify the data layer.
+    // NB: Start at the head, not head->next: heads hold entries, so their
+    // contents and ordering have to be checked like any other node's.
     const directory_t *curr = &directory_head;
-    curr = curr->next;
 
     while (curr != nullptr) {
       int const curr_size = curr->v.get_size();
@@ -1237,10 +1373,12 @@ public:
     using std::cout;
     using std::endl;
 
-    // Print contents of all index layers
-    for (int i = layers - 1; i >= 0; --i) {
-      cout << "Index " << std::hex << i << ": ";
-      const index_t *curr = &(index_head.at(i));
+    // Print contents of all index layers.
+    // NB: index layer n lives at index_head[n-1], and layers counts the
+    // directory layer, so the index layers are 1 .. layers-1.
+    for (int n = layers - 1; n >= 1; --n) {
+      cout << "Index " << n << ": ";
+      const index_t *curr = &(index_head.at(n - 1));
       while (curr != nullptr) {
         curr->dump();
         curr = curr->next;
@@ -1248,7 +1386,7 @@ public:
       cout << endl;
     }
 
-    cout << "Data: ";
+    cout << "Directory: ";
     const directory_t *curr = &directory_head;
     while (curr != nullptr) {
       curr->dump();
@@ -1277,8 +1415,10 @@ public:
     using std::cout;
     using std::endl;
 
-    index_t *curr = &(index_head.at(layer_idx)); // layer n's index into index_head is at n-1
-    curr = curr->next;
+    // NB: layer n's slot in index_head is n-1. Start at the head, not
+    // head->next: heads hold entries, so their down pointers have to be
+    // traced like any other node's.
+    index_t *curr = &(index_head.at(layer_idx));
 
     while (curr != nullptr) {
       int const curr_size = curr->v.get_size();
@@ -1326,7 +1466,12 @@ public:
         // Down pointer must not point to an orphan
         if (down->is_orphan_seq()) {
           cout << "Verify failure: down pointer for key " << +key
-               << " pointing to orphan in layer: " << layer_idx+1 << endl;
+               << " pointing to orphan in layer: " << layer_idx + 1
+               << " (target is_head=" << is_head(down, layer_idx)
+               << " size=" << down->v.get_size();
+          if (down->v.get_size() > 0)
+            cout << " min=" << +down->v.first();
+          cout << ")" << endl;
           return fail();
         }
 
