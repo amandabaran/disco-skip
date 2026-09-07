@@ -10,7 +10,7 @@ a starting point for the remote/RDMA side of the design.
   `include/skipvector_disco.h` and passes its structural `verify()` across 1–32 threads.
   Treat those as facts about the other side of the interface.
 - Sections marked **Proposed** are one side's suggestion and have not been agreed.
-- Items **A1–A9** marked `Decide` or `Confirm` are **open questions, not requirements.**
+- Items **A1–A10** marked `Decide` or `Confirm` are **open questions, not requirements.**
   Where this document says "assumed", that is an assumption that may be wrong. Do not
   resolve them by picking an option and implementing it — surface them for a decision
   between the two authors. Items marked `Resolved` have been agreed by both sides and
@@ -37,7 +37,9 @@ A disaggregated-memory key/value store.
 - **Failure model:** fail-stop memory nodes. No Byzantine faults, no partitions, no client
   crashes during evaluation.
 - **Linearizable range queries** are a target capability, served by snapshot timestamps
-  plus the `old_ver*` chain, so that readers never block writers.
+  plus the `old_ver*` chain, so that readers never block writers. The guarantee is narrower
+  and more clock-dependent than that sentence suggests -- point operations are clock-free and
+  unconditionally linearizable; only ranges need a timestamp. See §9.
 - **Target scale: up to 8 client machines, 8–16 cores each.** Each *machine* holds one local
   cache, shared by all of its threads. Throughout this document **N (or M) means machines**,
   never total cores — the two behave differently and §8 works out why.
@@ -622,7 +624,88 @@ covering node.
 
 ---
 
-## Open items — A1 to A9
+## 9. Linearizability, clocks, and range queries
+
+Orchestrator and remote-layer territory rather than the cache boundary, but it decides what
+the paper can claim, so it belongs in shared context.
+
+### Scope it first -- it is narrower than it looks
+
+**Point operations involve no clocks at all.** L1 linearizes a write at 2/3 CAS success and
+L2 linearizes a read at the max-tag quorum read, where the tag is
+`(struct_ver, content_ver)`. No cross-machine time comparison enters either path. **Only
+range queries need a snapshot timestamp**, because they alone have to fix a point in time and
+read every vector as of it.
+
+So the claim to make is:
+
+> Point get / insert / delete are linearizable, unconditionally. Range queries are
+> linearizable under commit-wait, or ε-linearizable without it.
+
+That is far easier to defend than "the system is ε-linearizable", and it is what the
+invariants already imply.
+
+### Commit-wait is a correctness mechanism, not an optimisation
+
+If a writer waits ε after taking its timestamp before making the write visible, then any
+operation starting after that write is visible provably carries a larger timestamp. That is
+Spanner's argument, and it converts ε-linearizability into linearizability outright. The
+price is ε of added write latency.
+
+Which changes what reviewers are being asked to accept:
+
+- *"ε is sub-nanosecond, so misordering is practically irrelevant"* -- a correctness claim
+  resting on timing hardware we do not have.
+- *"We implement commit-wait, so we are linearizable; it costs ε per write; on our testbed
+  that is X and costs Y%; with White-Rabbit-class clocks ε is sub-ns and the cost goes to
+  zero"* -- a correctness claim that holds unconditionally, plus a performance projection.
+
+The second is much the stronger position, and reviewers accept performance projections far
+more readily than correctness ones. If testbed ε on commodity PTP is around 100 ns against
+~2 µs operations, commit-wait costs roughly 5% -- a graph rather than an argument. White
+Rabbit then explains why that cost disappears, instead of propping up correctness.
+
+### Sub-nanosecond on the wire is not sub-nanosecond at the application
+
+White Rabbit synchronises clocks across its switch and NIC ecosystem. The ε that matters is
+the error in the timestamp a *thread* obtains, and that path runs
+reference -> host clock -> application read.
+
+- If the disciplined clock lives in the NIC, reading it is likely a PCIe read of roughly a
+  microsecond -- worse than the operation being timestamped.
+- If the system clock is disciplined via PTP and read through vDSO (~20-25 ns), achievable ε
+  is capped at PTP-to-system-clock quality: tens of nanoseconds, not sub-ns.
+
+That last hop is not a network problem, so WR does not address it. **Before any ε number goes
+in the paper**, work out concretely how a thread reads a WR-disciplined time and what that
+read costs. The shape of the story survives either answer; only the number changes.
+
+### One quantitative note
+
+Comparing ε to operation *duration* is the wrong measure. A violation needs two operations
+that are **non-overlapping in real time, conflicting, and separated by less than ε** --
+overlapping operations may legally be ordered either way, so duration does not enter it. The
+right quantity is the rate of conflicting non-overlapping pairs separated by less than ε,
+which follows from the arrival process and the conflict density. At 128 cores the cluster
+inter-arrival gap is tens of nanoseconds, so if ε lands in that range the at-risk fraction is
+not automatically negligible and wants computing from measured rates.
+
+### The clock-free alternative, worth citing even if unimplemented
+
+An RDMA fetch-and-add on a well-known counter in memory-server memory yields a genuine total
+order for one round trip, keeps the server passive, and is HCA-offloaded. At eight machines
+the single-cacheline contention is very likely fine. Citing it costs a paragraph and
+pre-empts "why not just serialise?".
+
+### None of this touches the cache
+
+The cache stores node addresses and never timestamps, so commit-wait, ε and snapshot
+acquisition are entirely orchestrator and remote-layer concerns. No cache-side work follows
+from this section.
+
+---
+
+## Open items — A1 to A10
 
 **Do not resolve these unilaterally.** `Decide` = a real choice with consequences.
 `Confirm` = an assumption that is probably already true but must be written down.
@@ -850,6 +933,22 @@ into "we measured that it is", which is worth having when a reviewer asks.
   decision on whether long-run cache viability is something the evaluation has to
   demonstrate. If runs are short and delete-light, it can be deferred — but deliberately, and
   metric 2 below will say whether that holds.
+
+### A10 — `Decide` — How are range queries linearized, and what ε do we report?
+
+Not a cache-boundary question, but it is the one that decides what the paper can claim, so it
+belongs in the same list. Reasoning in §9.
+
+- **Proposed:** implement commit-wait, so the guarantee is unconditional rather than resting
+  on hardware we do not have; report *measured* testbed ε; project the cost to zero for
+  White-Rabbit-class clocks. Point operations need nothing here — they are already
+  linearizable without clocks.
+- **Needed:** a decision on whether commit-wait is implemented for the evaluation, and where
+  the snapshot timestamp is read from. The second decides both the achievable ε and the
+  per-operation cost of obtaining it, and "sub-ns on the wire" does not settle it.
+- **Also:** if a guarantee parameterised by ε is claimed, ε should be measured on the testbed
+  rather than quoted from a datasheet, and the range-query path should be checked for
+  violations during the evaluation. Finding none is a result; not looking is a gap.
 
 ---
 
