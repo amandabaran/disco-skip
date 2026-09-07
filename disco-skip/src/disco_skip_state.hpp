@@ -129,34 +129,44 @@ public:
         range_profiler.addMeasurement(end - start);
     }
 
-    // ─── Cache API detection report ────────────────────────────────
+    // ─── Cache report ──────────────────────────────────────────────
     //
-    // Which cache API is actually linked. Worth printing rather than
-    // inferring: interface doc §5 notes that leaving bootstrap uncalled is
-    // safe but silently turns every head lookup into a per-level miss, so
-    // this exists to be read off a log instead of guessed at from a miss
-    // rate. It also records whether the A5 path-taking reconcile is present.
-    void reportCacheApi() const {
+    // Worth printing rather than inferring. Interface doc §5 notes that
+    // leaving bootstrap uncalled is safe but silently turns every lookup
+    // that lands on a head into a per-level miss, so bootstrap state is
+    // something to read off a log rather than guess at from a miss rate.
+    //
+    // The per-level node counts are the numerator of metric 2 (local nodes /
+    // remote nodes per level), which is the one that predicts the bloat
+    // failure mode in A9. Orphan fraction is reported alongside because it is
+    // easy to mistake for divergence and is not: orphans are ordinary
+    // skip-vector structure, and with matched capacities (A4) the remote
+    // generates them at the same rate.
+    //
+    // SEQUENTIAL-ONLY, like the cache calls it makes -- only safe once this
+    // client has drained its futures.
+    void reportCache() const {
 #if DS_CACHE_ENABLED
-        fmt::print("\n################ Cache API:\n");
+        fmt::print("\n################ Cache:\n");
         fmt::print("consulted:               {}\n",
                    layout.consult_cache ? "yes" : "no (no-cache baseline)");
+        fmt::print("heads bootstrapped:      {}\n",
+                   headsBootstrapped(cache_sv) ? "yes" : "NO (every head lookup misses)");
         fmt::print("levels:                  {}\n", layout.cache_layers);
         fmt::print("node capacity:           {}\n", kNodeCapacity);
-        fmt::print("path-taking reconcile:   {}\n",
-                   kCacheHasPathReconcile ? "yes" : "NO (entry repair only)");
-        fmt::print("heads_bootstrapped():    {}\n",
-                   kCacheHasHeadsBootstrapped ? "yes" : "NO (cannot assert bootstrap)");
-        fmt::print("node_count():            {}\n",
-                   kCacheHasNodeCount ? "yes" : "NO (bloat metric unavailable)");
+        for (uint32_t L = 0; L < layout.cache_layers && L < kMaxLayers; ++L) {
+            LevelStats const st = levelStats(cache_sv, L);
+            fmt::print("level {}: {} nodes, {} orphans, {} entries\n",
+                       L, st.nodes, st.orphans, st.entries);
+        }
 #else
-        fmt::print("\n################ Cache API: disabled (DS_CACHE_ENABLED=0)\n");
+        fmt::print("\n################ Cache: disabled (DS_CACHE_ENABLED=0)\n");
 #endif
     }
 
     // ─── Reporting (mirroring OopsState::reportStats) ──────────────
     void reportStats(bool detailed = false) {
-        reportCacheApi();
+        reportCache();
         fmt::print("\n################ Counters:\n");
         fmt::print("rdma_reads:              {}\n", rdma_reads);
         fmt::print("rdma_cas_attempts:       {}\n", rdma_cas_attempts);

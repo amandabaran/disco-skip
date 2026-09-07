@@ -6,10 +6,11 @@
 //
 // The two halves never call each other (interface doc §1). Everything here is
 // orchestrator glue: it adapts our RemoteAddr and our traversal output to the
-// cache's call surface, and isolates the parts of that surface still in flux.
+// cache's call surface.
 //
-// Only included when DS_CACHE_ENABLED; shared constants live in ds_defs.hpp so
-// the no-cache baseline does not depend on the cache half at all.
+// Only included when DS_CACHE_ENABLED; constants shared with the remote node
+// layout live in ds_defs.hpp so the no-cache baseline does not depend on the
+// cache half at all.
 
 #include <array>
 #include <cstdint>
@@ -40,16 +41,10 @@ using SkipVec = skipvector<Key, Value, RemoteAddr,
 
 namespace detail {
 
-// ── Feature detection for the parts of the cache API that are documented but
-// ── not yet pushed.
-//
-// Interface doc §5 lists a path-taking mirror_reconcile, heads_bootstrapped(),
-// node_count() and for_each_node(), and A5 describes them as built and
-// measured. None of those symbols exist on main or origin/put_perf_testing as
-// of this writing. Rather than guess, detect each one and degrade.
-//
-// When the real header lands, every `if constexpr` on these flips to the
-// first branch with no edit here.
+// Detectors for the API added by "cache: reconcile by splitting at observed
+// remote boundaries" (A5). They exist to turn a build against an older cache
+// into a clear error rather than a silent behaviour change -- see the
+// static_asserts below.
 
 template <class SV, class = void>
 struct HasPathReconcile : std::false_type {};
@@ -76,28 +71,154 @@ struct HasNodeCount<
 
 }  // namespace detail
 
-inline constexpr bool kCacheHasPathReconcile =
-    detail::HasPathReconcile<SkipVec>::value;
-inline constexpr bool kCacheHasHeadsBootstrapped =
-    detail::HasHeadsBootstrapped<SkipVec>::value;
-inline constexpr bool kCacheHasNodeCount = detail::HasNodeCount<SkipVec>::value;
+// A5 is what makes gather_prevs self-healing and stops a read-mostly client
+// degenerating the directory layer into a linked list. Falling back to
+// entry-only repair would still be *correct*, but A5's own measurement puts it
+// at "worse than having no cache at all" -- so this is a build error rather
+// than a runtime degradation nobody notices until the numbers look wrong.
+static_assert(detail::HasPathReconcile<SkipVec>::value,
+              "The cache is missing the path-taking mirror_reconcile(). Update "
+              "disco-skip/include to a revision at or after 'cache: reconcile "
+              "by splitting at observed remote boundaries'.");
+static_assert(detail::HasHeadsBootstrapped<SkipVec>::value,
+              "The cache is missing heads_bootstrapped().");
+static_assert(detail::HasNodeCount<SkipVec>::value,
+              "The cache is missing node_count(), which metric 2 (local-to-"
+              "remote node ratio) is measured from.");
 
-/// Assert that the cache was told its head addresses, when it can tell us.
-/// Interface doc §5: leaving bootstrap uncalled is safe but silently turns
-/// every lookup that lands on a head into a per-level miss, so this exists to
-/// be asserted rather than inferred from a high miss rate.
+/// Install the remote leftmost node address for each level.
 ///
-/// A template on purpose: `if constexpr` only discards the untaken branch
-/// inside a template, so a plain function here would still be checked against
-/// the current header and fail to compile.
-template <class SV>
-inline bool headsBootstrapped(SV const &sv) {
-  if constexpr (detail::HasHeadsBootstrapped<SV>::value) {
-    return sv.heads_bootstrapped();
-  } else {
-    (void)sv;
-    return true;  // unknowable with the current header; do not block on it
+/// A1: there is a stable leftmost node per level whose address is fixed for the
+/// lifetime of the structure, so this is write-once. Interface doc §5:
+/// SEQUENTIAL-ONLY, and must happen before any concurrent use. Leaving it
+/// uncalled is safe but silently turns every lookup that lands left of the
+/// first boundary into a per-level miss, which is why the caller should assert
+/// headsBootstrapped() afterwards rather than infer it from a miss rate.
+///
+/// @param heads  heads[L] is the remote leftmost node at level L, for
+///               L in 0..layers-1. Entries at and above /layers/ are ignored.
+inline void bootstrapHeads(SkipVec &sv,
+                           std::array<RemoteAddr, kMaxLayers> const &heads) {
+  sv.set_head_remote_addrs(heads);
+}
+
+/// Whether bootstrapHeads() has run.
+inline bool headsBootstrapped(SkipVec const &sv) {
+  return sv.heads_bootstrapped();
+}
+
+/// Feed back what a remote descent saw, after locate_data() missed or a read
+/// showed a k_min mismatch (C4).
+///
+/// Installs the level-0 routing entry, then splits the local structure at the
+/// remote boundaries the descent actually observed, which is what repairs the
+/// *coarse* case: a local node that recorded a boundary as an ordinary entry
+/// because some other client created it. Idempotent.
+///
+/// @param data_k_min  k_min of the remote data node covering the sought key
+/// @param data_addr   that node's remote address
+/// @param path        what the descent saw, path[L] describing level L
+/// @param levels      valid entries in /path/; 0 (or a null path) repairs the
+///                    entry only, and leaves promoted nodes null-addressed
+inline void reconcile(SkipVec &sv, Key data_k_min, RemoteAddr data_addr,
+                      PathStep const *path, uint32_t levels) {
+  if (path == nullptr || levels == 0) {
+    sv.mirror_reconcile(data_k_min, data_addr, nullptr, 0);
+    return;
   }
+
+  // A path can never be longer than the level cap, so this needs no allocation.
+  // The conversion is field-by-field rather than a reinterpret_cast: the two
+  // layouts happen to agree today, but a cast would break silently if the cache
+  // reordered its fields, whereas this stops compiling.
+  if (levels > kMaxLayers) {
+    levels = kMaxLayers;
+  }
+  std::array<typename SkipVec::path_step, kMaxLayers> steps{};
+  for (uint32_t i = 0; i < levels; ++i) {
+    steps[i].k_min = path[i].k_min;
+    steps[i].addr = path[i].addr;
+    steps[i].first_down = path[i].first_down;
+  }
+  sv.mirror_reconcile(data_k_min, data_addr, steps.data(), levels);
+}
+
+/// Gather the remote address of the node covering k at each level a key of
+/// /height/ will occupy, i.e. levels 0..height-1.
+///
+/// Any entry may come back null, meaning the covering node at that level has no
+/// known remote counterpart; the caller must treat that as a per-level miss and
+/// resolve it remotely.
+///
+/// @param out  must have room for /height/ entries
+inline bool gatherPrevs(SkipVec &sv, Key k, uint32_t height, RemoteAddr *out) {
+  return sv.gather_prevs(k, height, out);
+}
+
+/// Record a remote structural change that has already committed.
+///
+/// A key of height h occupies levels 0..h-1: at levels 0..h-2 it becomes the
+/// minimum of a newly created node, and at h-1 it is inserted into the existing
+/// node covering it. So index_addrs[L] for L < h-1 is the address of the node
+/// the remote split *created* at level L, while index_addrs[h-1] is an orphan
+/// address or null.
+///
+/// Height 0 needs no cache update at all -- a data-layer-only change does not
+/// alter index structure -- so this rejects it rather than asserting inside the
+/// cache.
+///
+/// @param layers  the runtime level count, to clamp /height/ against; the cache
+///                asserts internally if a height exceeds it
+inline void mirrorInsert(SkipVec &sv, Key k, uint32_t height,
+                         RemoteAddr data_addr,
+                         std::array<RemoteAddr, kMaxLayers> const &index_addrs,
+                         uint32_t layers) {
+  if (height == 0) {
+    return;
+  }
+  if (height > layers) {
+    height = layers;
+  }
+  sv.mirror_insert(k, static_cast<int>(height), data_addr, index_addrs);
+}
+
+/// Local node count at each level, 0 being the directory layer.
+///
+/// SEQUENTIAL-ONLY: walks the level chains without taking the sequence locks,
+/// so only call it while the cache is quiescent. This is the numerator of
+/// metric 2 (local nodes / remote nodes per level), which is what detects the
+/// bloat failure mode in A9.
+inline std::array<size_t, kMaxLayers> nodeCounts(SkipVec const &sv,
+                                                 uint32_t layers) {
+  std::array<size_t, kMaxLayers> counts{};
+  for (uint32_t L = 0; L < layers && L < kMaxLayers; ++L) {
+    counts[L] = sv.node_count(static_cast<int>(L));
+  }
+  return counts;
+}
+
+/// Orphan count and total entries at /level/.
+///
+/// SEQUENTIAL-ONLY, as node_count is. Orphans are ordinary skip-vector
+/// structure produced by the capacity-versus-promotion geometry, not
+/// divergence: with matched capacities (A4) the remote generates them at the
+/// same rate. Reported so the ~21% steady-state figure in A9 can be confirmed
+/// rather than assumed.
+struct LevelStats {
+  size_t nodes = 0;
+  size_t orphans = 0;
+  size_t entries = 0;
+};
+
+inline LevelStats levelStats(SkipVec const &sv, uint32_t level) {
+  LevelStats s;
+  sv.for_each_node(static_cast<int>(level),
+                   [&s](Key, bool is_orphan, size_t entry_count) {
+                     ++s.nodes;
+                     s.orphans += is_orphan ? 1 : 0;
+                     s.entries += entry_count;
+                   });
+  return s;
 }
 
 }  // namespace ds
