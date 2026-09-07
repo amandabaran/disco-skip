@@ -5,10 +5,10 @@
 #include <vector>
 #include <stdexcept>
 
-#include "chimera_state.hpp"
+#include "disco_skip_state.hpp"
 #include "register.hpp"
 
-namespace chimera {
+namespace ds {
 
 class RangeFuture : public BasicFuture {
 public:
@@ -31,7 +31,7 @@ private:
     timepoint start_time;
 
 public:
-    RangeFuture(ChimeraState& s, uint64_t id) : BasicFuture{s, id} {
+    RangeFuture(DsState& s, uint64_t id) : BasicFuture{s, id} {
         ongoing_per_server.assign(state.layout.num_servers, 0);
         bulk_bufs = state.layout.getBulkBufs(future_id);
         results_.reserve(state.layout.max_range);
@@ -105,7 +105,7 @@ public:
                 // Extract values (and optionally update the cache).
                 for (size_t off = 0; off < range_len; ++off) {
                     results_[off] = acc[off].fields.value;
-                    #if CHIMERA_CACHE_ENABLED
+                    #if DS_REG_CACHE_ENABLED
                         state.cache.put(start_key + off, acc[off]);
                     #endif
                 }
@@ -125,4 +125,4 @@ public:
     }
 };
 
-} // namespace chimera
+} // namespace ds

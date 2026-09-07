@@ -1,0 +1,69 @@
+# Local (off-cluster) gate for the remote side.
+#
+# The RDMA half needs libibverbs and a fabric, so it only builds on the
+# cluster. Everything here is plain C++: the RemoteAddr contract, the cache
+# instantiation, and the remote node layout. Running it costs a second and
+# catches the class of mistake -- a toggle that only compiles one way, a
+# RemoteAddr that stops being lock-free -- that is otherwise invisible until a
+# cluster deploy.
+#
+#   make          build and run every toggle combination
+#   make debug    same, with ASan + UBSan
+#
+# The cache half is header-only, so both targets depend on its headers too;
+# otherwise editing skipvector_disco.h leaves a stale binary.
+
+CXX      ?= g++
+CXXFLAGS := -std=c++17 -O1 -g -Wall -Wextra -Wpedantic -pthread
+LDFLAGS  := -pthread
+
+SRC_DIR   := ../src
+CACHE_DIR := ../include
+INCLUDES  := -I$(SRC_DIR) -I$(CACHE_DIR) -I$(CACHE_DIR)/include-cache
+
+# The cache reads MAX_THREADS from a header that is gitignored and generated
+# (see src/CMakeLists.txt for the build-tree copy). Off-cluster we fall back to
+# the checked-in template, which is what its own instructions say to do.
+MACHINE_DEFINES := $(CACHE_DIR)/include-cache/common/machine_defines.h
+
+HDRS := $(wildcard $(SRC_DIR)/ds_*.hpp) \
+        $(wildcard $(CACHE_DIR)/*.h) \
+        $(wildcard $(CACHE_DIR)/include-cache/*/*.h)
+
+# Every combination of the two toggles that invariants.md §9 defines.
+CONFIGS := cache1-repl1 cache1-repl3 cache0-repl1 cache0-repl3
+BINS    := $(addprefix obj/smoke-,$(CONFIGS))
+
+.PHONY: all check debug clean
+all: check
+
+$(MACHINE_DEFINES): $(CACHE_DIR)/include-cache/common/machine_defines.template.h
+	cp $< $@
+
+obj:
+	@mkdir -p obj
+
+define SMOKE_RULE
+obj/smoke-cache$(1)-repl$(2): local_smoke.cc $$(HDRS) $$(MACHINE_DEFINES) | obj
+	@echo "[CXX] cache=$(1) replicas=$(2)"
+	@$$(CXX) $$(CXXFLAGS) $$(INCLUDES) \
+	  -DDS_CACHE_ENABLED=$(1) -DDS_N_REPLICAS=$(2) \
+	  -DDS_MAX_LAYERS=8 -DDS_IDX_EXP=3 \
+	  $$< -o $$@ $$(LDFLAGS)
+endef
+
+$(eval $(call SMOKE_RULE,1,1))
+$(eval $(call SMOKE_RULE,1,3))
+$(eval $(call SMOKE_RULE,0,1))
+$(eval $(call SMOKE_RULE,0,3))
+
+check: $(BINS)
+	@for b in $(BINS); do echo "---- $$b ----"; $$b || exit 1; done
+	@echo "==== all toggle combinations pass ===="
+
+debug: CXXFLAGS := -std=c++17 -O0 -g3 -Wall -Wextra -Wpedantic -pthread -fsanitize=address,undefined
+debug: LDFLAGS  := -pthread -fsanitize=address,undefined
+debug: clean check
+
+clean:
+	rm -rf obj

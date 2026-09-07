@@ -4,7 +4,7 @@
 #include <cstddef>
 #include "register.hpp"
 
-namespace chimera {
+namespace ds {
 
 using ProcId = uint64_t;
 
@@ -16,6 +16,23 @@ struct Layout {
     uint64_t num_registers;
     uint64_t max_range;
     uint64_t majority;       // 0 = auto-compute (num_servers/2 + 1)
+
+    // Number of levels in the skip vector, counting the directory level as 0.
+    // Must be in (1, DS_MAX_LAYERS]; the cache asserts that range.
+    uint64_t cache_layers;
+
+    // Runtime arms of the two toggles. invariants.md §9 specifies
+    // DS_CACHE_ENABLED as compile-time, and it has to be: the cache is a member
+    // of DsState, so whether it exists at all is decided at build time. But the
+    // *no-cache baseline* wants to be a runtime arm, so one binary can produce
+    // both halves of the headline "RDMAs per op, cache on vs off" measurement
+    // without a rebuild. So: DS_CACHE_ENABLED decides whether the cache is
+    // compiled in, and consult_cache decides whether we ask it.
+    //
+    // Setting consult_cache with DS_CACHE_ENABLED=0 is a user error rather than
+    // a silent no-op; main.cpp rejects it.
+    bool consult_cache;
+    bool writeback;
 
     // Set by client at runtime after MR is allocated.
     // (Same pattern as swarm-kv: see Layout::client_local_region)
@@ -69,4 +86,4 @@ struct Layout {
     }
 };
 
-} // namespace chimera
+} // namespace ds

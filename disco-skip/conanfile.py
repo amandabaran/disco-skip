@@ -32,7 +32,9 @@ class DoryDiscoSkipConan(ConanFile):
         "lto": True,
     }
     generators = "cmake"
-    exports_sources = "src/*"
+    # `include/*` carries the compute-local cache half (header-only), which
+    # src/ now includes; without it the conan build cannot see the cache.
+    exports_sources = "src/*", "include/*"
     python_requires = "dory-compiler-options/0.0.1@dory/stable"
 
     def configure(self):

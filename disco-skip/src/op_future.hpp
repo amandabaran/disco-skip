@@ -5,7 +5,7 @@
 #include "put_future.hpp"
 #include "range_future.hpp"
 
-namespace chimera {
+namespace ds {
 
 class OpFuture : public BasicFuture {
 public:
@@ -18,7 +18,7 @@ private:
     RangeFuture range_f;
 
 public:
-    OpFuture(ChimeraState& s, uint64_t id)
+    OpFuture(DsState& s, uint64_t id)
         : BasicFuture{s, id}, get_f{s, id}, put_f{s, id}, range_f{s, id} {}
 
     // Dispatchers
@@ -100,4 +100,4 @@ public:
     }
 };
 
-} // namespace chimera
+} // namespace ds
