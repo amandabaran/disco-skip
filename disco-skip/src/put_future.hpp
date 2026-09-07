@@ -4,12 +4,13 @@
 #include <cstdint>
 #include <vector>
 #include <algorithm>
+#include <stdexcept>
 
 #include <dory/extern/ibverbs.hpp>
-#include "chimera_state.hpp"
+#include "disco_skip_state.hpp"
 #include "register.hpp"
 
-namespace chimera {
+namespace ds {
 
 class PutFuture : public BasicFuture {
 public:
@@ -31,7 +32,10 @@ private:
     std::vector<int64_t> ongoing_per_server;
     std::vector<bool> needs_cas;
 
-    uint64_t expected[8];
+    // Keyed by quorum slot. Fixed-size, so the quorum must fit; the ctor
+    // checks it rather than letting a larger quorum write off the end.
+    static constexpr size_t kMaxQuorum = 8;
+    uint64_t expected[kMaxQuorum];
     Register target_reg;
     uint64_t success_count = 0;
 
@@ -61,7 +65,13 @@ private:
     // Since CAS returns the current remote value anyway, we don't need
     // a chained READ. If it succeeds, we progress. If it fails,
     // swap_bufs[server_idx] automatically holds the current value for fallback.
-    void postOptimisticChain(size_t server_idx) {
+    //
+    // NB: indexed by *quorum slot*, not by server index. expected[] is keyed by
+    // slot everywhere (postCas does the same); swap_bufs[] and
+    // ongoing_per_server[] are keyed by server. Mixing the two is why this
+    // used to read expected[server_idx] here and write expected[slot] below.
+    void postOptimisticChain(size_t slot) {
+        size_t const server_idx = state.quorum_indices[slot];
         auto& rc = *state.server_conns[server_idx];
         uintptr_t remote = Layout::remoteAddrOf(rc.remoteBuf(), key);
 
@@ -69,7 +79,7 @@ private:
             future_id,
             &swap_bufs[server_idx],
             remote,
-            expected[server_idx],   // what we think is there (from cache)
+            expected[slot],   // what we think is there (from cache)
             target_reg.raw);
 
         ongoing_per_server[server_idx] += 1;
@@ -98,7 +108,10 @@ private:
     }
 
 public:
-    PutFuture(ChimeraState& s, uint64_t id) : BasicFuture{s, id} {
+    PutFuture(DsState& s, uint64_t id) : BasicFuture{s, id} {
+        if (state.quorum > kMaxQuorum) {
+            throw std::runtime_error("PutFuture: quorum exceeds kMaxQuorum");
+        }
         ongoing_per_server.assign(state.layout.num_servers, 0);
         needs_cas.assign(state.layout.num_servers, false);
         read_bufs = state.layout.getReadBufs(future_id);
@@ -114,7 +127,7 @@ public:
         success_count = 0;
         std::fill(needs_cas.begin(), needs_cas.end(), false);
 
-#if CHIMERA_CACHE_ENABLED
+#if DS_REG_CACHE_ENABLED
         Register cached;
         if (state.cache.get(key, cached)) {
             // ─── Cache-hit fast path: optimistic doorbell-batched chain ───
@@ -126,14 +139,11 @@ public:
                 static_cast<uint16_t>(state.client_idx),
                 static_cast<uint32_t>(value));
 
-            // Same expected for every server — what we think the slot has
-            for (size_t i = 0; i < state.layout.num_servers; ++i) {
-                expected[i] = cached.raw;
-            }
+            // Same expected for every replica -- what we think the slot has.
             for (size_t i = 0; i < state.quorum; ++i) {
-                size_t r = state.quorum_indices[i];
-                needs_cas[r] = true;
-                postOptimisticChain(r);
+                expected[i] = cached.raw;
+                needs_cas[state.quorum_indices[i]] = true;
+                postOptimisticChain(i);
             }
             step = OptimisticChain;
             return;
@@ -181,29 +191,27 @@ public:
 
             // ─── Optimistic chain completed ─────────────────────────
             case OptimisticChain: {
-                uint16_t z_max = target_reg.fields.seq - 1; 
-                bool any_failed = false;
+                uint16_t z_max = target_reg.fields.seq - 1;
 
                 for (size_t i = 0; i < state.quorum; ++i) {
                     size_t r = state.quorum_indices[i];
                     Register observed = swap_bufs[r];
                     state.countRead();   // The CAS read component still counts as a read metric
 
-                    if (observed.raw == expected[r]) {
+                    if (observed.raw == expected[i]) {
                         // Optimistic CAS succeeded
                         needs_cas[r] = false;
                         success_count++;
                     } else {
                         // CAS failed — observed is the real current value returned by the hardware
                         state.countCasFail();
-                        any_failed = true;
-                        
                         expected[i] = observed.raw;
                         z_max = std::max(z_max, observed.fields.seq);
                     }
                 }
 
-                // Normalize succeeded entries' expected[i] to quorum-slot keying
+                // Succeeded replicas now hold target_reg, so that is what a
+                // later retry must expect from them.
                 for (size_t i = 0; i < state.quorum; ++i) {
                     size_t r = state.quorum_indices[i];
                     if (!needs_cas[r]) {
@@ -212,7 +220,7 @@ public:
                 }
 
                 if (success_count >= state.quorum) {
-#if CHIMERA_CACHE_ENABLED
+#if DS_REG_CACHE_ENABLED
                     state.cache.put(key, target_reg);
 #endif
                     if (measuring) {
@@ -239,8 +247,6 @@ public:
 
             // ─── Phase 2: CAS retry loop ────────────────────────────
             case CAS: {
-                bool any_failed = false;
-
                 for (size_t i = 0; i < state.quorum; ++i) {
                     size_t r = state.quorum_indices[i];
                     if (!needs_cas[r]) continue;
@@ -252,7 +258,6 @@ public:
                         success_count++;
                     } else {
                         state.countCasFail();
-                        any_failed = true;
                         expected[i] = observed.raw;
 
                         // If observed has higher-or-equal seq than our target,
@@ -275,7 +280,7 @@ public:
                 }
 
                 if (success_count >= state.quorum) {
-#if CHIMERA_CACHE_ENABLED
+#if DS_REG_CACHE_ENABLED
                     state.cache.put(key, target_reg);
 #endif
                     if (measuring) {
@@ -299,4 +304,4 @@ public:
     }
 };
 
-} // namespace chimera
+} // namespace ds

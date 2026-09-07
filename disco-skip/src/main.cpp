@@ -22,9 +22,9 @@
 #include <dory/memstore/store.hpp>
 #include <dory/shared/match.hpp>
 
-// Chimera headers
+// Disco-skip headers
 #include "layout.hpp"
-#include "chimera_client.hpp"
+#include "disco_skip_client.hpp"
 #include "op_future.hpp"
 #include "register.hpp"
 #include "range_future.hpp" // Integrated your RangeFuture class definition
@@ -36,10 +36,6 @@ const uint64_t default_warmup     = 1'000'000;
 const uint64_t default_iter_count = 1'000'000;
 const uint64_t default_keepwarm   =   500'000;
 
-namespace chimera {
-    bool cache_enabled = false;
-    bool writeback_enabled = false;
-}
 
 enum OpType { OpGet, OpPut, OpScan };
 
@@ -62,7 +58,7 @@ struct PipeDeleter {
 std::unique_ptr<FILE, PipeDeleter> exec(const std::string& cmd);
 size_t pseudo_hash(const std::string& str);
 void run_ml_prog_tracker_workload(
-    chimera::ChimeraClient& client, 
+    ds::DsClient& client, 
     uint64_t global_thread_id, 
     uint64_t num_registers,
     uint64_t ops_to_run);
@@ -85,7 +81,7 @@ size_t pseudo_hash(const std::string& str) {
 }
 
 void run_ml_prog_tracker_workload(
-    chimera::ChimeraClient& client, 
+    ds::DsClient& client, 
     uint64_t global_thread_id, 
     uint64_t num_clients,        // total client count (was num_registers)
     uint64_t ops_to_run,
@@ -187,16 +183,19 @@ void run_ml_prog_tracker_workload(
 }
 
 int main(int argc, char** argv) {
-    chimera::ProcId proc_id = 0;
+    ds::ProcId proc_id = 0;
     bool show_help = false;
 
-    chimera::Layout layout;
+    ds::Layout layout;
     layout.num_clients       = 1;
     layout.num_servers       = 1;
     layout.async_parallelism = 1;
     layout.num_registers     = 100000;
     layout.max_range         = 10;
     layout.majority          = 0;
+    layout.cache_layers      = 4;
+    layout.consult_cache     = DS_CACHE_ENABLED ? true : false;
+    layout.writeback         = DS_REG_WRITEBACK_ENABLED ? true : false;
 
     // Set by client at runtime after MR is allocated.
     // (Same pattern as swarm-kv: see Layout::client_local_region)
@@ -233,6 +232,8 @@ int main(int argc, char** argv) {
             .optional()["-r"]["--regs"] |
         lyra::opt(layout.max_range, "max_range")
             .optional()["--maxrange"] |
+        lyra::opt(layout.cache_layers, "cache_layers")
+            .optional()["--layers"]("Skip-vector level count, directory = 0 (default 4)") |
         lyra::opt(rq_p,  "rq_p" ).optional()["--rq"] |
         lyra::opt(get_p, "get_p").optional()["--get"] |
         lyra::opt(put_p, "put_p").optional()["--put"] |
@@ -241,10 +242,11 @@ int main(int argc, char** argv) {
         lyra::opt(detailed, "detailed").optional()["-d"]["--detailed"] |
         lyra::opt(iter_count, "iter_count").optional()["-I"]["--iter_count"] |
         lyra::opt(warmup,     "warmup")    .optional()["-W"]["--warmup"] |
-        lyra::opt(chimera::cache_enabled, "cache")
-            ["--cache"]("Enable or disable the Chimera cache system (1 or 0)") |
-        lyra::opt(chimera::writeback_enabled, "writeback")
-            ["--writeback"]("Enable or disable writeback in CAS-ABD protocol (1 or 0)") |
+        lyra::opt(layout.consult_cache, "cache")
+            ["--cache"]("Consult the local skip-vector cache (1 or 0). Requires a "
+                        "DS_CACHE_ENABLED build; 0 gives the no-cache baseline.") |
+        lyra::opt(layout.writeback, "writeback")
+            ["--writeback"]("Enable or disable writeback in the CAS-ABD protocol (1 or 0)") |
         lyra::opt(run_ml_workload, "ml").optional()["--ml"] |
         lyra::opt(think_time, "think").optional()["--think"];
 
@@ -267,6 +269,23 @@ int main(int argc, char** argv) {
 
     if (layout.majority == 0) {
         layout.majority = layout.num_servers / 2 + 1;
+    }
+
+    // The cache asserts layers > 1 && layers <= MAX_LAYERS in its constructor,
+    // which would abort with no explanation. Fail with one instead.
+    if (layout.cache_layers <= 1 || layout.cache_layers > DS_MAX_LAYERS) {
+        std::cerr << "--layers must be in (1, " << DS_MAX_LAYERS
+                  << "], got " << layout.cache_layers << std::endl;
+        return 1;
+    }
+
+    // --cache 1 against a DS_CACHE_ENABLED=0 build cannot be honoured: the
+    // cache is not compiled in. This used to be accepted and ignored, so every
+    // artifact script has been passing a flag that did nothing.
+    if (layout.consult_cache && !DS_CACHE_ENABLED) {
+        std::cerr << "--cache 1 requires a build with DS_CACHE_ENABLED=1 "
+                     "(see src/CMakeLists.txt)" << std::endl;
+        return 1;
     }
 
     if(run_ml_workload){
@@ -335,8 +354,8 @@ int main(int argc, char** argv) {
         ctrl::ControlBlock::REMOTE_READ | ctrl::ControlBlock::REMOTE_WRITE |
         ctrl::ControlBlock::REMOTE_ATOMIC);
 
-    std::vector<chimera::ProcId> remote_ids;
-    for (chimera::ProcId id = 1; id <= num_proc; id++) {
+    std::vector<ds::ProcId> remote_ids;
+    for (ds::ProcId id = 1; id <= num_proc; id++) {
         if (id == proc_id) continue;
         remote_ids.push_back(id);
     }
@@ -354,7 +373,7 @@ int main(int argc, char** argv) {
 
     // ─── Connection exchange ───────────────────────────────────────
     auto& store = memstore::MemoryStore::getInstance();
-    dory::conn::RcConnectionExchanger<chimera::ProcId> ce(proc_id, remote_ids, cb);
+    dory::conn::RcConnectionExchanger<ds::ProcId> ce(proc_id, remote_ids, cb);
 
     for (auto const& id : remote_ids) {
         auto cq = fmt::format("cq{}", id);
@@ -379,7 +398,7 @@ int main(int argc, char** argv) {
     ce.unannounceReady(store, "qp", "prepared");
 
     if (is_client) {
-        chimera::ChimeraClient client{layout, ce, proc_id};
+        ds::DsClient client{layout, ce, proc_id};
 
         // SWARM PATTERN: First client triggers initial data loading phase
         if (proc_id == (layout.num_servers + 1)) {
@@ -411,7 +430,7 @@ int main(int argc, char** argv) {
             for (size_t kvIndex = 0; kvIndex < inserts.size(); kvIndex++) {
                 client.finishAllFutures();
                 
-                // Extract numerical representation of key string for Chimera's register mapping
+                // Extract numerical representation of key string for the register mapping
                 uint64_t target_reg = std::stoull(inserts[kvIndex].first.substr(4)) % layout.num_registers;
                 // std::cout << "Inserting register: " << target_reg << std::endl;
                 client.getFreeFuture().doPut(target_reg, 69, false);

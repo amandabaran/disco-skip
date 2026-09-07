@@ -6,20 +6,20 @@
 #include <dory/conn/rc-exchanger.hpp>
 #include <dory/extern/ibverbs.hpp>
 
-#include "chimera_state.hpp"
+#include "disco_skip_state.hpp"
 #include "op_future.hpp"
 
-namespace chimera {
+namespace ds {
 
-class ChimeraClient {
+class DsClient {
 private:
-    ChimeraState state;
+    DsState state;
     std::vector<OpFuture> futures;
     std::vector<bool> progress;
     std::vector<RangeFuture> range_futures;
     std::vector<bool> range_progress;
 public:
-    ChimeraClient(Layout layout,
+    DsClient(Layout layout,
               dory::conn::RcConnectionExchanger<ProcId>& rcx,
               ProcId proc_id)
     : state{layout, rcx, proc_id} {
@@ -35,53 +35,23 @@ public:
         }
     }
 
-    // Drain CQs across all server connections.  Routes each completion to
-    // its owning future via wr_id, and flips `progress[i]` so the user loop
+    // Drain the send CQs across all server connections. Routes each completion
+    // to its owning future via wr_id, and flips `progress[i]` so the user loop
     // knows to call tryStepForward on it.
-    // bool tickRdma() {
-    //     bool any_progress = false;
-    //     for (size_t s = 0; s < state.layout.num_servers; ++s) {
-    //         auto& rc = *state.server_conns[s];
-    //         auto& tp = state.to_poll_per_server[s];
-    //         if (tp == 0) continue;
-
-    //         state.wces.resize(static_cast<size_t>(tp));
-    //         if (!rc.pollCqIsOk(dory::conn::ReliableConnection::SendCq, state.wces)) {
-    //             throw std::runtime_error("Error polling CQ");
-    //         }
-    //         for (auto const& wc : state.wces) {
-    //             if (wc.status != IBV_WC_SUCCESS) {
-    //                 throw std::runtime_error("WC unsuccessful");
-    //             }
-    //             uint64_t raw_id = wc.wr_id;
-    //             bool is_range_op = (raw_id >> 63) != 0;
-    //             uint64_t clean_id = raw_id & ~(1ULL << 63);
-
-    //             if (is_range_op) {
-    //                 range_futures.at(clean_id).addToOngoingRDMA(s, -1); // Or appropriate hook
-    //                 range_progress.at(clean_id) = true;
-    //             } else {
-    //                 futures.at(clean_id).addToOngoingRDMA(s, -1);
-    //                 progress.at(clean_id) = true;
-    //             }
-    //             any_progress = true;
-    //         }
-    //         tp -= static_cast<int64_t>(state.wces.size());
-    //     }
-    //     return any_progress;
-
-        
-    // }
-
     bool tickRdma() {
         bool any_progress = false;
         for (size_t s = 0; s < state.layout.num_servers; ++s) {
             auto& rc = *state.server_conns[s];
             auto& tp = state.to_poll_per_server[s];
-            if (tp == 0) continue;
+            if (tp <= 0) continue;
 
-            // Set maximum burst capacity step for the hardware poll step
-            state.wces.resize(128); 
+            // Poll at most as many completions as we actually have outstanding on
+            // this server. Resizing to a blind 128 lets one poll reap more CQEs
+            // than `tp` accounted for, and the decrement below then drives `tp`
+            // negative -- after which `tp == 0` is never true again and this
+            // server stops being polled. swarm-kv bounds it the same way
+            // (oops_client.hpp: wces.resize(to_poll)).
+            state.wces.resize(static_cast<size_t>(tp));
 
             // Dory shrinks state.wces.size() inside this function to match the real event count
             if (!rc.pollCqIsOk(dory::conn::ReliableConnection::SendCq, state.wces)) {
@@ -165,11 +135,11 @@ public:
         }
     }
 
-    ChimeraState& getState() { return state; }
+    DsState& getState() { return state; }
 
     void reportStats(bool detailed = false) {
         state.reportStats(detailed);
     }
 };
 
-} // namespace chimera
+} // namespace ds

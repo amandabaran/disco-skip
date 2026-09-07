@@ -3,11 +3,12 @@
 #include <chrono>
 #include <cstdint>
 #include <vector>
+#include <stdexcept>
 
-#include "chimera_state.hpp"
+#include "disco_skip_state.hpp"
 #include "register.hpp"
 
-namespace chimera {
+namespace ds {
 
 class GetFuture : public BasicFuture {
 public:
@@ -28,7 +29,10 @@ private:
 
     Register max_reg;
     uint64_t max_count = 0;
-    uint64_t expected[8];
+    // Keyed by quorum slot, like PutFuture's. Fixed-size, so the quorum must
+    // fit; the ctor checks it rather than writing off the end.
+    static constexpr size_t kMaxQuorum = 8;
+    uint64_t expected[kMaxQuorum];
 
     uint32_t result_value = 0;
     bool measuring = false;
@@ -54,7 +58,10 @@ private:
     }
 
 public:
-    GetFuture(ChimeraState& s, uint64_t id) : BasicFuture{s, id} {
+    GetFuture(DsState& s, uint64_t id) : BasicFuture{s, id} {
+        if (state.quorum > kMaxQuorum) {
+            throw std::runtime_error("GetFuture: quorum exceeds kMaxQuorum");
+        }
         ongoing_per_server.assign(state.layout.num_servers, 0);
         read_bufs = state.layout.getReadBufs(future_id);
         swap_bufs = state.layout.getSwapBufs(future_id);
@@ -110,12 +117,12 @@ public:
                     if (max_reg < reg)        { max_reg = reg; max_count = 1; }
                     else if (reg == max_reg)  { max_count++; }
                 }
-                #if CHIMERA_CACHE_ENABLED
+                #if DS_REG_CACHE_ENABLED
                 state.cache.put(key, max_reg);
                 #endif
                 result_value = max_reg.fields.value;
 
-#if CHIMERA_WRITEBACK_ENABLED
+#if DS_REG_WRITEBACK_ENABLED
                 if (max_count < state.quorum) {
                     state.countWriteback(true);
                     postWriteback();
@@ -157,4 +164,4 @@ public:
     }
 };
 
-} // namespace chimera
+} // namespace ds

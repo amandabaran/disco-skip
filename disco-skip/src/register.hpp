@@ -2,7 +2,6 @@
 
 #include <cstdint>
 #include <string>
-#include <format>
 
 // 1. Packed Register. Exactly 8 bytes for RDMA CAS and Read.
 struct Register {
