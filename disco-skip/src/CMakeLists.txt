@@ -76,7 +76,24 @@ add_executable(disco-skip ${HEADER_TIDER} main.cpp)
 # resolves the "include-cache/common/machine_defines.h" form used by the tests,
 # and DS_GEN_DIR resolves the bare "machine_defines.h" that
 # include-cache/common/config.h uses.
-target_include_directories(disco-skip PRIVATE
+#
+# SYSTEM, i.e. -isystem, is load bearing. The dory toolchain compiles with
+# -Werror plus a much stricter warning set than the cache half is written for
+# (its own include/Makefile uses only -Wall -Wextra -Wpedantic). Building it
+# with plain -I fails on, among others:
+#
+#   -Werror=sign-promo      cpu_policy_tools.h, config.h -- an unsigned enum
+#                           passed to std::to_string / operator<<
+#   -Werror=class-memaccess vector_sfra.h -- memcpy over atomic_kv, which is
+#                           deliberate and is exactly the relocation that
+#                           ds_remote_addr.hpp's lock-free static_asserts
+#                           exist to keep safe
+#
+# The cache is the other author's half of the repo and is not ours to edit, and
+# blanket -Wno-error=... would weaken those checks on our own code too.
+# -isystem suppresses diagnostics originating inside those headers while
+# leaving full strictness everywhere else, which is precisely what it is for.
+target_include_directories(disco-skip SYSTEM PRIVATE
     ${CMAKE_CURRENT_BINARY_DIR}/gen
     ${DS_GEN_DIR}
     ${DS_CACHE_DIR}

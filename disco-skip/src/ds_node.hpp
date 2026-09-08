@@ -13,7 +13,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <type_traits>
 
 #include "ds_defs.hpp"
@@ -342,7 +341,12 @@ inline void stampSlot(VecSlot &s, Handle h) noexcept {
 /// that is then written out -- never against remote memory directly.
 inline void initNode(NodeRecord &n, Key k_min, uint32_t level,
                      bool is_orphan) noexcept {
-  std::memset(&n, 0, sizeof(n));
+  // Value-initialisation, not memset: Handle has a user-provided default
+  // constructor, which makes NodeRecord non-trivially-default-constructible,
+  // and the dory build's -Werror=class-memaccess rejects memset over such a
+  // type. Aggregate init is also simply better here -- it zeroes the padding
+  // and the whole entry array without depending on sizeof.
+  n = NodeRecord{};
   n.k_min = k_min;
   n.level = level;
   n.handle = Handle::make(/*struct_ver=*/0, /*content_ver=*/0, /*slot=*/0,

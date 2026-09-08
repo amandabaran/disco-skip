@@ -57,11 +57,17 @@ struct PipeDeleter {
 // Clean forward declarations to satisfy -Wmissing-declarations
 std::unique_ptr<FILE, PipeDeleter> exec(const std::string& cmd);
 size_t pseudo_hash(const std::string& str);
+// Declared to match the definition below exactly. The previous version of this
+// declaration had four parameters against the definition's six, so it declared
+// an overload that never existed and left the real function undeclared --
+// which is what -Wmissing-declarations was reporting.
 void run_ml_prog_tracker_workload(
-    ds::DsClient& client, 
-    uint64_t global_thread_id, 
-    uint64_t num_registers,
-    uint64_t ops_to_run);
+    ds::DsClient& client,
+    uint64_t global_thread_id,
+    uint64_t num_clients,
+    uint64_t ops_to_run,
+    uint64_t think_time_ms,
+    dory::memstore::MemoryStore& store);
 
 std::unique_ptr<FILE, PipeDeleter> exec(const std::string& cmd) {
     auto raw_pipe = popen(cmd.c_str(), "r");

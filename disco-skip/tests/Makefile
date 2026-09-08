@@ -34,8 +34,20 @@ HDRS := $(wildcard $(SRC_DIR)/ds_*.hpp) \
 CONFIGS := cache1-repl1 cache1-repl3 cache0-repl1 cache0-repl3
 BINS    := $(addprefix obj/smoke-,$(CONFIGS))
 
-.PHONY: all check debug clean
-all: check
+# Approximation of the dory toolchain's warning set, which is far stricter than
+# the cache half's own Makefile. Clang-only equivalents are used where GCC's
+# spelling differs, and the GCC-specific flags it does not know are dropped.
+# -Wno-nested-anon-types exempts register.hpp's pre-existing anonymous struct in
+# an anonymous union (chimera's code, and GCC accepts it).
+STRICTFLAGS := -std=c++17 -O1 -Werror -Wall -Wextra -Wpedantic -Wconversion \
+               -Wfloat-equal -Wpointer-arith -Wpacked -Wmissing-field-initializers \
+               -Wunreachable-code -Wcast-align -Wcast-qual -Wformat=2 \
+               -Wformat-nonliteral -Wuninitialized -Wformat-security -Winit-self \
+               -Wold-style-cast -Wredundant-decls -Wundef -Wno-unused \
+               -Wno-nested-anon-types
+
+.PHONY: all check strict debug clean
+all: check strict
 
 $(MACHINE_DEFINES): $(CACHE_DIR)/include-cache/common/machine_defines.template.h
 	cp $< $@
@@ -64,6 +76,13 @@ check: $(BINS)
 debug: CXXFLAGS := -std=c++17 -O0 -g3 -Wall -Wextra -Wpedantic -pthread -fsanitize=address,undefined
 debug: LDFLAGS  := -pthread -fsanitize=address,undefined
 debug: clean check
+
+# Catches the class of failure that only shows up under the cluster's -Werror.
+strict: | obj
+	@echo "[CXX] strict warning set"
+	@$(CXX) $(STRICTFLAGS) $(INCLUDES) -DDS_CACHE_ENABLED=0 -DDS_N_REPLICAS=1 \
+	  -DDS_MAX_LAYERS=8 -DDS_IDX_EXP=3 strict_headers.cc -o obj/strict $(LDFLAGS)
+	@obj/strict > /dev/null; echo "==== headers clean under the strict warning set ===="
 
 clean:
 	rm -rf obj

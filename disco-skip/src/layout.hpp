@@ -48,7 +48,11 @@ struct Layout {
 
     // helper to pad sizes to 64-byte boundaries
     static constexpr size_t align64(size_t size) {
-        return (size + 63) & ~63;
+        // ~size_t{63}, not ~63: the latter is an int, and sign-extending it to
+        // size_t happens to produce the right mask on this platform while
+        // tripping -Wsign-conversion. Spelling the width out removes both the
+        // warning and the dependence on that accident.
+        return (size + 63) & ~size_t{63};
     }
 
     uint64_t firstClientId() const { return num_servers + 1; }
