@@ -194,6 +194,7 @@ int main(int argc, char** argv) {
     layout.max_range         = 10;
     layout.majority          = 0;
     layout.cache_layers      = 4;
+    layout.nodes_per_client  = 1 << 16;
     layout.consult_cache     = DS_CACHE_ENABLED ? true : false;
     layout.writeback         = DS_REG_WRITEBACK_ENABLED ? true : false;
 
@@ -234,6 +235,10 @@ int main(int argc, char** argv) {
             .optional()["--maxrange"] |
         lyra::opt(layout.cache_layers, "cache_layers")
             .optional()["--layers"]("Skip-vector level count, directory = 0 (default 4)") |
+        lyra::opt(layout.nodes_per_client, "nodes_per_client")
+            .optional()["--nodes-per-client"](
+                "Nodes in each client's arena stripe (default 65536). Nothing is "
+                "reclaimed, so this must cover the whole run.") |
         lyra::opt(rq_p,  "rq_p" ).optional()["--rq"] |
         lyra::opt(get_p, "get_p").optional()["--get"] |
         lyra::opt(put_p, "put_p").optional()["--put"] |
@@ -277,6 +282,20 @@ int main(int argc, char** argv) {
         std::cerr << "--layers must be in (1, " << DS_MAX_LAYERS
                   << "], got " << layout.cache_layers << std::endl;
         return 1;
+    }
+
+    // Allocation never reclaims, so a stripe that is too small stops the run
+    // partway with no way to recover. Fail now, with the arithmetic shown,
+    // rather than mid-benchmark.
+    if (layout.nodes_per_client == 0) {
+        std::cerr << "--nodes-per-client must be positive" << std::endl;
+        return 1;
+    }
+    {
+        double const arena_gb =
+            static_cast<double>(layout.nodeArenaSize()) / (1024.0 * 1024.0 * 1024.0);
+        std::cout << "Node arena: " << layout.nodeArenaNodes() << " nodes, "
+                  << arena_gb << " GiB per memory server" << std::endl;
     }
 
     // --cache 1 against a DS_CACHE_ENABLED=0 build cannot be honoured: the
@@ -344,8 +363,20 @@ int main(int argc, char** argv) {
     cb.registerPd("primary");
 
    {
-        size_t allocated_size = is_client ? layout.clientSize() : layout.serverSize();
+        // The server region holds the node arena, laid out identically on every
+        // replica. The legacy register array shares it while that path still
+        // exists, so the server takes whichever is larger rather than assuming
+        // the skip vector has displaced it yet.
+        size_t const server_size = std::max(layout.serverSize(), layout.nodeArenaSize());
+        size_t const allocated_size = is_client ? layout.totalClientSize() : server_size;
         cb.allocateBuffer("shared-buf", allocated_size, 64);
+        std::cout << (is_client ? "Client" : "Server") << " region: "
+                  << allocated_size << " bytes";
+        if (!is_client) {
+            std::cout << " (" << layout.nodeArenaNodes() << " nodes of "
+                      << sizeof(ds::NodeRecord) << "B)";
+        }
+        std::cout << std::endl;
     }
 
     cb.registerMr(
@@ -368,7 +399,12 @@ int main(int argc, char** argv) {
     if (is_client) {
         layout.client_local_region = local_region;
     } else {
-        std::memset(reinterpret_cast<void*>(local_region), 0, layout.serverSize());
+        // Zeroing is not by itself a valid empty structure -- a zeroed node has
+        // next_k_min = 0 and so covers no key at all. The head records are
+        // written properly during bootstrap; this only makes the arena
+        // deterministic rather than whatever the allocator handed us.
+        std::memset(reinterpret_cast<void*>(local_region), 0,
+                    std::max(layout.serverSize(), layout.nodeArenaSize()));
     }
 
     // ─── Connection exchange ───────────────────────────────────────
