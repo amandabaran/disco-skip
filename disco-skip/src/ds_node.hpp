@@ -267,6 +267,33 @@ static_assert(sizeof(NodeRecord) % 64 == 0);
 static_assert(std::is_trivially_copyable_v<NodeRecord>);
 static_assert(std::is_trivially_copyable_v<VecSlot>);
 
+// ── Reserved node ids ───────────────────────────────────────────────────────
+//
+// Node ids are laid out as:
+//
+//     0                     null -- never allocated (see ds_remote_addr.hpp)
+//     1 .. kMaxLayers       the per-level head nodes, in level order
+//     kMaxLayers + 1        the initial data node
+//     kFirstDynamicId ...   per-client stripes (see Layout / NodeAllocator)
+//
+// Fixing the heads at known ids is what makes A1 cheap: the leftmost node at
+// each level has a stable address for the lifetime of the structure, so
+// set_head_remote_addrs() needs no discovery step and no memstore round trip --
+// only a barrier until the initialising client has written the records.
+//
+// These live here rather than in Layout because they are facts about node
+// identity, which both the arena layout and the bootstrap need to agree on.
+
+inline constexpr uint64_t kNullId = 0;
+inline constexpr uint64_t kHeadIdBase = 1;
+inline constexpr uint64_t kInitialDataId = kHeadIdBase + kMaxLayers;
+inline constexpr uint64_t kFirstDynamicId = kInitialDataId + 1;
+
+/// The head (leftmost) node at /level/, level 0 being the directory.
+inline constexpr RemoteAddr headAddr(uint32_t level) {
+  return RemoteAddr{kHeadIdBase + level};
+}
+
 /// The level a data (payload) node lives at.
 ///
 /// Levels 0..layers-1 are index levels, level 0 being the directory whose

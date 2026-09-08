@@ -34,6 +34,10 @@ HDRS := $(wildcard $(SRC_DIR)/ds_*.hpp) \
 CONFIGS := cache1-repl1 cache1-repl3 cache0-repl1 cache0-repl3
 BINS    := $(addprefix obj/smoke-,$(CONFIGS))
 
+# The structure verifier and the bootstrap builder, against a fake arena. Needs
+# no cache and no toggle sweep -- it is pure remote-side logic.
+VERIFY  := obj/verify
+
 # Approximation of the dory toolchain's warning set, which is far stricter than
 # the cache half's own Makefile. Clang-only equivalents are used where GCC's
 # spelling differs, and the GCC-specific flags it does not know are dropped.
@@ -69,7 +73,13 @@ $(eval $(call SMOKE_RULE,1,3))
 $(eval $(call SMOKE_RULE,0,1))
 $(eval $(call SMOKE_RULE,0,3))
 
-check: $(BINS)
+$(VERIFY): verify_test.cc $(HDRS) $(MACHINE_DEFINES) | obj
+	@echo "[CXX] verify"
+	@$(CXX) $(CXXFLAGS) $(INCLUDES) -DDS_CACHE_ENABLED=0 -DDS_N_REPLICAS=1 \
+	  -DDS_MAX_LAYERS=8 -DDS_IDX_EXP=3 $< -o $@ $(LDFLAGS)
+
+check: $(BINS) $(VERIFY)
+	@echo "---- $(VERIFY) ----"; $(VERIFY) || exit 1
 	@for b in $(BINS); do echo "---- $$b ----"; $$b || exit 1; done
 	@echo "==== all toggle combinations pass ===="
 

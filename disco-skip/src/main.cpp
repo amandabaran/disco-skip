@@ -24,6 +24,9 @@
 
 // Disco-skip headers
 #include "layout.hpp"
+#include "ds_bootstrap.hpp"
+#include "ds_rdma.hpp"
+#include "ds_verify.hpp"
 #include "disco_skip_client.hpp"
 #include "op_future.hpp"
 #include "register.hpp"
@@ -61,6 +64,8 @@ size_t pseudo_hash(const std::string& str);
 // declaration had four parameters against the definition's six, so it declared
 // an overload that never existed and left the real function undeclared --
 // which is what -Wmissing-declarations was reporting.
+void bootstrap_structure(ds::DsState& state);
+int run_structure_selftest(ds::DsState& state);
 void run_ml_prog_tracker_workload(
     ds::DsClient& client,
     uint64_t global_thread_id,
@@ -68,6 +73,77 @@ void run_ml_prog_tracker_workload(
     uint64_t ops_to_run,
     uint64_t think_time_ms,
     dory::memstore::MemoryStore& store);
+
+// ─── Bootstrap ──────────────────────────────────────────────────────────
+//
+// The memory servers run no logic, so nobody there can initialise the
+// structure: one client writes it before anyone traverses. Zeroing the arena is
+// not enough -- a zeroed node has next_k_min == 0 and so covers no key at all.
+//
+// Called only by the first client, and only before the "initialized" barrier
+// that every process already waits on, so no new barrier is needed: any client
+// that has passed that barrier is guaranteed to see the structure.
+void bootstrap_structure(ds::DsState& state) {
+    uint32_t const layers = static_cast<uint32_t>(state.layout.cache_layers);
+
+    ds::InitialNode built[ds::kMaxLayers + 1];
+    uint32_t const count = ds::buildInitialStructure(layers, built);
+
+    // The HCA reads directly out of the source buffer, so it has to be MR
+    // resident -- a stack array would not be addressable. Future 0's staging
+    // slot is free at this point, since no future has started.
+    ds::NodeRecord* staging = state.layout.getStageNode(0);
+
+    for (uint32_t i = 0; i < count; ++i) {
+        *staging = built[i].record;
+        ds::writeNodeAllReplicas(state.server_conns, staging, built[i].addr);
+    }
+
+    std::cout << "Bootstrap: wrote " << count << " nodes ("
+              << layers << " heads + 1 data node) to "
+              << state.server_conns.size() << " replica(s)" << std::endl;
+}
+
+// ─── Structure selftest ─────────────────────────────────────────────────
+//
+// Walks the remote structure over RDMA and checks invariants.md §1. Deliberately
+// independent of YCSB so it can run on a bare server/client pair, which makes it
+// the cheapest way to find out whether the write paths are producing a
+// well-formed structure at all.
+//
+// Sequential by construction: it runs with no futures in flight, which both the
+// blocking RDMA helpers and the verifier require.
+int run_structure_selftest(ds::DsState& state) {
+    uint32_t const layers = static_cast<uint32_t>(state.layout.cache_layers);
+
+    std::cout << "\n################ Structure selftest:" << std::endl;
+
+    ds::NodeRecord* buf = state.layout.getNodeBufs(0);
+    ds::RdmaNodeReader<decltype(state.server_conns)> reader(state.server_conns, buf);
+    ds::VerifyReport const rep = ds::verifyStructure(reader, layers);
+
+    std::cout << "index nodes:  " << rep.nodes_visited
+              << " (" << rep.orphans << " orphans, " << rep.entries << " entries)"
+              << std::endl;
+    for (size_t L = 0; L < rep.nodes_per_level.size(); ++L) {
+        std::cout << "  level " << L << ": " << rep.nodes_per_level[L]
+                  << " nodes" << std::endl;
+    }
+    std::cout << "data nodes:   " << rep.data_nodes
+              << " (" << rep.data_entries << " entries)" << std::endl;
+    std::cout << "rdma reads:   " << reader.reads()
+              << " (" << reader.tornReads() << " torn, retried)" << std::endl;
+
+    if (rep.ok()) {
+        std::cout << "SELFTEST PASS: I1-I4 hold" << std::endl;
+        return 0;
+    }
+    std::cout << "SELFTEST FAIL: " << rep.errors.size() << " problem(s)" << std::endl;
+    for (auto const& e : rep.errors) {
+        std::cout << "  " << e << std::endl;
+    }
+    return 1;
+}
 
 std::unique_ptr<FILE, PipeDeleter> exec(const std::string& cmd) {
     auto raw_pipe = popen(cmd.c_str(), "r");
@@ -213,6 +289,7 @@ int main(int argc, char** argv) {
     uint64_t warmup     = UINT64_MAX;
 
     bool run_ml_workload = false;
+    bool run_selftest = false;
     uint64_t think_time = 0;
 
     std::string ycsb_path = "./YCSB/bin/ycsb.sh";
@@ -258,6 +335,9 @@ int main(int argc, char** argv) {
                         "DS_CACHE_ENABLED build; 0 gives the no-cache baseline.") |
         lyra::opt(layout.writeback, "writeback")
             ["--writeback"]("Enable or disable writeback in the CAS-ABD protocol (1 or 0)") |
+        lyra::opt(run_selftest, "selftest").optional()["--selftest"](
+            "Bootstrap the structure, verify invariants I1-I4 over RDMA, and "
+            "exit. Needs no YCSB and runs on a single server/client pair.") |
         lyra::opt(run_ml_workload, "ml").optional()["--ml"] |
         lyra::opt(think_time, "think").optional()["--think"];
 
@@ -441,6 +521,52 @@ int main(int argc, char** argv) {
 
     if (is_client) {
         ds::DsClient client{layout, ce, proc_id};
+        ds::DsState& state = client.getState();
+
+        // ─── Bootstrap the skip vector ─────────────────────────────
+        //
+        // The first client writes the initial structure. Everything below this
+        // point runs after the "initialized" barrier that every process already
+        // waits on, so there is no need for a barrier of our own: no client
+        // traverses before that barrier, and the writes complete before we
+        // announce.
+        bool const is_initializer = (proc_id == layout.firstClientId());
+        if (is_initializer) {
+            bootstrap_structure(state);
+        }
+
+#if DS_CACHE_ENABLED
+        // Hand the cache its head addresses. These are reserved constants, so
+        // this needs no discovery -- but it does need doing, because a cache
+        // that was never told them reports a miss for every key left of the
+        // first boundary at every level, which is correct but silently slow
+        // (interface doc §5).
+        ds::bootstrapHeads(state.cache_sv, ds::headAddrs(layout.cache_layers));
+        if (!ds::headsBootstrapped(state.cache_sv)) {
+            std::cerr << "Cache heads were not bootstrapped" << std::endl;
+            return 1;
+        }
+#endif
+
+        // ─── Structure selftest ────────────────────────────────────
+        //
+        // Its own path, so it needs neither YCSB nor a workload file. It has to
+        // run after every client has passed the barrier, since a concurrent
+        // bootstrap write would look like corruption to a sequential checker.
+        if (run_selftest) {
+            ce.announceReady(store, "qp", "initialized");
+            ce.waitReadyAll(store, "qp", "initialized");
+
+            int const rc = run_structure_selftest(state);
+            state.reportCache();
+
+            ce.announceReady(store, "qp", "finished");
+            ce.waitReadyAll(store, "qp", "finished");
+            ce.unannounceReady(store, "qp", "initialized");
+            ce.unannounceReady(store, "qp", "connected");
+            std::cout << "###DONE###" << std::endl;
+            return rc;
+        }
 
         // SWARM PATTERN: First client triggers initial data loading phase
         if (proc_id == (layout.num_servers + 1)) {

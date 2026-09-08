@@ -113,26 +113,15 @@ struct Layout {
     // and nothing is ever reclaimed. That is a capacity limit, not a leak: the
     // arena has to be sized for the whole run, which nodeArenaNodes() does.
 
-    /// Node ids are laid out as:
-    ///
-    ///     0                        null (never allocated -- see RemoteAddr)
-    ///     1 .. kMaxLayers          the per-level head nodes, in level order
-    ///     kMaxLayers + 1           the initial data node
-    ///     kFirstDynamicId ...      per-client stripes, nodes_per_client each
-    ///
-    /// Fixing the heads at known ids is what makes A1 cheap: the leftmost node
-    /// at each level has a stable address for the lifetime of the structure, so
-    /// set_head_remote_addrs() needs no discovery step and no memstore round
-    /// trip -- only a barrier to wait until the initialising client has written
-    /// the records.
-    static constexpr uint64_t kNullId = 0;
-    static constexpr uint64_t kHeadIdBase = 1;
-    static constexpr uint64_t kInitialDataId = kHeadIdBase + kMaxLayers;
-    static constexpr uint64_t kFirstDynamicId = kInitialDataId + 1;
-
-    /// The head (leftmost) node at /level/, level 0 being the directory.
+    // The reserved-id map and headAddr() live in ds_node.hpp, since they are
+    // facts about node identity that the bootstrap needs too. Re-exported here
+    // so call sites that already hold a Layout need not reach past it.
+    static constexpr uint64_t kNullId = ds::kNullId;
+    static constexpr uint64_t kHeadIdBase = ds::kHeadIdBase;
+    static constexpr uint64_t kInitialDataId = ds::kInitialDataId;
+    static constexpr uint64_t kFirstDynamicId = ds::kFirstDynamicId;
     static constexpr RemoteAddr headAddr(uint32_t level) {
-        return RemoteAddr{kHeadIdBase + level};
+        return ds::headAddr(level);
     }
 
     /// Total nodes the arena must hold, and hence the server-side allocation.

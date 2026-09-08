@@ -12,6 +12,8 @@
 #include "ds_defs.hpp"
 #include "ds_node.hpp"
 #include "layout.hpp"
+#include "ds_bootstrap.hpp"
+#include "ds_verify.hpp"
 
 // Reference enough of each header that the compiler cannot skip instantiating
 // the parts we care about.
@@ -36,6 +38,17 @@ int main() {
 
   ds::NodeAllocator alloc(0, l.nodes_per_client);
 
+  ds::InitialNode built[ds::kMaxLayers + 1];
+  uint32_t const built_n = ds::buildInitialStructure(2, built);
+  auto const heads = ds::headAddrs(2);
+
+  // Instantiate the verifier against a trivial reader so its body is compiled
+  // under the strict set too -- it is a template, so nothing else would.
+  struct NullReader {
+    bool read(ds::RemoteAddr, ds::NodeRecord &) { return false; }
+  } null_reader;
+  ds::VerifyReport const rep = ds::verifyStructure(null_reader, 2);
+
   return static_cast<int>(
       static_cast<unsigned>(ds::slotIsConsistent(n)) +
       static_cast<unsigned>(ds::covers(n, 42)) +
@@ -43,5 +56,8 @@ int main() {
       static_cast<unsigned>(n.handle.tag() != 0) +
       static_cast<unsigned>(l.nodeArenaNodes() != 0) +
       static_cast<unsigned>(ds::Layout::headAddr(0).isNull()) +
-      static_cast<unsigned>(alloc.allocate().isNull()));
+      static_cast<unsigned>(alloc.allocate().isNull()) +
+      static_cast<unsigned>(built_n != 0) +
+      static_cast<unsigned>(heads[0].isNull()) +
+      static_cast<unsigned>(rep.ok()));
 }
