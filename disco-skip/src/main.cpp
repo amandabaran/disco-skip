@@ -86,21 +86,32 @@ void run_ml_prog_tracker_workload(
 void bootstrap_structure(ds::DsState& state) {
     uint32_t const layers = static_cast<uint32_t>(state.layout.cache_layers);
 
+    // A non-null bootstrap timestamp: the initial structure is settled, not
+    // in-flight, so there is no operation for a reader to help complete. A null
+    // ts would make every early reader try to resolve a version nobody is
+    // writing.
     ds::InitialNode built[ds::kMaxLayers + 1];
-    uint32_t const count = ds::buildInitialStructure(layers, built);
+    uint32_t const count = ds::buildInitialStructure(layers, /*ts=*/1, built);
 
     // The HCA reads directly out of the source buffer, so it has to be MR
     // resident -- a stack array would not be addressable. Future 0's staging
-    // slot is free at this point, since no future has started.
-    ds::NodeRecord* staging = state.layout.getStageNode(0);
+    // slots are free at this point, since no future has started.
+    ds::NodeRecord* stage_node = state.layout.getStageNode(0);
+    ds::VecRecord* stage_vec = state.layout.getStageVec(0);
 
     for (uint32_t i = 0; i < count; ++i) {
-        *staging = built[i].record;
-        ds::writeNodeAllReplicas(state.server_conns, staging, built[i].addr);
+        // Vector first, then the header that names it. A reader that catches
+        // the header must never find its vector missing -- the same ordering F2
+        // uses, contents before the pointer that publishes them.
+        *stage_vec = built[i].vec;
+        ds::writeVecAllReplicas(state.server_conns, state.layout, stage_vec,
+                                built[i].vec_offset);
+        *stage_node = built[i].node;
+        ds::writeNodeAllReplicas(state.server_conns, stage_node, built[i].addr);
     }
 
-    std::cout << "Bootstrap: wrote " << count << " nodes ("
-              << layers << " heads + 1 data node) to "
+    std::cout << "Bootstrap: wrote " << count << " nodes + " << count
+              << " vectors (" << layers << " heads + 1 data node) to "
               << state.server_conns.size() << " replica(s)" << std::endl;
 }
 
@@ -118,8 +129,9 @@ int run_structure_selftest(ds::DsState& state) {
 
     std::cout << "\n################ Structure selftest:" << std::endl;
 
-    ds::NodeRecord* buf = state.layout.getNodeBufs(0);
-    ds::RdmaNodeReader<decltype(state.server_conns)> reader(state.server_conns, buf);
+    ds::RdmaNodeReader<decltype(state.server_conns)> reader(
+        state.server_conns, state.layout, state.layout.getNodeBufs(0),
+        state.layout.getVecBufs(0), &state.vec_hint);
     ds::VerifyReport const rep = ds::verifyStructure(reader, layers);
 
     std::cout << "index nodes:  " << rep.nodes_visited
@@ -131,8 +143,17 @@ int run_structure_selftest(ds::DsState& state) {
     }
     std::cout << "data nodes:   " << rep.data_nodes
               << " (" << rep.data_entries << " entries)" << std::endl;
+    std::cout << "old versions: " << rep.old_versions << std::endl;
     std::cout << "rdma reads:   " << reader.reads()
-              << " (" << reader.tornReads() << " torn, retried)" << std::endl;
+              << " (" << reader.unstableRetries() << " mid-split retries, "
+              << reader.staleRetries() << " stale-vector retries)" << std::endl;
+    if (state.vec_hint.enabled()) {
+        std::cout << "offset hint:  hit rate " << state.vec_hint.hitRate()
+                  << " (" << state.vec_hint.hits() << " hit / "
+                  << state.vec_hint.misses() << " miss)" << std::endl;
+    } else {
+        std::cout << "offset hint:  disabled" << std::endl;
+    }
 
     if (rep.ok()) {
         std::cout << "SELFTEST PASS: I1-I4 hold" << std::endl;
@@ -277,6 +298,8 @@ int main(int argc, char** argv) {
     layout.majority          = 0;
     layout.cache_layers      = 4;
     layout.nodes_per_client  = 1 << 16;
+    layout.vecs_per_client   = 1 << 18;
+    layout.offset_hint       = true;
     layout.consult_cache     = DS_CACHE_ENABLED ? true : false;
     layout.writeback         = DS_REG_WRITEBACK_ENABLED ? true : false;
 
@@ -322,6 +345,17 @@ int main(int argc, char** argv) {
             .optional()["--nodes-per-client"](
                 "Nodes in each client's arena stripe (default 65536). Nothing is "
                 "reclaimed, so this must cover the whole run.") |
+        lyra::opt(layout.vecs_per_client, "vecs_per_client")
+            .optional()["--vecs-per-client"](
+                "Vectors in each client's arena stripe (default 262144). Every "
+                "write allocates one, so this is the binding limit on run "
+                "length -- budget one per write, not one per node.") |
+        lyra::opt(layout.offset_hint, "offset_hint")
+            .optional()["--offset-hint"](
+                "Speculate the vector offset so a node read is one doorbell "
+                "batch instead of two serialised reads (1 or 0). Saves a round "
+                "trip when right, wastes a vector read when wrong, so it "
+                "favours read-heavy workloads.") |
         lyra::opt(rq_p,  "rq_p" ).optional()["--rq"] |
         lyra::opt(get_p, "get_p").optional()["--get"] |
         lyra::opt(put_p, "put_p").optional()["--put"] |
@@ -374,15 +408,25 @@ int main(int argc, char** argv) {
     // Allocation never reclaims, so a stripe that is too small stops the run
     // partway with no way to recover. Fail now, with the arithmetic shown,
     // rather than mid-benchmark.
-    if (layout.nodes_per_client == 0) {
-        std::cerr << "--nodes-per-client must be positive" << std::endl;
+    if (layout.nodes_per_client == 0 || layout.vecs_per_client == 0) {
+        std::cerr << "--nodes-per-client and --vecs-per-client must be positive"
+                  << std::endl;
         return 1;
     }
     {
-        double const arena_gb =
-            static_cast<double>(layout.nodeArenaSize()) / (1024.0 * 1024.0 * 1024.0);
-        std::cout << "Node arena: " << layout.nodeArenaNodes() << " nodes, "
-                  << arena_gb << " GiB per memory server" << std::endl;
+        auto gib = [](size_t b) {
+            return static_cast<double>(b) / (1024.0 * 1024.0 * 1024.0);
+        };
+        std::cout << "Node arena:   " << layout.nodeArenaNodes() << " nodes, "
+                  << gib(layout.nodeArenaSize()) << " GiB per memory server"
+                  << std::endl;
+        // The vector arena is the one that binds: every write allocates a
+        // vector and nothing is reclaimed (invariants.md §5 defers epoch GC),
+        // so this caps total writes for the whole run.
+        std::cout << "Vector arena: " << layout.vecArenaVecs() << " vectors, "
+                  << gib(layout.vecArenaSize()) << " GiB per memory server"
+                  << " -- caps writes at " << layout.vecs_per_client
+                  << " per client for the whole run" << std::endl;
     }
 
     // --cache 1 against a DS_CACHE_ENABLED=0 build cannot be honoured: the
@@ -450,18 +494,21 @@ int main(int argc, char** argv) {
     cb.registerPd("primary");
 
    {
-        // The server region holds the node arena, laid out identically on every
+        // The server region holds both arenas, laid out identically on every
         // replica. The legacy register array shares it while that path still
         // exists, so the server takes whichever is larger rather than assuming
         // the skip vector has displaced it yet.
-        size_t const server_size = std::max(layout.serverSize(), layout.nodeArenaSize());
+        size_t const server_size =
+            std::max(layout.registerRegionSize(), layout.serverSize());
         size_t const allocated_size = is_client ? layout.totalClientSize() : server_size;
         cb.allocateBuffer("shared-buf", allocated_size, 64);
         std::cout << (is_client ? "Client" : "Server") << " region: "
                   << allocated_size << " bytes";
         if (!is_client) {
             std::cout << " (" << layout.nodeArenaNodes() << " nodes of "
-                      << sizeof(ds::NodeRecord) << "B)";
+                      << sizeof(ds::NodeRecord) << "B + "
+                      << layout.vecArenaVecs() << " vectors of "
+                      << sizeof(ds::VecRecord) << "B)";
         }
         std::cout << std::endl;
     }
@@ -491,7 +538,7 @@ int main(int argc, char** argv) {
         // written properly during bootstrap; this only makes the arena
         // deterministic rather than whatever the allocator handed us.
         std::memset(reinterpret_cast<void*>(local_region), 0,
-                    std::max(layout.serverSize(), layout.nodeArenaSize()));
+                    std::max(layout.registerRegionSize(), layout.serverSize()));
     }
 
     // ─── Connection exchange ───────────────────────────────────────

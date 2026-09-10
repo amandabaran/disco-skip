@@ -93,7 +93,7 @@ inline bool blockingCas(dory::conn::ReliableConnection &rc, uint64_t *swap,
   return *swap == expected;
 }
 
-/// Write one node record to every replica.
+/// Write one node header to every replica.
 ///
 /// /staging/ must be an MR-resident NodeRecord holding the bytes to write. The
 /// same bytes go to every replica, since the arena layout is identical on all
@@ -107,49 +107,126 @@ void writeNodeAllReplicas(Conns &conns, NodeRecord *staging, RemoteAddr addr) {
   }
 }
 
+/// Write one vector to every replica.
+template <class Conns>
+void writeVecAllReplicas(Conns &conns, Layout const &layout, VecRecord *staging,
+                         VecOffset off) {
+  for (size_t r = 0; r < conns.size(); ++r) {
+    auto &rc = *conns[r];
+    blockingWrite(rc, staging, kVecRecordBytes,
+                  layout.vecAddrOf(rc.remoteBuf(), off));
+  }
+}
+
 /// A node reader satisfying StructureVerifier's Reader concept, backed by real
 /// RDMA reads.
 ///
-/// Retries a torn read rather than reporting it: interface doc §7 is explicit
-/// that a torn read means "re-read" and says nothing about the cache being
-/// wrong. Only a read that will not settle is reported, since during --selftest
-/// the structure is quiescent and so a persistent mismatch is real corruption,
-/// not a race.
+/// Vectors live out of line, so a node read is two regions: the 64-byte header,
+/// then the vector its handle names. Those are ordinarily serialised -- the
+/// offset is not known until the header lands.
+///
+/// The offset hint breaks that dependency. When it has a guess, both reads go
+/// out in one doorbell batch and the vector is validated against the handle
+/// afterwards; a wrong guess costs a wasted 320-byte read and a second,
+/// correct one, landing exactly where the unspeculated read would have. So the
+/// hint trades bandwidth for latency, never the reverse, which is why it is a
+/// toggle rather than always on: under write-heavy load every write moves the
+/// vector and the guess is usually wrong.
+///
+/// A header whose bookends disagree means a split is mid-propagation. This
+/// reader retries rather than helping, because it is used for --selftest over a
+/// quiescent structure, where a mismatch that will not settle is real
+/// corruption rather than a race. The operation state machines help instead;
+/// that is what makes their reads non-blocking.
 template <class Conns>
 class RdmaNodeReader {
  public:
-  /// @param buf  an MR-resident NodeRecord to read into
-  RdmaNodeReader(Conns &conns, NodeRecord *buf, size_t replica = 0)
-      : conns_(conns), buf_(buf), replica_(replica) {}
+  /// @param node_buf  MR-resident NodeRecord to read headers into
+  /// @param vec_buf   MR-resident VecRecord to read vectors into
+  RdmaNodeReader(Conns &conns, Layout const &layout, NodeRecord *node_buf,
+                 VecRecord *vec_buf, VecOffsetHint *hint = nullptr,
+                 size_t replica = 0)
+      : conns_(conns),
+        layout_(layout),
+        node_buf_(node_buf),
+        vec_buf_(vec_buf),
+        hint_(hint),
+        replica_(replica) {}
 
-  bool read(RemoteAddr a, NodeRecord &out) {
+  bool read(RemoteAddr a, NodeRecord &node, VecRecord &vec) {
     if (a.isNull()) return false;
     auto &rc = *conns_[replica_];
-    uintptr_t const remote = Layout::nodeAddrOf(rc.remoteBuf(), a);
+    uintptr_t const node_remote = Layout::nodeAddrOf(rc.remoteBuf(), a);
 
-    for (int attempt = 0; attempt < kTornReadRetries; ++attempt) {
-      blockingRead(rc, buf_, kNodeRecordBytes, remote);
-      ++reads_;
-      if (slotIsConsistent(*buf_)) {
-        out = *buf_;
-        return true;
+    for (int attempt = 0; attempt < kRetries; ++attempt) {
+      VecOffset const guess = hint_ != nullptr ? hint_->guess(a) : kNullVec;
+
+      // With a guess, fetch both regions in one batch; the vector may turn out
+      // to be the wrong version, which the check below catches.
+      if (guess != kNullVec) {
+        blockingRead(rc, node_buf_, kNodeRecordBytes, node_remote);
+        blockingRead(rc, vec_buf_, kVecRecordBytes,
+                     layout_.vecAddrOf(rc.remoteBuf(), guess));
+        reads_ += 2;
+      } else {
+        blockingRead(rc, node_buf_, kNodeRecordBytes, node_remote);
+        ++reads_;
       }
-      ++torn_;
+
+      if (!node_buf_->isStable()) {
+        ++unstable_;
+        continue;  // a split is propagating; re-read
+      }
+
+      VecOffset const truth = node_buf_->handle.offset();
+      if (hint_ != nullptr) hint_->record(a, truth, guess);
+
+      if (guess != truth) {
+        blockingRead(rc, vec_buf_, kVecRecordBytes,
+                     layout_.vecAddrOf(rc.remoteBuf(), truth));
+        ++reads_;
+      }
+
+      if (!vectorIsCurrent(*node_buf_, *vec_buf_, truth)) {
+        ++stale_;
+        continue;  // the node moved on between the two reads
+      }
+
+      node = *node_buf_;
+      vec = *vec_buf_;
+      return true;
     }
     return false;
   }
 
+  /// Fetch a vector by offset, for walking the old_ver chain. No validation:
+  /// a superseded version is exactly what the caller asked for.
+  bool readVec(VecOffset off, VecRecord &vec) {
+    if (off == kNullVec) return false;
+    auto &rc = *conns_[replica_];
+    blockingRead(rc, vec_buf_, kVecRecordBytes,
+                 layout_.vecAddrOf(rc.remoteBuf(), off));
+    ++reads_;
+    vec = *vec_buf_;
+    return true;
+  }
+
   [[nodiscard]] uint64_t reads() const { return reads_; }
-  [[nodiscard]] uint64_t tornReads() const { return torn_; }
+  [[nodiscard]] uint64_t unstableRetries() const { return unstable_; }
+  [[nodiscard]] uint64_t staleRetries() const { return stale_; }
 
  private:
-  static constexpr int kTornReadRetries = 8;
+  static constexpr int kRetries = 16;
 
   Conns &conns_;
-  NodeRecord *buf_;
+  Layout const &layout_;
+  NodeRecord *node_buf_;
+  VecRecord *vec_buf_;
+  VecOffsetHint *hint_;
   size_t replica_;
   uint64_t reads_ = 0;
-  uint64_t torn_ = 0;
+  uint64_t unstable_ = 0;
+  uint64_t stale_ = 0;
 };
 
 }  // namespace ds

@@ -53,9 +53,15 @@ namespace ds {
 /// be flagged orphan because verify_index() only tolerates an unreferenced node
 /// in a layer if it is one -- interface doc §3. The two flags answer different
 /// questions.)
+/// One node and its initial vector, ready to be written out.
+///
+/// The vector is a separate record at its own offset, so bootstrap writes two
+/// regions per node rather than one.
 struct InitialNode {
   RemoteAddr addr;
-  NodeRecord record;
+  VecOffset vec_offset;
+  NodeRecord node;
+  VecRecord vec;
 };
 
 /// How many nodes the initial structure has: one data node plus one head per
@@ -67,30 +73,44 @@ inline constexpr uint32_t initialNodeCount(uint32_t layers) {
 /// Build the initial structure into /out/, returning how many entries were
 /// filled. /out/ must have room for initialNodeCount(layers).
 ///
+/// Reserved vector offsets mirror the node ids, so node N's initial vector sits
+/// at offset N. That is only true of the reserved range -- past bootstrap the
+/// two spaces are independent, since every write moves a node to a new offset.
+///
+/// Every vector is created with a non-null timestamp. Bootstrap writes a
+/// settled structure, not an in-flight one: there is no operation for a reader
+/// to help complete, and a null ts would make every early reader try to resolve
+/// a version that nobody is writing.
+///
 /// @param layers  level count, counting the directory as 0. Must be > 1 and
 ///                <= kMaxLayers, which the caller validates.
-inline uint32_t buildInitialStructure(uint32_t layers, InitialNode *out) {
+/// @param ts      the bootstrap timestamp; must be non-null
+inline uint32_t buildInitialStructure(uint32_t layers, uint64_t ts,
+                                      InitialNode *out) {
   uint32_t n = 0;
 
   // The one data node. Empty, and covering [0, inf) since it has no successor.
   {
     InitialNode &in = out[n++];
     in.addr = RemoteAddr{kInitialDataId};
-    initNode(in.record, /*k_min=*/0, kDataLevel, /*is_orphan=*/false);
+    in.vec_offset = static_cast<VecOffset>(kInitialDataId);
+    initNode(in.node, /*k_min=*/0, kDataLevel, in.vec_offset);
+    initVec(in.vec, /*is_orphan=*/false, ts);
   }
 
   // Heads, bottom-up, each pointing at the one below.
   for (uint32_t level = 0; level < layers; ++level) {
     InitialNode &in = out[n++];
-    in.addr = RemoteAddr{kHeadIdBase + level};
-    initNode(in.record, /*k_min=*/0, level, /*is_orphan=*/false);
+    uint64_t const id = kHeadIdBase + level;
+    in.addr = RemoteAddr{id};
+    in.vec_offset = static_cast<VecOffset>(id);
+    initNode(in.node, /*k_min=*/0, level, in.vec_offset);
+    initVec(in.vec, /*is_orphan=*/false, ts);
 
-    uint64_t const child = (level == 0) ? kInitialDataId
-                                        : kHeadIdBase + (level - 1);
-    VecSlot &s = in.record.current();
-    s.size = 1;
-    s.e[0] = Entry{/*key=*/0, /*val=*/child};
-    stampSlot(s, in.record.handle);
+    uint64_t const child =
+        (level == 0) ? kInitialDataId : kHeadIdBase + (level - 1);
+    in.vec.size = 1;
+    in.vec.e[0] = Entry{/*key=*/0, /*val=*/child};
   }
 
   return n;

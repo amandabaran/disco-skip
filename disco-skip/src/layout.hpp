@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <vector>
 #include "ds_defs.hpp"
 #include "ds_node.hpp"
 #include "register.hpp"
@@ -28,6 +29,20 @@ struct Layout {
     // cover every node the client will create over the whole run, and the
     // server allocation scales with num_clients * this.
     uint64_t nodes_per_client;
+
+    // Likewise for the vector arena -- but this is the one that binds, because
+    // every write allocates a new vector (copy-on-write) while only a split
+    // allocates a node. Budget one per write, not one per node.
+    uint64_t vecs_per_client;
+
+    // Whether to speculate the current vector offset from a local hint so the
+    // header and vector reads can be issued in one doorbell batch. A wrong
+    // guess costs a wasted vector read -- bandwidth, a work request and a
+    // completion -- but not latency, since the fallback read lands where the
+    // unspeculated second read would have. So this is a bandwidth trade: worth
+    // it for read-heavy workloads, where the hint is usually right, and against
+    // for write-heavy ones, where every write moves the vector.
+    bool offset_hint;
 
     // Runtime arms of the two toggles. invariants.md §9 specifies
     // DS_CACHE_ENABLED as compile-time, and it has to be: the cache is a member
@@ -75,7 +90,8 @@ struct Layout {
     }
 
     size_t clientSize() const { return async_parallelism * perFutureSize(); }
-    size_t serverSize() const { return num_registers * sizeof(Register); }
+    /// Legacy flat-register region, kept while that path still exists.
+    size_t registerRegionSize() const { return num_registers * sizeof(Register); }
 
     // ─── Pointer accessors (use client_local_region) ───────────────────
     Register* getReadBufs(uint64_t future_id) const {
@@ -98,87 +114,118 @@ struct Layout {
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    // Skip-vector node arena
+    // Skip-vector arenas
     // ═══════════════════════════════════════════════════════════════════
     //
-    // The memory servers hold one flat array of NodeRecords, laid out
-    // identically on every replica. A node's identity is its index into that
-    // array -- a RemoteAddr -- which is why a RemoteAddr is replica-independent
-    // and has to be resolved against a particular connection's remoteBuf() to
-    // become an address. See ds_remote_addr.hpp for why it must not become a
-    // virtual address instead.
+    // The memory servers hold two flat arrays, laid out identically on every
+    // replica:
     //
-    // There is no free list. invariants.md §5 puts epoch GC explicitly out of
-    // scope, so allocation is a per-client bump pointer over a private stripe
-    // and nothing is ever reclaimed. That is a capacity limit, not a leak: the
-    // arena has to be sized for the whole run, which nodeArenaNodes() does.
+    //     [ node arena   : NodeRecord, 64 B each  ]
+    //     [ vector arena : VecRecord, 320 B each  ]
+    //
+    // A node's identity is its index into the first -- a RemoteAddr -- which is
+    // why a RemoteAddr is replica-independent and has to be resolved against a
+    // particular connection's remoteBuf() to become an address. A version's
+    // identity is its index into the second, which is what the handle's 32-bit
+    // offset field holds.
+    //
+    // Both are per-client bump allocators over private stripes, with no free
+    // list: invariants.md §5 puts epoch GC explicitly out of scope. For nodes
+    // that is a mild constraint. For vectors it is the binding one, because
+    // *every write allocates a vector* -- so the vector arena must hold one
+    // per write for the whole run. At 320 B that is ~32 GB cluster-wide for
+    // 1e8 writes, which means arena size bounds run length rather than the
+    // other way round. Worth knowing before a long run, and worth reporting,
+    // which is why vecArenaSize() is printed at startup.
 
-    // The reserved-id map and headAddr() live in ds_node.hpp, since they are
-    // facts about node identity that the bootstrap needs too. Re-exported here
-    // so call sites that already hold a Layout need not reach past it.
+    /// Reserved ids and offsets live in ds_node.hpp, next to headAddr(), since
+    /// they are facts about node identity the bootstrap needs too. Re-exported
+    /// so call sites holding a Layout need not reach past it.
     static constexpr uint64_t kNullId = ds::kNullId;
     static constexpr uint64_t kHeadIdBase = ds::kHeadIdBase;
     static constexpr uint64_t kInitialDataId = ds::kInitialDataId;
     static constexpr uint64_t kFirstDynamicId = ds::kFirstDynamicId;
+    static constexpr VecOffset kFirstDynamicVec = ds::kFirstDynamicVec;
     static constexpr RemoteAddr headAddr(uint32_t level) {
         return ds::headAddr(level);
     }
 
-    /// Total nodes the arena must hold, and hence the server-side allocation.
     uint64_t nodeArenaNodes() const {
         return kFirstDynamicId + num_clients * nodes_per_client;
     }
-
     size_t nodeArenaSize() const {
         return static_cast<size_t>(nodeArenaNodes()) * sizeof(NodeRecord);
     }
 
-    /// Address of a node on one replica. A node's address is also its handle's
-    /// address, since the handle sits at offset 0 -- so this doubles as the CAS
-    /// target.
+    uint64_t vecArenaVecs() const {
+        return kFirstDynamicVec + num_clients * vecs_per_client;
+    }
+    size_t vecArenaSize() const {
+        return static_cast<size_t>(vecArenaVecs()) * sizeof(VecRecord);
+    }
+
+    size_t vecArenaOffset() const { return align64(nodeArenaSize()); }
+    size_t serverSize() const { return vecArenaOffset() + vecArenaSize(); }
+
+    /// Address of a node on one replica. Also its handle's address, since the
+    /// handle sits at offset 0 -- so this doubles as the CAS target.
     static uintptr_t nodeAddrOf(uintptr_t remote_base, RemoteAddr a) {
         return remote_base + a.id * sizeof(NodeRecord);
     }
 
-    /// Address of one CoW slot within a node, for staging a new version without
-    /// rewriting the header.
-    static uintptr_t slotAddrOf(uintptr_t remote_base, RemoteAddr a,
-                                uint8_t slot) {
-        return nodeAddrOf(remote_base, a) + offsetof(NodeRecord, slot) +
-               static_cast<size_t>(slot & 1u) * sizeof(VecSlot);
+    /// Address of the node's next_id field, which a split CASes in place.
+    static uintptr_t nextIdAddrOf(uintptr_t remote_base, RemoteAddr a) {
+        return nodeAddrOf(remote_base, a) + offsetof(NodeRecord, next_id);
+    }
+    static uintptr_t nextKMinAddrOf(uintptr_t remote_base, RemoteAddr a) {
+        return nodeAddrOf(remote_base, a) + offsetof(NodeRecord, next_k_min);
+    }
+    /// tail_struct_ver is 4 bytes, but RDMA CAS is 8. It is CAS'd as the
+    /// 8-byte word it shares with `level`, which never changes after creation,
+    /// so the pair can be swapped atomically without disturbing it.
+    static uintptr_t tailWordAddrOf(uintptr_t remote_base, RemoteAddr a) {
+        return nodeAddrOf(remote_base, a) + offsetof(NodeRecord, level);
+    }
+
+    /// Address of one vector on one replica.
+    uintptr_t vecAddrOf(uintptr_t remote_base, VecOffset off) const {
+        return remote_base + vecArenaOffset() +
+               static_cast<size_t>(off) * sizeof(VecRecord);
+    }
+    /// Address of a vector's ts field, which readers CAS to resolve a pending
+    /// version.
+    uintptr_t vecTsAddrOf(uintptr_t remote_base, VecOffset off) const {
+        return vecAddrOf(remote_base, off) + offsetof(VecRecord, ts);
     }
 
     // ─── Per-future scratchpad for the skip-vector path ────────────────
     //
-    // Only buffers that RDMA reads into or writes out of need to live in the
+    // Only buffers RDMA reads into or writes out of need to live in the
     // registered MR. The descent path itself (PathStep[]) is ordinary client
     // memory and lives in the future object.
     //
-    // The descent reuses one node buffer per replica across levels: it is
-    // strictly sequential -- read level L, extract the PathStep, read level
-    // L-1 -- so per-level buffers would be dead space. The data node gets its
-    // own buffer because a Get holds both at once.
-    //
-    // Staging buffers are not per-replica: the same bytes go to every replica,
-    // so one copy is read by all of them.
+    // The descent reuses one node/vector buffer pair per replica across levels:
+    // it is strictly sequential -- read a header, maybe its vector, descend --
+    // so per-level buffers would be dead space. The data node gets its own pair
+    // because a Get holds both at once. Staging buffers are not per-replica,
+    // since the same bytes go to every replica.
 
     size_t nodeBufsSize() const { return static_cast<size_t>(num_servers) * sizeof(NodeRecord); }
-    size_t dataBufsSize() const { return static_cast<size_t>(num_servers) * sizeof(NodeRecord); }
+    size_t vecBufsSize() const { return static_cast<size_t>(num_servers) * sizeof(VecRecord); }
     size_t stageNodeSize() const { return sizeof(NodeRecord); }
-    size_t stageSlotSize() const { return sizeof(VecSlot); }
+    size_t stageVecSize() const { return sizeof(VecRecord); }
     size_t casBufsSize() const { return static_cast<size_t>(num_servers) * sizeof(uint64_t); }
 
     size_t nodePerFutureSize() const {
-        return align64(nodeBufsSize() + dataBufsSize() + stageNodeSize() +
-                       stageSlotSize() + casBufsSize());
+        return align64(2 * nodeBufsSize() + 2 * vecBufsSize() +
+                       stageNodeSize() + stageVecSize() + casBufsSize());
     }
-
     size_t nodeClientSize() const { return async_parallelism * nodePerFutureSize(); }
 
     /// Offset of the skip-vector scratchpad within the client region. The
-    /// legacy register scratchpad keeps the front of the region so both paths
-    /// can coexist while the skip-vector operations are built out; when the
-    /// register path is deleted this becomes 0.
+    /// legacy register scratchpad keeps the front so both paths can coexist
+    /// while the skip-vector operations are built out; this becomes 0 when the
+    /// register path goes.
     size_t nodeRegionOffset() const { return align64(clientSize()); }
 
     uintptr_t nodeFutureBase(uint64_t future_id) const {
@@ -186,28 +233,36 @@ struct Layout {
                future_id * nodePerFutureSize();
     }
 
-    NodeRecord* getNodeBufs(uint64_t future_id) const {
-        return reinterpret_cast<NodeRecord*>(nodeFutureBase(future_id));
+    // Layout within a future's slice, in order:
+    //   [idx nodes][idx vecs][data nodes][data vecs][stage node][stage vec][cas]
+    NodeRecord* getNodeBufs(uint64_t f) const {
+        return reinterpret_cast<NodeRecord*>(nodeFutureBase(f));
     }
-    NodeRecord* getDataBufs(uint64_t future_id) const {
-        return reinterpret_cast<NodeRecord*>(nodeFutureBase(future_id) + nodeBufsSize());
+    VecRecord* getVecBufs(uint64_t f) const {
+        return reinterpret_cast<VecRecord*>(nodeFutureBase(f) + nodeBufsSize());
     }
-    NodeRecord* getStageNode(uint64_t future_id) const {
-        return reinterpret_cast<NodeRecord*>(nodeFutureBase(future_id) +
-                                             nodeBufsSize() + dataBufsSize());
+    NodeRecord* getDataNodeBufs(uint64_t f) const {
+        return reinterpret_cast<NodeRecord*>(nodeFutureBase(f) + nodeBufsSize() +
+                                             vecBufsSize());
     }
-    VecSlot* getStageSlot(uint64_t future_id) const {
-        return reinterpret_cast<VecSlot*>(nodeFutureBase(future_id) + nodeBufsSize() +
-                                          dataBufsSize() + stageNodeSize());
+    VecRecord* getDataVecBufs(uint64_t f) const {
+        return reinterpret_cast<VecRecord*>(nodeFutureBase(f) + 2 * nodeBufsSize() +
+                                            vecBufsSize());
     }
-    uint64_t* getCasBufs(uint64_t future_id) const {
-        return reinterpret_cast<uint64_t*>(nodeFutureBase(future_id) + nodeBufsSize() +
-                                           dataBufsSize() + stageNodeSize() +
-                                           stageSlotSize());
+    NodeRecord* getStageNode(uint64_t f) const {
+        return reinterpret_cast<NodeRecord*>(nodeFutureBase(f) + 2 * nodeBufsSize() +
+                                             2 * vecBufsSize());
+    }
+    VecRecord* getStageVec(uint64_t f) const {
+        return reinterpret_cast<VecRecord*>(nodeFutureBase(f) + 2 * nodeBufsSize() +
+                                            2 * vecBufsSize() + stageNodeSize());
+    }
+    uint64_t* getCasBufs(uint64_t f) const {
+        return reinterpret_cast<uint64_t*>(nodeFutureBase(f) + 2 * nodeBufsSize() +
+                                           2 * vecBufsSize() + stageNodeSize() +
+                                           stageVecSize());
     }
 
-    /// Total client-side registered memory: the legacy register scratchpad
-    /// followed by the skip-vector one.
     size_t totalClientSize() const { return nodeRegionOffset() + nodeClientSize(); }
 };
 
@@ -252,6 +307,104 @@ public:
     /// the selftest uses to check stripe isolation.
     [[nodiscard]] bool owns(RemoteAddr a) const {
         return a.id >= first_ && a.id < end_;
+    }
+};
+
+
+/// Per-client bump allocator over that client's private stripe of the vector
+/// arena.
+///
+/// Separate from NodeAllocator because the two are consumed at wildly
+/// different rates: a node is allocated only by a split, a vector by every
+/// single write. Sharing one stripe would let write traffic starve splits.
+class VecAllocator {
+    VecOffset first_ = Layout::kFirstDynamicVec;
+    VecOffset next_ = Layout::kFirstDynamicVec;
+    VecOffset end_ = Layout::kFirstDynamicVec;
+
+public:
+    VecAllocator() = default;
+
+    VecAllocator(uint64_t client_idx, uint64_t vecs_per_client)
+        : first_(static_cast<VecOffset>(Layout::kFirstDynamicVec +
+                                        client_idx * vecs_per_client)),
+          next_(first_),
+          end_(static_cast<VecOffset>(first_ + vecs_per_client)) {}
+
+    /// Returns a fresh vector offset, or kNullVec when the stripe is spent.
+    ///
+    /// Exhaustion is not recoverable: with no reclamation, running out means
+    /// the run is longer than the arena was sized for. Callers treat it as a
+    /// hard error rather than retrying.
+    VecOffset allocate() {
+        if (next_ >= end_) return kNullVec;
+        return next_++;
+    }
+
+    [[nodiscard]] uint64_t allocated() const { return next_ - first_; }
+    [[nodiscard]] uint64_t remaining() const { return end_ - next_; }
+    [[nodiscard]] uint64_t capacity() const { return end_ - first_; }
+    [[nodiscard]] VecOffset firstOffset() const { return first_; }
+    [[nodiscard]] bool exhausted() const { return next_ >= end_; }
+    [[nodiscard]] bool owns(VecOffset o) const {
+        return o >= first_ && o < end_;
+    }
+};
+
+/// Last-seen vector offset per node, so the header read and the vector read can
+/// be issued in one doorbell batch instead of serialised on the header's
+/// answer.
+///
+/// Direct-mapped and indexed by node id, because node ids are dense indices
+/// into a bounded arena -- so this is a flat array with no hashing, no
+/// eviction, and O(1) lookup. It is purely client-local and never RDMA'd, which
+/// is why it lives here rather than in the registered MR.
+///
+/// It deliberately does NOT live in the cache. Cache entries are write-once:
+/// install_data_entry() ignores insert()'s "already present" return, so a hint
+/// packed into a REMOTE_ADDR could never be refreshed -- installed on first
+/// touch and stale forever after the first write. It would also undercut the
+/// §5 additivity argument, which rests on node addresses being stable.
+///
+/// A wrong hint costs a wasted vector read, not a round trip: the real read
+/// lands where the unspeculated one would have. So the toggle trades rNIC and
+/// PCIe bandwidth, which is the scarce resource under write-heavy load, and
+/// hitRate() is instrumented so the crossover is measured rather than assumed.
+class VecOffsetHint {
+    std::vector<VecOffset> hint_;
+    bool enabled_ = false;
+    uint64_t hits_ = 0;
+    uint64_t misses_ = 0;
+
+public:
+    VecOffsetHint() = default;
+    VecOffsetHint(size_t arena_nodes, bool enabled)
+        : hint_(enabled ? arena_nodes : 0, kNullVec), enabled_(enabled) {}
+
+    [[nodiscard]] bool enabled() const { return enabled_; }
+
+    /// The offset to speculate for /a/, or kNullVec for "no guess" -- in which
+    /// case the caller must serialise the two reads.
+    [[nodiscard]] VecOffset guess(RemoteAddr a) const {
+        if (!enabled_ || a.id >= hint_.size()) return kNullVec;
+        return hint_[a.id];
+    }
+
+    /// Record the true offset, learned from a header read. Also scores the
+    /// guess that preceded it, which is what hitRate() reports.
+    void record(RemoteAddr a, VecOffset truth, VecOffset guessed) {
+        if (!enabled_ || a.id >= hint_.size()) return;
+        if (guessed != kNullVec) {
+            if (guessed == truth) ++hits_; else ++misses_;
+        }
+        hint_[a.id] = truth;
+    }
+
+    [[nodiscard]] uint64_t hits() const { return hits_; }
+    [[nodiscard]] uint64_t misses() const { return misses_; }
+    [[nodiscard]] double hitRate() const {
+        uint64_t const n = hits_ + misses_;
+        return n == 0 ? 0.0 : static_cast<double>(hits_) / static_cast<double>(n);
     }
 };
 

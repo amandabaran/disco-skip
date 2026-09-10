@@ -41,152 +41,153 @@ static int g_failures = 0;
 //
 // Sizes and offsets are static_asserted in ds_node.hpp, so what is worth
 // testing here is the behaviour: that the version encoding round-trips, that
-// tag order really is lexicographic, that a torn read is detected, and that
-// findLte agrees with a brute-force scan.
+// tag order really is lexicographic, that the two in-progress markers work, and
+// that findLte agrees with a brute-force scan.
 
 static void checkHandleEncoding() {
-  // Round-trip every field, including values that would collide if the shifts
-  // or masks were wrong.
-  ds::Handle const h = ds::Handle::make(0xBEEF, 0xDEADBEEFu, 1,
-                                        ds::Handle::kFlagOrphan);
-  CHECK(h.structVer() == 0xBEEF, "struct_ver round-trips");
-  CHECK(h.contentVer() == 0xDEADBEEFu, "content_ver round-trips");
-  CHECK(h.slot() == 1, "slot round-trips");
-  CHECK(h.isOrphan(), "orphan flag round-trips");
+  ds::Handle const h = ds::Handle::make(0x2ABC, 0x1DEAD, 0xC0FFEEu);
+  CHECK(h.structVer() == 0x2ABC, "struct_ver round-trips");
+  CHECK(h.contentVer() == 0x1DEAD, "content_ver round-trips");
+  CHECK(h.offset() == 0xC0FFEEu, "offset round-trips");
 
   // Max values must not bleed into neighbouring fields.
-  ds::Handle const full = ds::Handle::make(0xFFFF, 0xFFFFFFFFu, 0xFF, 0xFF);
-  CHECK(full.structVer() == 0xFFFF, "max struct_ver");
-  CHECK(full.contentVer() == 0xFFFFFFFFu, "max content_ver");
+  ds::Handle const full = ds::Handle::make(ds::Handle::kMaxStructVer,
+                                           ds::Handle::kMaxContentVer, 0xFFFFFFFFu);
+  CHECK(full.structVer() == ds::Handle::kMaxStructVer, "max struct_ver");
+  CHECK(full.contentVer() == ds::Handle::kMaxContentVer, "max content_ver");
+  CHECK(full.offset() == 0xFFFFFFFFu, "max offset");
   CHECK(full.raw == ~uint64_t{0}, "all fields at max fill the word exactly");
 
-  // V3: a single operation moves at most one of the two versions.
-  ds::Handle const base = ds::Handle::make(5, 9, 0, 0);
-  ds::Handle const c = base.bumpContent(1);
-  CHECK(c.contentVer() == 10 && c.structVer() == 5, "bumpContent moves only content_ver");
-  CHECK(c.slot() == 1, "bumpContent switches slot");
-  ds::Handle const st = base.bumpStruct(1, 0);
-  CHECK(st.structVer() == 6 && st.contentVer() == 9, "bumpStruct moves only struct_ver");
+  // V3: one operation moves at most one version, and both move the content to
+  // a new offset, since versions are copy-on-write.
+  ds::Handle const base = ds::Handle::make(5, 9, 100);
+  ds::Handle const c = base.withContent(200);
+  CHECK(c.contentVer() == 10 && c.structVer() == 5, "withContent moves only content_ver");
+  CHECK(c.offset() == 200, "withContent takes the new offset");
+  ds::Handle const st = base.withStruct(300);
+  CHECK(st.structVer() == 6 && st.contentVer() == 9, "withStruct moves only struct_ver");
 
-  // L3: tag order is (struct_ver, content_ver) lexicographic. The point of the
-  // bit layout is that a plain unsigned compare on tag() gives exactly that, so
-  // the max-tag quorum read (L2) is one integer comparison. Check it as a
-  // property against the pair ordering it is supposed to reproduce, including
-  // the case that matters: a higher struct_ver must win even when its
-  // content_ver is far lower.
+  // L3: tag order is (struct_ver, content_ver) lexicographic, and the bit
+  // layout exists so a plain unsigned compare on tag() reproduces it -- making
+  // L2's max-tag quorum read one integer comparison. Checked as a property
+  // with the offset varied, to prove it cannot perturb the comparison.
   std::mt19937_64 rng(7);
   for (int i = 0; i < 20000; ++i) {
-    uint32_t const s1 = static_cast<uint32_t>(rng() & 0xFFFF);
-    uint32_t const c1 = static_cast<uint32_t>(rng());
-    uint32_t const s2 = static_cast<uint32_t>(rng() & 0xFFFF);
-    uint32_t const c2 = static_cast<uint32_t>(rng());
-    // Vary slot and flags too: they must not affect the comparison at all.
-    ds::Handle const a = ds::Handle::make(s1, c1, static_cast<uint8_t>(rng()),
-                                          static_cast<uint8_t>(rng()));
-    ds::Handle const b = ds::Handle::make(s2, c2, static_cast<uint8_t>(rng()),
-                                          static_cast<uint8_t>(rng()));
-    bool const want = (s1 != s2) ? (s1 < s2) : (c1 < c2);
-    bool const got = a.tag() < b.tag();
+    uint32_t const s1 = static_cast<uint32_t>(rng()) & ds::Handle::kMaxStructVer;
+    uint32_t const c1 = static_cast<uint32_t>(rng()) & ds::Handle::kMaxContentVer;
+    uint32_t const s2 = static_cast<uint32_t>(rng()) & ds::Handle::kMaxStructVer;
+    uint32_t const c2 = static_cast<uint32_t>(rng()) & ds::Handle::kMaxContentVer;
+    ds::Handle const a = ds::Handle::make(s1, c1, static_cast<uint32_t>(rng()));
+    ds::Handle const b = ds::Handle::make(s2, c2, static_cast<uint32_t>(rng()));
     if (s1 == s2 && c1 == c2) {
-      CHECK(a.tag() == b.tag(), "equal version pairs compare equal regardless of slot/flags");
+      CHECK(a.tag() == b.tag(), "equal version pairs compare equal whatever the offset");
     } else {
-      CHECK(got == want, "tag() order is lexicographic on (struct_ver, content_ver)");
+      bool const want = (s1 != s2) ? (s1 < s2) : (c1 < c2);
+      CHECK((a.tag() < b.tag()) == want,
+            "tag() order is lexicographic on (struct_ver, content_ver)");
     }
   }
-  CHECK(ds::Handle::make(1, 0, 0).tag() > ds::Handle::make(0, 0xFFFFFFFFu, 0).tag(),
-        "a struct_ver bump outranks any content_ver");
+  CHECK(ds::Handle::make(1, 0, 0xFFFFFFFFu).tag() >
+            ds::Handle::make(0, ds::Handle::kMaxContentVer, 0).tag(),
+        "a struct_ver bump outranks any content_ver, whatever the offsets");
 }
 
-static void checkSlotConsistency() {
+static void checkInProgressMarkers() {
   ds::NodeRecord n;
-  ds::initNode(n, /*k_min=*/100, /*level=*/0, /*is_orphan=*/false);
-  CHECK(ds::slotIsConsistent(n), "a freshly initialised node is consistent");
-  CHECK(n.current().size == 0, "and empty");
-  CHECK(n.current().next_k_min == ds::kReservedKey, "with an open-ended range");
-  CHECK(!n.handle.isOrphan(), "and not an orphan");
-  CHECK(n.freeSlot() == 1, "slot 0 current means slot 1 is free");
+  ds::initNode(n, /*k_min=*/100, /*level=*/0, /*vec=*/7);
+  CHECK(n.isStable(), "a freshly initialised node is stable");
+  CHECK(n.handle.offset() == 7, "and points at its vector");
+  CHECK(n.next_k_min == ds::kReservedKey, "with an open-ended range");
 
-  // A torn read: the handle landed from after a write but the slot from before
-  // it. This is the interleaving the bookends exist to catch, and it must read
-  // as "re-read", not as valid data.
-  ds::NodeRecord torn = n;
-  torn.handle = n.handle.bumpContent(n.freeSlot());
-  CHECK(!ds::slotIsConsistent(torn), "handle ahead of its slot is detected");
+  // A split's handle CAS bumps struct_ver, opening the propagation window: the
+  // tail still holds the old value, so a header-only read can tell that
+  // next_id / next_k_min are not yet trustworthy. That is what lets a passing
+  // reader skip the vector on a stable node and help on an unstable one.
+  uint32_t const before = n.handle.structVer();
+  n.handle = n.handle.withStruct(/*new_offset=*/8);
+  CHECK(!n.isStable(), "bumping struct_ver opens the window");
+  CHECK(n.tail_struct_ver == before, "the tail still holds the old value");
+  n.tail_struct_ver = n.handle.structVer();
+  CHECK(n.isStable(), "matching the tail closes the window");
 
-  // A half-landed slot write: leading bookend updated, trailing not.
-  ds::NodeRecord half = n;
-  uint8_t const fs = half.freeSlot();
-  half.handle = half.handle.bumpContent(fs);
-  ds::stampSlot(half.slot[fs], half.handle);
-  CHECK(ds::slotIsConsistent(half), "a fully stamped new slot is consistent");
-  half.slot[fs].trail_content_ver ^= 1u;
-  CHECK(!ds::slotIsConsistent(half), "a half-landed slot write is detected");
+  // A plain content write never opens that window -- for that case the pending
+  // marker is the vector's null timestamp instead.
+  n.handle = n.handle.withContent(/*new_offset=*/9);
+  CHECK(n.isStable(), "a content write never opens the split window");
 
-  // A size past capacity is corruption, not a version problem, but it would
-  // make findLte read out of bounds -- so it is rejected on the same path.
-  ds::NodeRecord bad = n;
-  bad.current().size = ds::kNodeCapacity + 1;
-  CHECK(!ds::slotIsConsistent(bad), "an over-capacity size is rejected");
+  ds::VecRecord v;
+  ds::initVec(v, /*is_orphan=*/false, ds::kNullTs);
+  CHECK(v.isPending(), "a null timestamp reads as pending");
+  ds::initVec(v, /*is_orphan=*/false, /*ts=*/1234);
+  CHECK(!v.isPending(), "a fixed timestamp does not");
+  CHECK(!v.hasSplitDescriptor(), "a plain vector carries no split descriptor");
+  v.next_id = 42;
+  CHECK(v.hasSplitDescriptor(), "setting next_id makes it a descriptor");
 
-  // The previous version stays readable after a publish: that is what C2's
-  // one-step old_ver* chase depends on.
-  ds::NodeRecord pub = n;
-  pub.current().size = 3;
-  ds::stampSlot(pub.current(), pub.handle);
-  uint8_t const next_slot = pub.freeSlot();
-  pub.slot[next_slot].size = 4;
-  pub.handle = pub.handle.bumpContent(next_slot);
-  ds::stampSlot(pub.slot[next_slot], pub.handle);
-  CHECK(ds::slotIsConsistent(pub), "consistent after publishing a new slot");
-  CHECK(pub.current().size == 4, "current is the new version");
-  CHECK(pub.previous().size == 3, "previous is the old version (C2's old_ver*)");
+  // Version identity: the offset is what really identifies a version, so a
+  // read validated against the wrong offset is rejected even when the version
+  // fields happen to agree.
+  ds::NodeRecord m;
+  ds::initNode(m, 0, 0, /*vec=*/5);
+  ds::VecRecord mv;
+  ds::initVec(mv, false, 1);
+  CHECK(ds::vectorIsCurrent(m, mv, 5), "the named vector is current");
+  CHECK(!ds::vectorIsCurrent(m, mv, 6), "a vector read from another offset is not");
+  mv.content_ver = 3;
+  CHECK(!ds::vectorIsCurrent(m, mv, 5), "nor one whose version disagrees");
 }
 
-static void checkFindLteAndCovers() {
-  ds::NodeRecord n;
-  ds::initNode(n, /*k_min=*/0, /*level=*/0, false);
-  ds::VecSlot &s = n.current();
+static void checkFindLteAndRange() {
+  ds::VecRecord v;
+  ds::initVec(v, false, 1);
 
-  // Every size from empty to full, against a brute-force scan.
-  std::mt19937_64 rng(11);
   for (uint32_t size = 0; size <= ds::kNodeCapacity; ++size) {
     std::vector<ds::Key> keys;
     for (uint32_t i = 0; i < size; ++i) keys.push_back(10 * (i + 1));
-    s.size = size;
-    for (uint32_t i = 0; i < size; ++i) s.e[i] = {keys[i], 1000 + keys[i]};
-
+    v.size = size;
+    for (uint32_t i = 0; i < size; ++i) v.e[i] = {keys[i], 1000 + keys[i]};
     for (ds::Key probe = 0; probe <= 10 * (ds::kNodeCapacity + 2); ++probe) {
       int want = -1;
       for (uint32_t i = 0; i < size; ++i) {
         if (keys[i] <= probe) want = static_cast<int>(i);
       }
-      int const got = ds::findLte(s, probe);
+      int const got = ds::findLte(v, probe);
       CHECK(got == want, "findLte agrees with a brute-force scan");
-      if (got != want) {
-        std::printf("    size=%u probe=%llu want=%d got=%d\n", size,
-                    (unsigned long long)probe, want, got);
-        return;  // one report is enough
-      }
+      if (got != want) return;
     }
   }
-  (void)rng;
 
-  // covers() is C4's range check, answerable from one node read because
-  // next_k_min travels with the node.
-  ds::NodeRecord c;
-  ds::initNode(c, /*k_min=*/100, 0, false);
-  c.current().next_k_min = 200;
-  CHECK(!ds::covers(c, 99), "below k_min is not covered");
-  CHECK(ds::covers(c, 100), "k_min itself is covered");
-  CHECK(ds::covers(c, 199), "just below next_k_min is covered");
-  CHECK(!ds::covers(c, 200), "next_k_min itself is not covered");
-  CHECK(!ds::covers(c, 5000), "far above is not covered");
+  // The range check, and the rule that the vector's split descriptor wins.
+  // A stale header bound is the dangerous kind: too large, and it turns "I
+  // need another hop" into "definitively absent", so the node answers for a
+  // range it no longer covers.
+  ds::NodeRecord n;
+  ds::initNode(n, /*k_min=*/100, 0, /*vec=*/1);
+  n.next_k_min = 500;
+  ds::VecRecord cur;
+  ds::initVec(cur, false, 1);
 
-  // The last node in a chain covers everything above its k_min.
+  CHECK(ds::rangeEnd(n, cur) == 500, "with no descriptor the header's bound is used");
+  CHECK(!ds::covers(n, cur, 99), "below k_min is not covered");
+  CHECK(ds::covers(n, cur, 100), "k_min itself is covered");
+  CHECK(ds::covers(n, cur, 499), "just below the end is covered");
+  CHECK(!ds::covers(n, cur, 500), "the end itself is not");
+
+  cur.next_id = 91;
+  cur.k_min_next = 300;
+  CHECK(ds::rangeEnd(n, cur) == 300, "the descriptor's bound wins over the header's");
+  CHECK(ds::covers(n, cur, 299), "299 is still ours");
+  CHECK(!ds::covers(n, cur, 350),
+        "350 is not, though the stale header bound would have claimed it");
+  CHECK(ds::nextNode(n, cur).id == 91, "and the hop follows the descriptor");
+
   ds::NodeRecord last;
-  ds::initNode(last, /*k_min=*/100, 0, false);
-  CHECK(ds::covers(last, 100), "tail node covers its own k_min");
-  CHECK(ds::covers(last, ds::kReservedKey - 1), "tail node covers arbitrarily high keys");
+  ds::initNode(last, /*k_min=*/100, 0, 1);
+  ds::VecRecord lv;
+  ds::initVec(lv, false, 1);
+  CHECK(ds::covers(last, lv, ds::kReservedKey - 1),
+        "a tail node covers arbitrarily high keys");
+  CHECK(ds::nextNode(last, lv).isNull(), "and has no successor");
 }
 
 // ── Arena layout and the client-partitioned allocator ───────────────────────
@@ -202,6 +203,8 @@ static ds::Layout makeLayout(uint64_t clients, uint64_t servers,
   l.majority = 0;
   l.cache_layers = 4;
   l.nodes_per_client = nodes_per_client;
+  l.vecs_per_client = nodes_per_client * 4;
+  l.offset_hint = true;
   l.client_local_region = 0;
   return l;
 }
@@ -209,56 +212,73 @@ static ds::Layout makeLayout(uint64_t clients, uint64_t servers,
 static void checkArenaLayout() {
   ds::Layout const l = makeLayout(8, 3, 1000, 4);
 
-  // The reserved region: null, then one head per level, then the initial data
-  // node. Heads must never collide with each other, with null, or with the
-  // dynamic region -- a collision would have two logical nodes sharing bytes.
-  CHECK(ds::Layout::kNullId == 0, "id 0 is null");
+  CHECK(ds::kNullId == 0, "id 0 is null");
+  CHECK(ds::kNullVec == 0, "vector offset 0 is null");
   std::set<uint64_t> reserved;
   for (uint32_t L = 0; L < ds::kMaxLayers; ++L) {
-    ds::RemoteAddr const h = ds::Layout::headAddr(L);
+    ds::RemoteAddr const h = ds::headAddr(L);
     CHECK(!h.isNull(), "a head address is never null");
-    CHECK(h.id < ds::Layout::kInitialDataId, "heads sit below the initial data node");
+    CHECK(h.id < ds::kInitialDataId, "heads sit below the initial data node");
     CHECK(reserved.insert(h.id).second, "head ids are distinct");
   }
-  CHECK(reserved.size() == ds::kMaxLayers, "one head per level");
-  CHECK(ds::Layout::kInitialDataId == ds::kMaxLayers + 1, "initial data node follows the heads");
-  CHECK(ds::Layout::kFirstDynamicId == ds::Layout::kInitialDataId + 1,
-        "the dynamic region starts after the reserved one");
+  CHECK(ds::kInitialDataId == ds::kMaxLayers + 1, "initial data node follows the heads");
+  CHECK(ds::kFirstDynamicId == ds::kInitialDataId + 1, "dynamic ids follow the reserved");
 
-  // Arena sizing must cover reserved + every client's stripe.
-  CHECK(l.nodeArenaNodes() == ds::Layout::kFirstDynamicId + 8 * 1000,
-        "arena covers reserved plus all stripes");
-  CHECK(l.nodeArenaSize() == l.nodeArenaNodes() * sizeof(ds::NodeRecord),
-        "arena size is nodes * record size");
+  // Both arenas cover reserved plus every stripe, and must not overlap within
+  // the server region.
+  CHECK(l.nodeArenaNodes() == ds::kFirstDynamicId + 8 * 1000, "node arena covers all stripes");
+  CHECK(l.vecArenaVecs() == ds::kFirstDynamicVec + 8 * 4000, "vector arena covers all stripes");
+  CHECK(l.vecArenaOffset() >= l.nodeArenaSize(), "the vector arena starts after the node arena");
+  CHECK(l.serverSize() == l.vecArenaOffset() + l.vecArenaSize(),
+        "the server region is exactly the two arenas");
+  CHECK(l.vecArenaSize() > l.nodeArenaSize(),
+        "the vector arena is larger, since every write consumes one");
 
-  // Address arithmetic. A node's address is also its handle's address, because
-  // the handle is at offset 0 -- the CAS target depends on that.
+  // A node's address is also its handle's address, because the handle is at
+  // offset 0 -- the CAS target depends on that.
   uintptr_t const base = 0x100000;
-  CHECK(ds::Layout::nodeAddrOf(base, ds::RemoteAddr{1}) == base + sizeof(ds::NodeRecord),
-        "node 1 sits one record in");
   CHECK(ds::Layout::nodeAddrOf(base, ds::RemoteAddr{7}) == base + 7 * sizeof(ds::NodeRecord),
         "node addressing is linear in the id");
-  for (uint8_t sl = 0; sl < 2; ++sl) {
-    uintptr_t const want = ds::Layout::nodeAddrOf(base, ds::RemoteAddr{5}) +
-                           ds::kNodeHeaderSize + sl * sizeof(ds::VecSlot);
-    CHECK(ds::Layout::slotAddrOf(base, ds::RemoteAddr{5}, sl) == want,
-          "slot address is header + slot index * slot size");
-    CHECK(want % 64 == 0, "every slot starts 64B-aligned (F4)");
-  }
+  CHECK(ds::Layout::nodeAddrOf(base, ds::RemoteAddr{7}) % 64 == 0,
+        "every node is 64B-aligned (F4)");
+  CHECK(l.vecAddrOf(base, 3) == base + l.vecArenaOffset() + 3 * sizeof(ds::VecRecord),
+        "vector addressing is linear in the offset");
+  CHECK(l.vecAddrOf(base, 3) % 64 == 0, "every vector is 64B-aligned (F4)");
 
-  // Per-future scratchpad accessors must not overlap. Overlap here would have
-  // one in-flight RDMA silently corrupting another's buffer.
+  // The in-place CAS targets a split's propagation needs. RDMA CAS is an
+  // 8-byte operation, so each must be 8B-aligned.
+  CHECK(ds::Layout::nextIdAddrOf(base, ds::RemoteAddr{2}) ==
+            ds::Layout::nodeAddrOf(base, ds::RemoteAddr{2}) +
+                offsetof(ds::NodeRecord, next_id),
+        "next_id CAS target");
+  CHECK(ds::Layout::nextKMinAddrOf(base, ds::RemoteAddr{2}) ==
+            ds::Layout::nodeAddrOf(base, ds::RemoteAddr{2}) +
+                offsetof(ds::NodeRecord, next_k_min),
+        "next_k_min CAS target");
+  CHECK(ds::Layout::nextIdAddrOf(base, ds::RemoteAddr{2}) % 8 == 0, "next_id is 8B-aligned");
+  CHECK(ds::Layout::nextKMinAddrOf(base, ds::RemoteAddr{2}) % 8 == 0, "next_k_min is 8B-aligned");
+  CHECK(ds::Layout::tailWordAddrOf(base, ds::RemoteAddr{2}) % 8 == 0,
+        "the tail word is 8B-aligned");
+  CHECK(offsetof(ds::NodeRecord, tail_struct_ver) ==
+            offsetof(ds::NodeRecord, level) + sizeof(uint32_t),
+        "tail_struct_ver shares its 8-byte word with level, which never changes");
+  CHECK(l.vecTsAddrOf(base, 3) % 8 == 0, "the ts CAS target is 8B-aligned");
+
+  // Per-future scratchpad regions must not overlap: overlap would have one
+  // in-flight RDMA silently corrupting another's buffer.
   ds::Layout ml = l;
-  alignas(64) static std::vector<unsigned char> backing;
+  static std::vector<unsigned char> backing;
   backing.assign(ml.totalClientSize() + 64, 0);
   ml.client_local_region = reinterpret_cast<uintptr_t>(backing.data());
 
   std::vector<std::pair<uintptr_t, size_t>> regions;
   for (uint64_t f = 0; f < ml.async_parallelism; ++f) {
     regions.emplace_back(reinterpret_cast<uintptr_t>(ml.getNodeBufs(f)), ml.nodeBufsSize());
-    regions.emplace_back(reinterpret_cast<uintptr_t>(ml.getDataBufs(f)), ml.dataBufsSize());
+    regions.emplace_back(reinterpret_cast<uintptr_t>(ml.getVecBufs(f)), ml.vecBufsSize());
+    regions.emplace_back(reinterpret_cast<uintptr_t>(ml.getDataNodeBufs(f)), ml.nodeBufsSize());
+    regions.emplace_back(reinterpret_cast<uintptr_t>(ml.getDataVecBufs(f)), ml.vecBufsSize());
     regions.emplace_back(reinterpret_cast<uintptr_t>(ml.getStageNode(f)), ml.stageNodeSize());
-    regions.emplace_back(reinterpret_cast<uintptr_t>(ml.getStageSlot(f)), ml.stageSlotSize());
+    regions.emplace_back(reinterpret_cast<uintptr_t>(ml.getStageVec(f)), ml.stageVecSize());
     regions.emplace_back(reinterpret_cast<uintptr_t>(ml.getCasBufs(f)), ml.casBufsSize());
   }
   size_t overlaps = 0, out_of_bounds = 0;
@@ -274,9 +294,6 @@ static void checkArenaLayout() {
   }
   CHECK(overlaps == 0, "no two per-future scratchpad regions overlap");
   CHECK(out_of_bounds == 0, "every scratchpad region is inside the client MR");
-
-  // The skip-vector region must start clear of the legacy register scratchpad,
-  // since both live in the same MR while the register path still exists.
   CHECK(ml.nodeRegionOffset() >= ml.clientSize(),
         "the node region starts after the legacy register region");
 }
@@ -534,8 +551,8 @@ int main() {
 
   checkSharedDefs();
   checkHandleEncoding();
-  checkSlotConsistency();
-  checkFindLteAndCovers();
+  checkInProgressMarkers();
+  checkFindLteAndRange();
   checkArenaLayout();
   checkAllocator();
 #if DS_CACHE_ENABLED

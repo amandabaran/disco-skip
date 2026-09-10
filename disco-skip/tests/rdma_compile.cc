@@ -13,17 +13,30 @@
 // Force instantiation of the templates; being templates, nothing above would.
 using Conns = std::vector<dory::conn::ReliableConnection *>;
 
-void instantiate_rdma_paths(Conns &conns, ds::NodeRecord *staging,
-                            ds::RemoteAddr addr, uint32_t layers);
-void instantiate_rdma_paths(Conns &conns, ds::NodeRecord *staging,
-                            ds::RemoteAddr addr, uint32_t layers) {
-  ds::writeNodeAllReplicas(conns, staging, addr);
+struct Bufs {
+  ds::NodeRecord *node;
+  ds::VecRecord *vec;
+  ds::NodeRecord *stage_node;
+  ds::VecRecord *stage_vec;
+};
 
-  ds::RdmaNodeReader<Conns> reader(conns, staging);
-  ds::NodeRecord out;
-  (void)reader.read(addr, out);
+void instantiate_rdma_paths(Conns &conns, ds::Layout const &layout, Bufs b,
+                            ds::VecOffsetHint *hint, ds::RemoteAddr addr,
+                            uint32_t layers);
+void instantiate_rdma_paths(Conns &conns, ds::Layout const &layout, Bufs b,
+                            ds::VecOffsetHint *hint, ds::RemoteAddr addr,
+                            uint32_t layers) {
+  ds::writeNodeAllReplicas(conns, b.stage_node, addr);
+  ds::writeVecAllReplicas(conns, layout, b.stage_vec, ds::kFirstDynamicVec);
+
+  ds::RdmaNodeReader<Conns> reader(conns, layout, b.node, b.vec, hint);
+  ds::NodeRecord out_node;
+  ds::VecRecord out_vec;
+  (void)reader.read(addr, out_node, out_vec);
+  (void)reader.readVec(ds::kFirstDynamicVec, out_vec);
   (void)reader.reads();
-  (void)reader.tornReads();
+  (void)reader.unstableRetries();
+  (void)reader.staleRetries();
 
   // The verifier, driven by the RDMA reader -- the exact combination that runs
   // in --selftest.
@@ -32,13 +45,17 @@ void instantiate_rdma_paths(Conns &conns, ds::NodeRecord *staging,
 }
 
 // The bootstrap write loop, in the shape main.cpp uses it.
-void instantiate_bootstrap(Conns &conns, ds::NodeRecord *staging, uint32_t layers);
-void instantiate_bootstrap(Conns &conns, ds::NodeRecord *staging, uint32_t layers) {
+void instantiate_bootstrap(Conns &conns, ds::Layout const &layout, Bufs b,
+                           uint32_t layers);
+void instantiate_bootstrap(Conns &conns, ds::Layout const &layout, Bufs b,
+                           uint32_t layers) {
   ds::InitialNode built[ds::kMaxLayers + 1];
-  uint32_t const count = ds::buildInitialStructure(layers, built);
+  uint32_t const count = ds::buildInitialStructure(layers, /*ts=*/1, built);
   for (uint32_t i = 0; i < count; ++i) {
-    *staging = built[i].record;
-    ds::writeNodeAllReplicas(conns, staging, built[i].addr);
+    *b.stage_vec = built[i].vec;
+    ds::writeVecAllReplicas(conns, layout, b.stage_vec, built[i].vec_offset);
+    *b.stage_node = built[i].node;
+    ds::writeNodeAllReplicas(conns, b.stage_node, built[i].addr);
   }
 }
 

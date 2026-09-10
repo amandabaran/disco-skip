@@ -19,11 +19,11 @@
 // the parts we care about.
 int main() {
   ds::NodeRecord n;
-  ds::initNode(n, 42, 0, false);
-  ds::VecSlot &s = n.current();
-  s.size = 1;
-  s.e[0] = ds::Entry{42, 7};
-  ds::stampSlot(s, n.handle);
+  ds::initNode(n, 42, 0, /*vec=*/1);
+  ds::VecRecord v;
+  ds::initVec(v, /*is_orphan=*/false, /*ts=*/1);
+  v.size = 1;
+  v.e[0] = ds::Entry{42, 7};
 
   ds::Layout l{};
   l.num_clients = 1;
@@ -34,29 +34,43 @@ int main() {
   l.majority = 0;
   l.cache_layers = 2;
   l.nodes_per_client = 8;
+  l.vecs_per_client = 8;
+  l.offset_hint = true;
   l.client_local_region = 0;
 
   ds::NodeAllocator alloc(0, l.nodes_per_client);
+  ds::VecAllocator valloc(0, l.vecs_per_client);
+  ds::VecOffsetHint hint(16, true);
 
   ds::InitialNode built[ds::kMaxLayers + 1];
-  uint32_t const built_n = ds::buildInitialStructure(2, built);
+  uint32_t const built_n = ds::buildInitialStructure(2, /*ts=*/1, built);
   auto const heads = ds::headAddrs(2);
 
   // Instantiate the verifier against a trivial reader so its body is compiled
   // under the strict set too -- it is a template, so nothing else would.
   struct NullReader {
-    bool read(ds::RemoteAddr, ds::NodeRecord &) { return false; }
+    bool read(ds::RemoteAddr, ds::NodeRecord &, ds::VecRecord &) { return false; }
+    bool readVec(ds::VecOffset, ds::VecRecord &) { return false; }
   } null_reader;
   ds::VerifyReport const rep = ds::verifyStructure(null_reader, 2);
 
   return static_cast<int>(
-      static_cast<unsigned>(ds::slotIsConsistent(n)) +
-      static_cast<unsigned>(ds::covers(n, 42)) +
-      static_cast<unsigned>(ds::findLte(s, 42) >= 0) +
+      static_cast<unsigned>(n.isStable()) +
+      static_cast<unsigned>(v.isPending()) +
+      static_cast<unsigned>(v.hasSplitDescriptor()) +
+      static_cast<unsigned>(ds::vectorIsCurrent(n, v, 1)) +
+      static_cast<unsigned>(ds::covers(n, v, 42)) +
+      static_cast<unsigned>(ds::rangeEnd(n, v) != 0) +
+      static_cast<unsigned>(ds::nextNode(n, v).isNull()) +
+      static_cast<unsigned>(ds::findLte(v, 42) >= 0) +
       static_cast<unsigned>(n.handle.tag() != 0) +
       static_cast<unsigned>(l.nodeArenaNodes() != 0) +
-      static_cast<unsigned>(ds::Layout::headAddr(0).isNull()) +
+      static_cast<unsigned>(l.vecArenaVecs() != 0) +
+      static_cast<unsigned>(l.serverSize() != 0) +
+      static_cast<unsigned>(ds::headAddr(0).isNull()) +
       static_cast<unsigned>(alloc.allocate().isNull()) +
+      static_cast<unsigned>(valloc.allocate() == ds::kNullVec) +
+      static_cast<unsigned>(hint.guess(ds::RemoteAddr{1}) == ds::kNullVec) +
       static_cast<unsigned>(built_n != 0) +
       static_cast<unsigned>(heads[0].isNull()) +
       static_cast<unsigned>(rep.ok()));

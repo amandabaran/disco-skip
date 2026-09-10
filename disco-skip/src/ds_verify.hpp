@@ -10,11 +10,14 @@
 //
 // A Reader must provide:
 //
-//     bool read(RemoteAddr a, NodeRecord &out);
+//     bool read(RemoteAddr a, NodeRecord &node, VecRecord &vec);
+//     bool readVec(VecOffset off, VecRecord &vec);
 //
-// returning false if the node could not be read consistently. On the RDMA side
-// that means a torn read that did not settle after retries; locally it means an
-// out-of-range id.
+// The first fetches a node header and the vector its handle names -- two
+// regions, since vectors live out of line. The second fetches a vector by
+// offset, which is what walking the old_ver chain needs. Both return false if
+// the read could not be completed: on the RDMA side a header whose bookends
+// never settle, locally an out-of-range index.
 //
 // SEQUENTIAL-ONLY. Every check here assumes the structure is quiescent -- it
 // reads nodes one at a time and compares them against each other, so a
@@ -39,6 +42,7 @@ struct VerifyReport {
   std::vector<size_t> nodes_per_level;  // index 0 = directory
   size_t data_nodes = 0;
   size_t data_entries = 0;
+  size_t old_versions = 0;
   std::vector<std::string> errors;
 
   [[nodiscard]] bool ok() const { return errors.empty(); }
@@ -54,6 +58,9 @@ inline constexpr size_t kMaxErrors = 32;
 /// and a bound is cheaper and more robust than a visited set when the chain is
 /// the thing under suspicion.
 inline constexpr size_t kMaxChainSteps = 1u << 24;
+
+/// Cap on old_ver chain depth, for the same reason.
+inline constexpr size_t kMaxChainDepth = 1u << 20;
 
 }  // namespace detail
 
@@ -116,9 +123,53 @@ class StructureVerifier {
 
   static std::string idStr(uint64_t id) { return "node " + std::to_string(id); }
 
-  /// Checks that hold for any node in isolation.
-  void checkNodeLocal(NodeRecord const &n, uint64_t id, uint32_t expect_level) {
-    VecSlot const &s = n.current();
+  /// Checks that hold for one node and its current vector in isolation.
+  void checkNodeLocal(NodeRecord const &n, VecRecord const &s, uint64_t id,
+                      uint32_t expect_level) {
+    // A quiescent structure has no operation in flight, so every node must be
+    // settled. An unstable node here means a writer died mid-propagation and
+    // nobody helped it finish -- which, since helping is what makes reads
+    // non-blocking, would mean readers are livelocked on it.
+    if (!n.isStable()) {
+      err(idStr(id) + ": handle struct_ver " +
+          std::to_string(n.handle.structVer()) +
+          " != tail_struct_ver " + std::to_string(n.tail_struct_ver) +
+          ", so a split is still propagating in a quiescent structure");
+    }
+
+    // The vector must be the version the handle names.
+    if (s.struct_ver != n.handle.structVer() ||
+        s.content_ver != n.handle.contentVer()) {
+      err(idStr(id) + ": vector at offset " +
+          std::to_string(n.handle.offset()) + " carries version (" +
+          std::to_string(s.struct_ver) + "," + std::to_string(s.content_ver) +
+          ") but the handle names (" + std::to_string(n.handle.structVer()) +
+          "," + std::to_string(n.handle.contentVer()) + ")");
+    }
+
+    // Likewise no version should still be pending.
+    if (s.isPending()) {
+      err(idStr(id) +
+          ": current version's ts is null (pending) in a quiescent structure");
+    }
+
+    // A split descriptor that outlives its propagation must agree with the
+    // header, or readers preferring the vector's copy and readers using the
+    // header's would disagree about where this node's range ends.
+    if (s.hasSplitDescriptor()) {
+      if (s.next_id != n.next_id) {
+        err(idStr(id) + ": vector's split next_id " +
+            std::to_string(s.next_id) + " disagrees with the header's " +
+            std::to_string(n.next_id));
+      }
+      if (s.k_min_next != n.next_k_min) {
+        err(idStr(id) + ": vector's split k_min_next " +
+            std::to_string(s.k_min_next) + " disagrees with the header's " +
+            std::to_string(n.next_k_min));
+      }
+    }
+
+    checkOldVerChain(n, s, id);
 
     if (n.level != expect_level) {
       err(idStr(id) + ": level is " + std::to_string(n.level) + ", expected " +
@@ -149,31 +200,58 @@ class StructureVerifier {
 
     // Every key must fall inside the range the node advertises, or a descent
     // that trusts next_k_min would skip it.
-    if (s.size > 0 && s.e[s.size - 1].key >= s.next_k_min) {
+    Key const end = rangeEnd(n, s);
+    if (s.size > 0 && s.e[s.size - 1].key >= end) {
       err(idStr(id) + ": last key " + std::to_string(s.e[s.size - 1].key) +
-          " is at or past next_k_min " + std::to_string(s.next_k_min));
+          " is at or past the end of its range " + std::to_string(end));
     }
 
-    // Timestamps must not go backwards across the slot ring. The ring
-    // alternates, so `previous` is exactly one version behind `current`, and a
-    // snapshot read walking back for the version with ts <= T relies on that
-    // ordering to know when to stop. An inversion would make it stop early and
-    // read the wrong version.
-    //
-    // Trivially satisfied today, since nothing writes a timestamp yet -- it is
-    // here so the insert path cannot introduce an inversion unnoticed.
-    if (n.current().ts < n.previous().ts) {
-      err(idStr(id) + ": current version's ts " + std::to_string(n.current().ts) +
-          " is older than the previous version's " +
-          std::to_string(n.previous().ts));
-    }
+  }
 
-    // old_ver is reserved and must be zero until the out-of-line version chain
-    // is built (A10). A non-zero value here would mean something wrote a chain
-    // that nothing knows how to read.
-    if (s.old_ver != 0) {
-      err(idStr(id) + ": old_ver is set to " + std::to_string(s.old_ver) +
-          " but the out-of-line version chain is not implemented");
+  /// Walks the old_ver chain, checking it is finite and ordered.
+  ///
+  /// A snapshot read walks back for the version with ts <= T and stops at the
+  /// first one that qualifies, so the chain must be strictly decreasing in ts.
+  /// An inversion would make it stop early and serve the wrong version, which
+  /// is the failure mode a range query cannot detect for itself.
+  void checkOldVerChain(NodeRecord const &n, VecRecord const &current,
+                        uint64_t id) {
+    VecOffset off = static_cast<VecOffset>(current.old_ver);
+    uint64_t newer_ts = current.ts;
+    uint32_t newer_content = current.content_ver;
+    VecRecord older;
+    size_t depth = 0;
+
+    while (off != kNullVec) {
+      if (++depth > detail::kMaxChainDepth) {
+        err(idStr(id) + ": old_ver chain exceeded the depth bound, so it "
+                        "contains a cycle");
+        return;
+      }
+      if (!r_.readVec(off, older)) {
+        err(idStr(id) + ": old_ver chain reaches unreadable offset " +
+            std::to_string(off));
+        return;
+      }
+      ++rep_.old_versions;
+
+      if (older.isPending()) {
+        err(idStr(id) + ": a superseded version at offset " +
+            std::to_string(off) + " is still pending, so no snapshot can ever "
+                                  "be resolved against it");
+      } else if (older.ts >= newer_ts) {
+        err(idStr(id) + ": old_ver chain is not decreasing in ts -- offset " +
+            std::to_string(off) + " has ts " + std::to_string(older.ts) +
+            " at or above its successor's " + std::to_string(newer_ts));
+      }
+      if (older.content_ver >= newer_content && older.struct_ver == n.handle.structVer()) {
+        err(idStr(id) + ": old_ver chain is not decreasing in content_ver at "
+                        "offset " + std::to_string(off));
+      }
+
+      newer_ts = older.ts;
+      newer_content = older.content_ver;
+      off = static_cast<VecOffset>(older.old_ver);
     }
   }
 
@@ -181,6 +259,7 @@ class StructureVerifier {
   void walkIndexLevel(uint32_t level) {
     RemoteAddr cur = headAddr(level);
     NodeRecord n;
+    VecRecord v;
     Key prev_k_min = 0;
     bool first = true;
     size_t steps = 0;
@@ -191,19 +270,19 @@ class StructureVerifier {
             ": next chain exceeded the step bound, so it contains a cycle (I2)");
         return;
       }
-      if (!r_.read(cur, n)) {
+      if (!r_.read(cur, n, v)) {
         err(idStr(cur.id) + ": could not be read consistently");
         return;
       }
 
       ++rep_.nodes_visited;
       ++rep_.nodes_per_level[level];
-      rep_.entries += n.current().size;
-      bool const orphan = n.handle.isOrphan();
+      rep_.entries += v.size;
+      bool const orphan = v.is_orphan != 0;
       if (orphan) ++rep_.orphans;
       seen_orphan_[cur.id] = orphan;
 
-      checkNodeLocal(n, cur.id, level);
+      checkNodeLocal(n, v, cur.id, level);
 
       // I2: the chain must be sorted strictly ascending by k_min. Equal k_mins
       // would make "the node covering k" ambiguous.
@@ -216,7 +295,7 @@ class StructureVerifier {
       first = false;
 
       // Record this node's down pointers for pass 2.
-      VecSlot const &s = n.current();
+      VecRecord const &s = v;
       uint32_t const capped = s.size <= kNodeCapacity ? s.size : 0;
       for (uint32_t i = 0; i < capped; ++i) {
         uint64_t const child = s.e[i].val;
@@ -238,20 +317,22 @@ class StructureVerifier {
       // next_k_min must agree with the successor's k_min, or C4's single-read
       // range check gives a wrong answer. This is the invariant that makes
       // co-locating it worthwhile, so it is worth checking directly.
-      RemoteAddr const next{s.next_id};
+      RemoteAddr const next = nextNode(n, v);
+      Key const end = rangeEnd(n, v);
       if (next.isNull()) {
-        if (s.next_k_min != kReservedKey) {
+        if (end != kReservedKey) {
           err(idStr(cur.id) +
-              ": is last in its chain but next_k_min is not the sentinel");
+              ": is last in its chain but its range end is not the sentinel");
         }
       } else {
         NodeRecord succ;
-        if (!r_.read(next, succ)) {
+        VecRecord succ_v;
+        if (!r_.read(next, succ, succ_v)) {
           err(idStr(next.id) + ": successor could not be read consistently");
           return;
         }
-        if (succ.k_min != s.next_k_min) {
-          err(idStr(cur.id) + ": next_k_min " + std::to_string(s.next_k_min) +
+        if (succ.k_min != end) {
+          err(idStr(cur.id) + ": range end " + std::to_string(end) +
               " disagrees with " + idStr(next.id) + "'s k_min " +
               std::to_string(succ.k_min));
         }
@@ -262,10 +343,11 @@ class StructureVerifier {
 
   void checkDownPointers() {
     NodeRecord child;
+    VecRecord child_v;
     for (auto const &kv : down_) {
       RemoteAddr const a{kv.first};
       Expect const &e = kv.second;
-      if (!r_.read(a, child)) {
+      if (!r_.read(a, child, child_v)) {
         err(idStr(a.id) + ": down-pointer target could not be read");
         continue;
       }
@@ -304,11 +386,13 @@ class StructureVerifier {
   /// it is reached through the directory's entries and then walked by next.
   void walkDataLevel() {
     NodeRecord dir;
-    if (!r_.read(headAddr(0), dir)) return;  // already reported
-    if (dir.current().size == 0) return;     // empty structure
+    VecRecord dir_v;
+    if (!r_.read(headAddr(0), dir, dir_v)) return;  // already reported
+    if (dir_v.size == 0) return;                    // empty structure
 
-    RemoteAddr cur{dir.current().e[0].val};
+    RemoteAddr cur{dir_v.e[0].val};
     NodeRecord n;
+    VecRecord v;
     Key prev_k_min = 0;
     bool first = true;
     size_t steps = 0;
@@ -318,13 +402,13 @@ class StructureVerifier {
         err("data level: next chain contains a cycle (I2)");
         return;
       }
-      if (!r_.read(cur, n)) {
+      if (!r_.read(cur, n, v)) {
         err(idStr(cur.id) + ": data node could not be read consistently");
         return;
       }
       ++rep_.data_nodes;
-      rep_.data_entries += n.current().size;
-      checkNodeLocal(n, cur.id, kDataLevel);
+      rep_.data_entries += v.size;
+      checkNodeLocal(n, v, cur.id, kDataLevel);
 
       if (!first && n.k_min <= prev_k_min) {
         err(idStr(cur.id) + ": data-level k_min " + std::to_string(n.k_min) +
@@ -333,7 +417,7 @@ class StructureVerifier {
       }
       prev_k_min = n.k_min;
       first = false;
-      cur = RemoteAddr{n.current().next_id};
+      cur = nextNode(n, v);
     }
   }
 };

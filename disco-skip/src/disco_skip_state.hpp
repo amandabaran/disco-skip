@@ -34,6 +34,17 @@ public:
     std::vector<struct ibv_wc> wces;
     std::vector<size_t> quorum_indices;
 
+    // Last-seen vector offset per node, so a node read can go out as one
+    // doorbell batch instead of two serialised RDMAs. Client-local and never
+    // RDMA'd, hence not in the registered MR.
+    VecOffsetHint vec_hint;
+
+    // Per-client stripes of the two arenas. Separate because a node is
+    // allocated only by a split while a vector is allocated by every write, so
+    // one shared stripe would let write traffic starve splits.
+    NodeAllocator node_alloc;
+    VecAllocator vec_alloc;
+
     // ─── Profilers (mirroring OopsState) ────────────────────────────
     LatencyProfiler get_profiler;
     LatencyProfiler put_profiler;
@@ -107,6 +118,11 @@ public:
         for (size_t i = 0; i < quorum; ++i) {
             quorum_indices.push_back((client_idx + i) % layout.num_servers);
         }
+
+        vec_hint = VecOffsetHint(static_cast<size_t>(layout.nodeArenaNodes()),
+                                 layout.offset_hint);
+        node_alloc = NodeAllocator(client_idx, layout.nodes_per_client);
+        vec_alloc = VecAllocator(client_idx, layout.vecs_per_client);
     }
 
     // ─── Counter helpers ───────────────────────────────────────────
@@ -154,6 +170,16 @@ public:
                    headsBootstrapped(cache_sv) ? "yes" : "NO (every head lookup misses)");
         fmt::print("levels:                  {}\n", layout.cache_layers);
         fmt::print("node capacity:           {}\n", kNodeCapacity);
+        fmt::print("offset hint:             {}\n",
+                   vec_hint.enabled()
+                       ? fmt::format("{:.3f} hit rate ({} hit / {} miss)",
+                                     vec_hint.hitRate(), vec_hint.hits(),
+                                     vec_hint.misses())
+                       : std::string("disabled"));
+        fmt::print("nodes allocated:         {} of {}\n",
+                   node_alloc.allocated(), node_alloc.capacity());
+        fmt::print("vectors allocated:       {} of {}\n",
+                   vec_alloc.allocated(), vec_alloc.capacity());
         for (uint32_t L = 0; L < layout.cache_layers && L < kMaxLayers; ++L) {
             LevelStats const st = levelStats(cache_sv, L);
             fmt::print("level {}: {} nodes, {} orphans, {} entries\n",

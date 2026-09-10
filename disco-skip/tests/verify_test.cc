@@ -8,6 +8,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -15,6 +16,7 @@
 #include "ds_defs.hpp"
 #include "ds_node.hpp"
 #include "ds_verify.hpp"
+#include "layout.hpp"
 
 static int g_failures = 0;
 
@@ -26,42 +28,52 @@ static int g_failures = 0;
     }                                                                         \
   } while (0)
 
-/// A local stand-in for the memory servers' arena. The RDMA reader on the
+/// A local stand-in for the memory servers' two arenas. The RDMA reader on the
 /// cluster has the same interface, so the verifier under test here is the same
 /// code that runs there.
 class FakeArena {
  public:
-  explicit FakeArena(size_t nodes) : nodes_(nodes) {
-    for (auto &n : nodes_) ds::initNode(n, 0, 0, false);
+  FakeArena(size_t nodes, size_t vecs) : nodes_(nodes), vecs_(vecs) {
+    for (auto &n : nodes_) ds::initNode(n, 0, 0, ds::kNullVec);
+    for (auto &v : vecs_) ds::initVec(v, false, /*ts=*/1);
   }
 
-  bool read(ds::RemoteAddr a, ds::NodeRecord &out) {
+  bool read(ds::RemoteAddr a, ds::NodeRecord &node, ds::VecRecord &vec) {
     if (a.isNull() || a.id >= nodes_.size()) return false;
-    out = nodes_[a.id];
-    // The real reader validates bookends and retries; here a stamped-wrong node
-    // is a genuine corruption we want reported rather than retried.
-    return ds::slotIsConsistent(out);
+    node = nodes_[a.id];
+    ds::VecOffset const off = node.handle.offset();
+    if (off == ds::kNullVec || off >= vecs_.size()) return false;
+    vec = vecs_[off];
+    return true;
   }
 
-  ds::NodeRecord &at(ds::RemoteAddr a) { return nodes_[a.id]; }
-  ds::NodeRecord &at(uint64_t id) { return nodes_[id]; }
-  size_t size() const { return nodes_.size(); }
-
-  /// Re-stamp after mutating, so a test that means to break one invariant does
-  /// not accidentally trip the torn-read check instead.
-  void restamp(uint64_t id) {
-    ds::stampSlot(nodes_[id].current(), nodes_[id].handle);
+  bool readVec(ds::VecOffset off, ds::VecRecord &vec) {
+    if (off == ds::kNullVec || off >= vecs_.size()) return false;
+    vec = vecs_[off];
+    return true;
   }
+
+  ds::NodeRecord &node(ds::RemoteAddr a) { return nodes_[a.id]; }
+  ds::NodeRecord &node(uint64_t id) { return nodes_[id]; }
+  /// The vector the given node currently points at.
+  ds::VecRecord &vec(ds::RemoteAddr a) {
+    return vecs_[nodes_[a.id].handle.offset()];
+  }
+  ds::VecRecord &vecAt(ds::VecOffset off) { return vecs_[off]; }
 
  private:
   std::vector<ds::NodeRecord> nodes_;
+  std::vector<ds::VecRecord> vecs_;
 };
 
 static FakeArena buildInitial(uint32_t layers) {
-  FakeArena arena(ds::kFirstDynamicId + 256);
+  FakeArena arena(ds::kFirstDynamicId + 256, ds::kFirstDynamicVec + 256);
   ds::InitialNode built[ds::kMaxLayers + 1];
-  uint32_t const n = ds::buildInitialStructure(layers, built);
-  for (uint32_t i = 0; i < n; ++i) arena.at(built[i].addr) = built[i].record;
+  uint32_t const n = ds::buildInitialStructure(layers, /*ts=*/1000, built);
+  for (uint32_t i = 0; i < n; ++i) {
+    arena.node(built[i].addr) = built[i].node;
+    arena.vecAt(built[i].vec_offset) = built[i].vec;
+  }
   return arena;
 }
 
@@ -99,83 +111,73 @@ static void checkVerifierCatchesBreakage() {
   // I1: k_min must not exceed the smallest key held.
   {
     FakeArena a = buildInitial(layers);
-    a.at(ds::headAddr(1)).k_min = 5;  // its entry is keyed 0
-    a.restamp(ds::headAddr(1).id);
+    a.node(ds::headAddr(1)).k_min = 5;  // its entry is keyed 0
     rejects(ds::verifyStructure(a, layers), "k_min past its first key (I1)");
   }
 
   // A down pointer must land on a node whose k_min equals the routing key.
   {
     FakeArena a = buildInitial(layers);
-    a.at(ds::headAddr(0)).k_min = 7;  // parent routes to it under key 0
-    a.restamp(ds::headAddr(0).id);
+    a.node(ds::headAddr(0)).k_min = 7;  // parent routes to it under key 0
     rejects(ds::verifyStructure(a, layers), "a down pointer whose target k_min disagrees");
   }
 
   // A child must sit exactly one level below its parent.
   {
     FakeArena a = buildInitial(layers);
-    a.at(ds::headAddr(1)).level = 3;
-    a.restamp(ds::headAddr(1).id);
+    a.node(ds::headAddr(1)).level = 3;
     rejects(ds::verifyStructure(a, layers), "a level that is not one below its parent");
   }
 
   // I2: a cycle in a next chain.
   {
     FakeArena a = buildInitial(layers);
-    a.at(ds::headAddr(2)).current().next_id = ds::headAddr(2).id;
-    a.at(ds::headAddr(2)).current().next_k_min = 0;
-    a.restamp(ds::headAddr(2).id);
+    a.node(ds::headAddr(2)).next_id = ds::headAddr(2).id;
+    a.node(ds::headAddr(2)).next_k_min = 0;
     rejects(ds::verifyStructure(a, layers), "a self-cycle in a next chain (I2)");
   }
 
-  // next_k_min must agree with the successor's k_min, which is the whole point
-  // of co-locating it.
+  // The range end must agree with the successor's k_min.
   {
     FakeArena a = buildInitial(layers);
     uint64_t const extra = ds::kFirstDynamicId;
-    ds::initNode(a.at(extra), /*k_min=*/100, /*level=*/1, /*is_orphan=*/false);
-    ds::VecSlot &h = a.at(ds::headAddr(1)).current();
-    h.next_id = extra;
-    h.next_k_min = 999;  // lies about where the successor starts
-    a.restamp(ds::headAddr(1).id);
-    rejects(ds::verifyStructure(a, layers), "next_k_min disagreeing with the successor");
+    ds::VecOffset const extra_vec = ds::kFirstDynamicVec;
+    ds::initNode(a.node(extra), /*k_min=*/100, /*level=*/1, extra_vec);
+    ds::initVec(a.vecAt(extra_vec), /*is_orphan=*/true, /*ts=*/1000);
+    a.node(ds::headAddr(1)).next_id = extra;
+    a.node(ds::headAddr(1)).next_k_min = 999;  // lies about where it starts
+    rejects(ds::verifyStructure(a, layers), "a range end disagreeing with the successor");
   }
 
   // I4: an orphan must not be the target of a down pointer.
   {
     FakeArena a = buildInitial(layers);
-    ds::NodeRecord &dir = a.at(ds::headAddr(0));
-    dir.handle = ds::Handle::make(dir.handle.structVer(), dir.handle.contentVer(),
-                                  dir.handle.slot(), ds::Handle::kFlagOrphan);
-    a.restamp(ds::headAddr(0).id);
+    a.vec(ds::headAddr(0)).is_orphan = 1;
     rejects(ds::verifyStructure(a, layers), "an orphan that something routes to (I4)");
   }
 
-  // I3: a non-orphan that nothing routes to. Splice a node into level 1's
-  // chain without giving it a parent -- exactly the shape the cache's
-  // verify_index() also rejects.
+  // I3: a non-orphan that nothing routes to.
   {
     FakeArena a = buildInitial(layers);
     uint64_t const extra = ds::kFirstDynamicId;
-    ds::initNode(a.at(extra), /*k_min=*/100, /*level=*/1, /*is_orphan=*/false);
-    ds::VecSlot &h = a.at(ds::headAddr(1)).current();
-    h.next_id = extra;
-    h.next_k_min = 100;
-    a.restamp(ds::headAddr(1).id);
+    ds::VecOffset const extra_vec = ds::kFirstDynamicVec;
+    ds::initNode(a.node(extra), /*k_min=*/100, /*level=*/1, extra_vec);
+    ds::initVec(a.vecAt(extra_vec), /*is_orphan=*/false, /*ts=*/1000);
+    a.node(ds::headAddr(1)).next_id = extra;
+    a.node(ds::headAddr(1)).next_k_min = 100;
     rejects(ds::verifyStructure(a, layers), "an unparented non-orphan (I3)");
   }
 
-  // The same splice, but flagged orphan, is legitimate: capacity-overflow
-  // splits produce exactly this, and it must NOT be reported.
+  // The same splice, flagged orphan, is legitimate: capacity-overflow splits
+  // produce exactly this, and it must NOT be reported.
   {
     FakeArena a = buildInitial(layers);
     uint64_t const extra = ds::kFirstDynamicId;
-    ds::initNode(a.at(extra), /*k_min=*/100, /*level=*/1, /*is_orphan=*/true);
-    ds::VecSlot &h = a.at(ds::headAddr(1)).current();
-    h.next_id = extra;
-    h.next_k_min = 100;
-    a.restamp(ds::headAddr(1).id);
+    ds::VecOffset const extra_vec = ds::kFirstDynamicVec;
+    ds::initNode(a.node(extra), /*k_min=*/100, /*level=*/1, extra_vec);
+    ds::initVec(a.vecAt(extra_vec), /*is_orphan=*/true, /*ts=*/1000);
+    a.node(ds::headAddr(1)).next_id = extra;
+    a.node(ds::headAddr(1)).next_k_min = 100;
     ds::VerifyReport const r = ds::verifyStructure(a, layers);
     if (!r.ok()) {
       std::printf("FAIL: verifier rejected a legitimate overflow orphan:\n");
@@ -189,69 +191,159 @@ static void checkVerifierCatchesBreakage() {
   // rather than merely looking odd.
   {
     FakeArena a = buildInitial(layers);
-    ds::VecSlot &s = a.at(ds::headAddr(2)).current();
-    s.size = 2;
-    s.e[0] = ds::Entry{50, ds::headAddr(1).id};
-    s.e[1] = ds::Entry{10, ds::headAddr(1).id};
-    a.restamp(ds::headAddr(2).id);
+    ds::VecRecord &v = a.vec(ds::headAddr(2));
+    v.size = 2;
+    v.e[0] = ds::Entry{50, ds::headAddr(1).id};
+    v.e[1] = ds::Entry{10, ds::headAddr(1).id};
     rejects(ds::verifyStructure(a, layers), "entries out of order");
   }
 
   // Two parents for one child: the index must be a tree.
   {
     FakeArena a = buildInitial(layers);
-    ds::VecSlot &s = a.at(ds::headAddr(2)).current();
-    s.size = 2;
-    s.e[0] = ds::Entry{0, ds::headAddr(1).id};
-    s.e[1] = ds::Entry{100, ds::headAddr(1).id};  // same child, twice
-    s.next_k_min = ds::kReservedKey;
-    a.restamp(ds::headAddr(2).id);
+    ds::VecRecord &v = a.vec(ds::headAddr(2));
+    v.size = 2;
+    v.e[0] = ds::Entry{0, ds::headAddr(1).id};
+    v.e[1] = ds::Entry{100, ds::headAddr(1).id};
     rejects(ds::verifyStructure(a, layers), "one child with two parents");
   }
 
-  // Timestamps must not go backwards across the slot ring, or a snapshot read
-  // walking back for the version with ts <= T stops at the wrong one.
+  // ── The new markers ─────────────────────────────────────────────────────
+
+  // An unstable node in a quiescent structure means a writer died
+  // mid-propagation and nobody helped it finish -- which livelocks readers.
   {
     FakeArena a = buildInitial(layers);
-    ds::NodeRecord &n = a.at(ds::headAddr(1));
-    n.current().ts = 100;
-    n.slot[n.freeSlot()].ts = 500;  // previous version is somehow newer
-    a.restamp(ds::headAddr(1).id);
-    rejects(ds::verifyStructure(a, layers), "a timestamp inversion across the ring");
+    ds::NodeRecord &n = a.node(ds::headAddr(1));
+    n.handle = n.handle.withStruct(n.handle.offset());  // bumps struct_ver only
+    rejects(ds::verifyStructure(a, layers), "a node left mid-split (bookend mismatch)");
   }
 
-  // A plain forward timestamp is fine and must not be reported.
+  // The vector must be the version the handle names.
   {
     FakeArena a = buildInitial(layers);
-    ds::NodeRecord &n = a.at(ds::headAddr(1));
-    n.slot[n.freeSlot()].ts = 100;
-    n.current().ts = 500;
-    a.restamp(ds::headAddr(1).id);
+    a.vec(ds::headAddr(1)).content_ver = 9;
+    rejects(ds::verifyStructure(a, layers), "a vector whose version is not the handle's");
+  }
+
+  // A pending version in a quiescent structure: nobody is going to resolve it.
+  {
+    FakeArena a = buildInitial(layers);
+    a.vec(ds::headAddr(1)).ts = ds::kNullTs;
+    rejects(ds::verifyStructure(a, layers), "a version left pending");
+  }
+
+  // A split descriptor that outlived propagation must agree with the header,
+  // or readers preferring the vector and readers using the header disagree
+  // about where the node's range ends.
+  {
+    FakeArena a = buildInitial(layers);
+    ds::VecRecord &v = a.vec(ds::headAddr(1));
+    v.next_id = 777;
+    v.k_min_next = 4242;
+    rejects(ds::verifyStructure(a, layers), "a split descriptor disagreeing with the header");
+  }
+
+  // old_ver must decrease in ts: a snapshot read stops at the first version
+  // with ts <= T, so an inversion makes it stop early and serve the wrong one.
+  {
+    FakeArena a = buildInitial(layers);
+    ds::VecOffset const old = ds::kFirstDynamicVec;
+    ds::initVec(a.vecAt(old), /*is_orphan=*/false, /*ts=*/5000);  // newer!
+    a.vec(ds::headAddr(1)).old_ver = old;   // current ts is 1000
+    rejects(ds::verifyStructure(a, layers), "an old_ver chain that is not decreasing in ts");
+  }
+
+  // A correctly ordered chain must be accepted, and counted.
+  {
+    FakeArena a = buildInitial(layers);
+    ds::VecOffset const old = ds::kFirstDynamicVec;
+    ds::initVec(a.vecAt(old), /*is_orphan=*/false, /*ts=*/500);
+    a.vecAt(old).content_ver = 0;
+    ds::VecRecord &cur = a.vec(ds::headAddr(1));
+    cur.content_ver = 1;
+    a.node(ds::headAddr(1)).handle =
+        ds::Handle::make(0, 1, a.node(ds::headAddr(1)).handle.offset());
+    cur.old_ver = old;
     ds::VerifyReport const r = ds::verifyStructure(a, layers);
     if (!r.ok()) {
-      std::printf("FAIL: verifier rejected a valid timestamp ordering:\n");
+      std::printf("FAIL: verifier rejected a valid old_ver chain:\n");
       for (auto const &e : r.errors) std::printf("    %s\n", e.c_str());
       ++g_failures;
     }
+    CHECK(r.old_versions == 1, "the superseded version is counted");
   }
 
-  // old_ver is reserved: a non-zero value means something wrote a version chain
-  // that nothing can read.
+  // A cycle in the old_ver chain must be bounded, not spun on.
   {
     FakeArena a = buildInitial(layers);
-    a.at(ds::headAddr(1)).current().old_ver = 7;
-    a.restamp(ds::headAddr(1).id);
-    rejects(ds::verifyStructure(a, layers), "old_ver set while the chain is unimplemented");
+    ds::VecOffset const cur_off = a.node(ds::headAddr(1)).handle.offset();
+    a.vecAt(cur_off).old_ver = cur_off;  // points at itself
+    rejects(ds::verifyStructure(a, layers), "a self-cycle in the old_ver chain");
   }
 
-  // A torn node must be reported, not silently walked past.
+  // A superseded version that is still pending can never satisfy a snapshot.
   {
     FakeArena a = buildInitial(layers);
-    a.at(ds::headAddr(1)).current().trail_content_ver ^= 1u;  // no restamp
-    rejects(ds::verifyStructure(a, layers), "a torn node");
+    ds::VecOffset const old = ds::kFirstDynamicVec;
+    ds::initVec(a.vecAt(old), /*is_orphan=*/false, ds::kNullTs);
+    a.vec(ds::headAddr(1)).old_ver = old;
+    rejects(ds::verifyStructure(a, layers), "a superseded version left pending");
   }
 
   std::printf("  verifier rejects every deliberately broken structure\n");
+}
+
+static void checkAllocatorsAndHint() {
+  // The two arenas are consumed at different rates, so they are separate
+  // stripes; check they hand out disjoint, non-reserved ranges.
+  std::set<uint64_t> vecs;
+  for (uint64_t c = 0; c < 4; ++c) {
+    ds::VecAllocator alloc(c, 50);
+    CHECK(alloc.capacity() == 50, "vector stripe capacity");
+    CHECK(alloc.firstOffset() >= ds::kFirstDynamicVec,
+          "a vector stripe never overlaps the reserved offsets");
+    for (uint64_t i = 0; i < 50; ++i) {
+      ds::VecOffset const o = alloc.allocate();
+      CHECK(o != ds::kNullVec, "allocation inside capacity succeeds");
+      CHECK(alloc.owns(o), "an allocated offset belongs to its own stripe");
+      CHECK(vecs.insert(o).second, "no offset is handed out twice");
+    }
+    CHECK(alloc.exhausted() && alloc.allocate() == ds::kNullVec,
+          "exhaustion reports null rather than wrapping");
+  }
+  CHECK(vecs.size() == 200, "all vector stripes together cover every offset once");
+
+  // The offset hint: disabled is inert, enabled learns and scores.
+  {
+    ds::VecOffsetHint off(1024, /*enabled=*/false);
+    CHECK(!off.enabled(), "disabled hint reports disabled");
+    CHECK(off.guess(ds::RemoteAddr{5}) == ds::kNullVec, "disabled hint never guesses");
+    off.record(ds::RemoteAddr{5}, 42, ds::kNullVec);
+    CHECK(off.guess(ds::RemoteAddr{5}) == ds::kNullVec, "disabled hint learns nothing");
+  }
+  {
+    ds::VecOffsetHint on(1024, /*enabled=*/true);
+    ds::RemoteAddr const a{5};
+    CHECK(on.guess(a) == ds::kNullVec, "no guess before anything is learned");
+    // A first read with no guess must not be scored either way.
+    on.record(a, 42, ds::kNullVec);
+    CHECK(on.hits() == 0 && on.misses() == 0, "an unguessed read is not scored");
+    CHECK(on.guess(a) == 42, "the hint learned the offset");
+    // A correct guess.
+    on.record(a, 42, on.guess(a));
+    CHECK(on.hits() == 1 && on.misses() == 0, "a correct guess scores a hit");
+    // The vector moved: the guess is now wrong, and the hint updates.
+    on.record(a, 77, 42);
+    CHECK(on.misses() == 1, "a stale guess scores a miss");
+    CHECK(on.guess(a) == 77, "and the hint follows the move");
+    CHECK(on.hitRate() > 0.4 && on.hitRate() < 0.6, "hit rate is 1 of 2");
+    // Out of range must be inert, not out-of-bounds.
+    CHECK(on.guess(ds::RemoteAddr{99999}) == ds::kNullVec,
+          "an id past the arena guesses nothing");
+    on.record(ds::RemoteAddr{99999}, 1, 1);
+  }
+  std::printf("  allocators and offset hint behave\n");
 }
 
 int main() {
@@ -259,6 +351,7 @@ int main() {
               ds::kNodeCapacity);
   checkInitialStructureIsValid();
   checkVerifierCatchesBreakage();
+  checkAllocatorsAndHint();
   std::printf("%s\n", g_failures == 0 ? "ALL PASS" : "FAILURES");
   return g_failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
