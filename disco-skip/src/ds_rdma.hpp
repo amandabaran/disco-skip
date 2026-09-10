@@ -14,6 +14,7 @@
 // future would wait forever. Use these before futures start or after they have
 // all drained.
 
+#include <chrono>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -227,6 +228,86 @@ class RdmaNodeReader {
   uint64_t reads_ = 0;
   uint64_t unstable_ = 0;
   uint64_t stale_ = 0;
+};
+
+/// The full Ops surface ds_descend.hpp expects, over real RDMA.
+///
+/// Extends the reader with the four compare-and-swaps the helping path needs.
+/// Each returns whether it succeeded; every caller in the descent ignores that,
+/// because a failure means another thread already performed the step.
+///
+/// Blocking, like everything else in this header, so it belongs to bootstrap,
+/// --selftest and the sequential phases -- not to a pipelined benchmark loop.
+template <class Conns>
+class RdmaOps : public RdmaNodeReader<Conns> {
+  using Base = RdmaNodeReader<Conns>;
+
+ public:
+  RdmaOps(Conns &conns, Layout const &layout, NodeRecord *node_buf,
+          VecRecord *vec_buf, uint64_t *cas_buf, VecOffsetHint *hint = nullptr,
+          size_t replica = 0)
+      : Base(conns, layout, node_buf, vec_buf, hint, replica),
+        conns_(conns),
+        layout_(layout),
+        cas_buf_(cas_buf),
+        replica_(replica) {}
+
+  bool casTs(VecOffset off, uint64_t expected, uint64_t desired) {
+    auto &rc = *conns_[replica_];
+    ++cas_;
+    return blockingCas(rc, cas_buf_, layout_.vecTsAddrOf(rc.remoteBuf(), off),
+                       expected, desired);
+  }
+
+  bool casNextId(RemoteAddr a, uint64_t expected, uint64_t desired) {
+    auto &rc = *conns_[replica_];
+    ++cas_;
+    return blockingCas(rc, cas_buf_,
+                       Layout::nextIdAddrOf(rc.remoteBuf(), a), expected,
+                       desired);
+  }
+
+  bool casNextKMin(RemoteAddr a, Key expected, Key desired) {
+    auto &rc = *conns_[replica_];
+    ++cas_;
+    return blockingCas(rc, cas_buf_,
+                       Layout::nextKMinAddrOf(rc.remoteBuf(), a), expected,
+                       desired);
+  }
+
+  /// tail_struct_ver is 4 bytes but RDMA CAS is 8, so it is swapped as the word
+  /// it shares with `level` -- which never changes after creation, and whose
+  /// inclusion makes the CAS fail if the node is not the one we read.
+  bool casTailWord(RemoteAddr a, uint64_t expected, uint64_t desired) {
+    auto &rc = *conns_[replica_];
+    ++cas_;
+    return blockingCas(rc, cas_buf_,
+                       Layout::tailWordAddrOf(rc.remoteBuf(), a), expected,
+                       desired);
+  }
+
+  /// A helper's timestamp source.
+  ///
+  /// steady_clock is a placeholder, and deliberately not good enough for A10:
+  /// a real snapshot timestamp has to be comparable across machines, which
+  /// means a PTP-disciplined clock read and a measured epsilon. Until that is
+  /// decided this is monotonic per process, which is enough to keep the
+  /// old_ver chain ordered locally and not enough to order anything across
+  /// clients. Flagged rather than hidden, since a wrong clock here produces
+  /// wrong range-query results rather than a crash.
+  uint64_t now() {
+    return static_cast<uint64_t>(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+  }
+
+  [[nodiscard]] uint64_t casCount() const { return cas_; }
+
+ private:
+  Conns &conns_;
+  Layout const &layout_;
+  uint64_t *cas_buf_;
+  size_t replica_;
+  uint64_t cas_ = 0;
 };
 
 }  // namespace ds

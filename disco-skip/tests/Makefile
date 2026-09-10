@@ -14,7 +14,7 @@
 # otherwise editing skipvector_disco.h leaves a stale binary.
 
 CXX      ?= g++
-CXXFLAGS := -std=c++17 -O1 -g -Wall -Wextra -Wpedantic -pthread
+CXXFLAGS := -std=c++17 -O1 -g -Wall -Wextra -Wpedantic -pthread -Wno-nested-anon-types
 LDFLAGS  := -pthread
 
 SRC_DIR   := ../src
@@ -26,7 +26,7 @@ INCLUDES  := -I$(SRC_DIR) -I$(CACHE_DIR) -I$(CACHE_DIR)/include-cache
 # the checked-in template, which is what its own instructions say to do.
 MACHINE_DEFINES := $(CACHE_DIR)/include-cache/common/machine_defines.h
 
-HDRS := $(wildcard $(SRC_DIR)/ds_*.hpp) \
+HDRS := $(wildcard $(SRC_DIR)/ds_*.hpp) $(SRC_DIR)/layout.hpp \
         $(wildcard $(CACHE_DIR)/*.h) \
         $(wildcard $(CACHE_DIR)/include-cache/*/*.h)
 
@@ -37,6 +37,8 @@ BINS    := $(addprefix obj/smoke-,$(CONFIGS))
 # The structure verifier and the bootstrap builder, against a fake arena. Needs
 # no cache and no toggle sweep -- it is pure remote-side logic.
 VERIFY  := obj/verify
+DESCEND := obj/descend
+GET     := obj/get
 
 # Approximation of the dory toolchain's warning set, which is far stricter than
 # the cache half's own Makefile. Clang-only equivalents are used where GCC's
@@ -86,8 +88,20 @@ $(VERIFY): verify_test.cc $(HDRS) $(MACHINE_DEFINES) | obj
 	@$(CXX) $(CXXFLAGS) $(INCLUDES) -DDS_CACHE_ENABLED=0 -DDS_N_REPLICAS=1 \
 	  -DDS_MAX_LAYERS=8 -DDS_IDX_EXP=3 $< -o $@ $(LDFLAGS)
 
-check: $(BINS) $(VERIFY)
+$(DESCEND): descend_test.cc $(HDRS) $(MACHINE_DEFINES) | obj
+	@echo "[CXX] descend"
+	@$(CXX) $(CXXFLAGS) $(INCLUDES) -DDS_CACHE_ENABLED=0 -DDS_N_REPLICAS=1 \
+	  -DDS_MAX_LAYERS=8 -DDS_IDX_EXP=3 $< -o $@ $(LDFLAGS)
+
+$(GET): get_test.cc $(HDRS) fake_ops.hpp $(MACHINE_DEFINES) | obj
+	@echo "[CXX] get"
+	@$(CXX) $(CXXFLAGS) $(INCLUDES) -DDS_CACHE_ENABLED=1 -DDS_N_REPLICAS=1 \
+	  -DDS_MAX_LAYERS=8 -DDS_IDX_EXP=3 $< -o $@ $(LDFLAGS)
+
+check: $(BINS) $(VERIFY) $(DESCEND) $(GET)
 	@echo "---- $(VERIFY) ----"; $(VERIFY) || exit 1
+	@echo "---- $(DESCEND) ----"; $(DESCEND) || exit 1
+	@echo "---- $(GET) ----"; $(GET) || exit 1
 	@for b in $(BINS); do echo "---- $$b ----"; $$b || exit 1; done
 	@echo "==== all toggle combinations pass ===="
 

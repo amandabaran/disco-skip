@@ -438,6 +438,22 @@ inline constexpr RemoteAddr headAddr(uint32_t level) {
   return k >= n.k_min && k < rangeEnd(n, v);
 }
 
+/// The 8-byte word holding `level` and `tail_struct_ver`.
+///
+/// RDMA CAS is an 8-byte operation but tail_struct_ver is 4, so closing the
+/// propagation window CASes the pair as one word. `level` never changes after a
+/// node is created, so carrying it through the swap disturbs nothing -- and
+/// including it makes the CAS fail if the node is not the one we read, which is
+/// a free extra check.
+///
+/// Little-endian assumed, as everywhere else that reads these bytes across the
+/// wire: `level` sits at the lower offset, so it occupies the low half.
+[[nodiscard]] inline uint64_t packTailWord(uint32_t level,
+                                           uint32_t tail_struct_ver) noexcept {
+  return static_cast<uint64_t>(level) |
+         (static_cast<uint64_t>(tail_struct_ver) << 32);
+}
+
 /// Initialise a node header in place. Always into a client-local staging
 /// buffer that is then written out -- never against remote memory directly.
 inline void initNode(NodeRecord &n, Key k_min, uint32_t level,

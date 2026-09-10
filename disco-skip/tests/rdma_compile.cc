@@ -6,6 +6,8 @@
 
 #include "ds_bootstrap.hpp"
 #include "ds_node.hpp"
+#include "ds_descend.hpp"
+#include "ds_get.hpp"
 #include "ds_rdma.hpp"
 #include "ds_verify.hpp"
 #include "layout.hpp"
@@ -42,6 +44,29 @@ void instantiate_rdma_paths(Conns &conns, ds::Layout const &layout, Bufs b,
   // in --selftest.
   ds::VerifyReport const rep = ds::verifyStructure(reader, layers);
   (void)rep.ok();
+}
+
+// The descent and Get, over the full RDMA Ops surface. Compile-only: this is
+// the combination that runs on the cluster, so it must at least type-check
+// here.
+void instantiate_ops(Conns &conns, ds::Layout const &layout, Bufs b,
+                     uint64_t *cas_buf, ds::VecOffsetHint *hint,
+                     uint32_t layers);
+void instantiate_ops(Conns &conns, ds::Layout const &layout, Bufs b,
+                     uint64_t *cas_buf, ds::VecOffsetHint *hint,
+                     uint32_t layers) {
+  ds::RdmaOps<Conns> ops(conns, layout, b.node, b.vec, cas_buf, hint);
+
+  ds::PathStep path[ds::kMaxLayers];
+  ds::Descender<ds::RdmaOps<Conns>> d(ops);
+  ds::DescentResult const r = d.descend(42, layers, path);
+  (void)r.ok();
+  (void)ops.casCount();
+
+  ds::NullCache null_cache;
+  ds::GetStats stats;
+  ds::Getter<ds::RdmaOps<Conns>, ds::NullCache> g(ops, null_cache, layers, stats);
+  (void)g.get(42);
 }
 
 // The bootstrap write loop, in the shape main.cpp uses it.

@@ -221,4 +221,28 @@ inline LevelStats levelStats(SkipVec const &sv, uint32_t level) {
   return s;
 }
 
+/// Adapts SkipVec to the surface Getter expects, so the orchestration in
+/// ds_get.hpp can be driven with either the real cache or NullCache without
+/// knowing which.
+///
+/// Deliberately thin: it converts types and nothing else. Anything that needs
+/// to reason about the cache's semantics belongs in the free functions above,
+/// where it can be read next to the interface doc.
+class CacheAdapter {
+ public:
+  explicit CacheAdapter(SkipVec &sv) : sv_(sv) {}
+
+  [[nodiscard]] RemoteAddr locateData(Key k) { return sv_.locate_data(k); }
+
+  void reconcile(Key data_k_min, RemoteAddr data_addr, PathStep const *path,
+                 uint32_t levels) {
+    ds::reconcile(sv_, data_k_min, data_addr, path, levels);
+  }
+
+  SkipVec &sv() { return sv_; }
+
+ private:
+  SkipVec &sv_;
+};
+
 }  // namespace ds
