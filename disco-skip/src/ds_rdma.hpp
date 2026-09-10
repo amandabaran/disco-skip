@@ -154,6 +154,23 @@ class RdmaNodeReader {
         hint_(hint),
         replica_(replica) {}
 
+  /// A 64-byte header read, raw: no stability retry, because a descent needs
+  /// to *see* that a node is mid-propagation in order to route around it or
+  /// help finish it. The combined read() below is the settled variant, for the
+  /// verifier.
+  bool readNode(RemoteAddr a, NodeRecord &node) {
+    if (a.isNull()) return false;
+    auto &rc = *conns_[replica_];
+    blockingRead(rc, node_buf_, kNodeRecordBytes,
+                 Layout::nodeAddrOf(rc.remoteBuf(), a));
+    ++node_reads_;
+    // Learn the true offset even on a raw read: it costs nothing and keeps the
+    // hint warm for whoever does speculate.
+    if (hint_ != nullptr) hint_->record(a, node_buf_->handle.offset(), kNullVec);
+    node = *node_buf_;
+    return true;
+  }
+
   bool read(RemoteAddr a, NodeRecord &node, VecRecord &vec) {
     if (a.isNull()) return false;
     auto &rc = *conns_[replica_];
@@ -168,10 +185,11 @@ class RdmaNodeReader {
         blockingRead(rc, node_buf_, kNodeRecordBytes, node_remote);
         blockingRead(rc, vec_buf_, kVecRecordBytes,
                      layout_.vecAddrOf(rc.remoteBuf(), guess));
-        reads_ += 2;
+        ++node_reads_;
+        ++vec_reads_;
       } else {
         blockingRead(rc, node_buf_, kNodeRecordBytes, node_remote);
-        ++reads_;
+        ++node_reads_;
       }
 
       if (!node_buf_->isStable()) {
@@ -185,7 +203,7 @@ class RdmaNodeReader {
       if (guess != truth) {
         blockingRead(rc, vec_buf_, kVecRecordBytes,
                      layout_.vecAddrOf(rc.remoteBuf(), truth));
-        ++reads_;
+        ++vec_reads_;
       }
 
       if (!vectorIsCurrent(*node_buf_, *vec_buf_, truth)) {
@@ -200,19 +218,27 @@ class RdmaNodeReader {
     return false;
   }
 
-  /// Fetch a vector by offset, for walking the old_ver chain. No validation:
-  /// a superseded version is exactly what the caller asked for.
+  /// Fetch a vector by offset. No validation: the caller may be walking the
+  /// old_ver chain, where a superseded version is exactly what it asked for.
   bool readVec(VecOffset off, VecRecord &vec) {
     if (off == kNullVec) return false;
     auto &rc = *conns_[replica_];
     blockingRead(rc, vec_buf_, kVecRecordBytes,
                  layout_.vecAddrOf(rc.remoteBuf(), off));
-    ++reads_;
+    ++vec_reads_;
     vec = *vec_buf_;
     return true;
   }
 
-  [[nodiscard]] uint64_t reads() const { return reads_; }
+  [[nodiscard]] uint64_t reads() const { return node_reads_ + vec_reads_; }
+  [[nodiscard]] uint64_t nodeReads() const { return node_reads_; }
+  [[nodiscard]] uint64_t vecReads() const { return vec_reads_; }
+  /// Bytes off the wire, which is the number that matters: a header is 64 B
+  /// and a vector 320 B, so counting reads alone hides the difference the
+  /// layout exists to create.
+  [[nodiscard]] uint64_t bytesRead() const {
+    return node_reads_ * kNodeRecordBytes + vec_reads_ * kVecRecordBytes;
+  }
   [[nodiscard]] uint64_t unstableRetries() const { return unstable_; }
   [[nodiscard]] uint64_t staleRetries() const { return stale_; }
 
@@ -225,7 +251,8 @@ class RdmaNodeReader {
   VecRecord *vec_buf_;
   VecOffsetHint *hint_;
   size_t replica_;
-  uint64_t reads_ = 0;
+  uint64_t node_reads_ = 0;
+  uint64_t vec_reads_ = 0;
   uint64_t unstable_ = 0;
   uint64_t stale_ = 0;
 };

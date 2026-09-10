@@ -144,9 +144,12 @@ int run_structure_selftest(ds::DsState& state) {
     std::cout << "data nodes:   " << rep.data_nodes
               << " (" << rep.data_entries << " entries)" << std::endl;
     std::cout << "old versions: " << rep.old_versions << std::endl;
-    std::cout << "rdma reads:   " << reader.reads()
-              << " (" << reader.unstableRetries() << " mid-split retries, "
-              << reader.staleRetries() << " stale-vector retries)" << std::endl;
+    std::cout << "rdma reads:   " << reader.reads() << " ("
+              << reader.nodeReads() << " headers, " << reader.vecReads()
+              << " vectors, " << reader.bytesRead() << " bytes)" << std::endl;
+    std::cout << "              " << reader.unstableRetries()
+              << " mid-split retries, " << reader.staleRetries()
+              << " stale-vector retries" << std::endl;
     if (state.vec_hint.enabled()) {
         std::cout << "offset hint:  hit rate " << state.vec_hint.hitRate()
                   << " (" << state.vec_hint.hits() << " hit / "
@@ -155,16 +158,74 @@ int run_structure_selftest(ds::DsState& state) {
         std::cout << "offset hint:  disabled" << std::endl;
     }
 
-    if (rep.ok()) {
-        std::cout << "SELFTEST PASS: I1-I4 hold" << std::endl;
-        return 0;
+    if (!rep.ok()) {
+        std::cout << "SELFTEST FAIL: " << rep.errors.size() << " problem(s)"
+                  << std::endl;
+        for (auto const& e : rep.errors) {
+            std::cout << "  " << e << std::endl;
+        }
+        return 1;
     }
-    std::cout << "SELFTEST FAIL: " << rep.errors.size() << " problem(s)" << std::endl;
-    for (auto const& e : rep.errors) {
-        std::cout << "  " << e << std::endl;
+    std::cout << "SELFTEST PASS: I1-I4 hold" << std::endl;
+
+    // Exercise the descent over real RDMA. The structure is empty, so every
+    // key resolves to the single data node and finds nothing -- which is
+    // exactly the interesting assertion: a descent over an empty structure
+    // must reach the data node and report absent, never fail or miss.
+    std::cout << "\n################ Descent:" << std::endl;
+    ds::RdmaOps<decltype(state.server_conns)> ops(
+        state.server_conns, state.layout, state.layout.getNodeBufs(0),
+        state.layout.getVecBufs(0), state.layout.getCasBufs(0),
+        &state.vec_hint);
+    ds::Descender<decltype(ops)> descender(ops);
+
+    ds::PathStep path[ds::kMaxLayers];
+    uint32_t ok = 0, absent = 0, bad = 0;
+    ds::Key const probes[] = {0, 1, 42, 1000, 1u << 20};
+    for (ds::Key k : probes) {
+        ds::DescentResult const r = descender.descend(k, layers, path);
+        if (!r.ok()) {
+            std::cout << "  key " << k << ": descent failed, status "
+                      << static_cast<int>(r.status) << std::endl;
+            ++bad;
+            continue;
+        }
+        ++ok;
+        if (!r.found) ++absent;
+        // Every level's covering node must start at or below the key, and the
+        // staircase must be non-increasing as it climbs.
+        for (uint32_t L = 0; L + 1 < layers; ++L) {
+            if (path[L + 1].k_min > path[L].k_min) {
+                std::cout << "  key " << k << ": staircase inverted between "
+                          << "level " << L << " and " << (L + 1) << std::endl;
+                ++bad;
+            }
+        }
+        if (r.data_k_min > k) {
+            std::cout << "  key " << k << ": data node k_min " << r.data_k_min
+                      << " is above the key" << std::endl;
+            ++bad;
+        }
     }
-    return 1;
+    std::cout << "probes:       " << ok << " resolved, " << absent
+              << " absent (expected: all, the structure is empty)" << std::endl;
+    std::cout << "rdma:         " << ops.nodeReads() << " headers, "
+              << ops.vecReads() << " vectors, " << ops.casCount() << " CAS"
+              << std::endl;
+    if (bad != 0) {
+        std::cout << "DESCENT FAIL: " << bad << " problem(s)" << std::endl;
+        return 1;
+    }
+    if (ok != sizeof(probes) / sizeof(probes[0]) || absent != ok) {
+        std::cout << "DESCENT FAIL: expected every probe to resolve and be absent"
+                  << std::endl;
+        return 1;
+    }
+    std::cout << "DESCENT PASS: every probe reached the data node and reported "
+                 "absent" << std::endl;
+    return 0;
 }
+
 
 std::unique_ptr<FILE, PipeDeleter> exec(const std::string& cmd) {
     auto raw_pipe = popen(cmd.c_str(), "r");

@@ -26,21 +26,27 @@ class FakeOps {
 
   // ── The Ops concept ──────────────────────────────────────────────────────
 
-  bool read(ds::RemoteAddr a, ds::NodeRecord &node, ds::VecRecord &vec) {
+  /// A 64-byte header read.
+  bool readNode(ds::RemoteAddr a, ds::NodeRecord &node) {
     if (a.isNull() || a.id >= nodes_.size()) return false;
     node = nodes_[a.id];
-    ds::VecOffset const off = node.handle.offset();
-    if (off == ds::kNullVec || off >= vecs_.size()) return false;
-    vec = vecs_[off];
-    ++reads_;
+    ++node_reads_;
     return true;
   }
 
+  /// A 320-byte vector read -- five times the bytes, and the one the layout
+  /// exists to avoid on a pass-through hop.
   bool readVec(ds::VecOffset off, ds::VecRecord &vec) {
     if (off == ds::kNullVec || off >= vecs_.size()) return false;
     vec = vecs_[off];
-    ++reads_;
+    ++vec_reads_;
     return true;
+  }
+
+  /// Both, for callers that always want the pair (the verifier).
+  bool read(ds::RemoteAddr a, ds::NodeRecord &node, ds::VecRecord &vec) {
+    if (!readNode(a, node)) return false;
+    return readVec(node.handle.offset(), vec);
   }
 
   bool casTs(ds::VecOffset off, uint64_t expected, uint64_t desired) {
@@ -87,7 +93,9 @@ class FakeOps {
   ds::VecRecord &vecAt(ds::VecOffset off) { return vecs_[off]; }
   ds::VecRecord &vecOf(ds::RemoteAddr a) { return vecs_[nodes_[a.id].handle.offset()]; }
 
-  uint64_t reads() const { return reads_; }
+  uint64_t nodeReads() const { return node_reads_; }
+  uint64_t vecReads() const { return vec_reads_; }
+  uint64_t reads() const { return node_reads_ + vec_reads_; }
   uint64_t casTsCalls() const { return cas_ts_; }
   uint64_t casTailCalls() const { return cas_tail_; }
   uint64_t clockNow() const { return clock_; }
@@ -96,7 +104,7 @@ class FakeOps {
   std::vector<ds::NodeRecord> nodes_;
   std::vector<ds::VecRecord> vecs_;
   uint64_t clock_ = 1000;
-  uint64_t reads_ = 0, cas_ts_ = 0, cas_next_id_ = 0, cas_next_k_min_ = 0,
+  uint64_t node_reads_ = 0, vec_reads_ = 0, cas_ts_ = 0, cas_next_id_ = 0, cas_next_k_min_ = 0,
            cas_tail_ = 0;
 };
 

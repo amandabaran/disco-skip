@@ -10,7 +10,7 @@
 //
 // Ops must provide:
 //
-//     bool read(RemoteAddr a, NodeRecord &node, VecRecord &vec);
+//     bool readNode(RemoteAddr a, NodeRecord &node);
 //     bool readVec(VecOffset off, VecRecord &vec);
 //     bool casTs(VecOffset off, uint64_t expected, uint64_t desired);
 //     bool casNextId(RemoteAddr a, uint64_t expected, uint64_t desired);
@@ -56,7 +56,8 @@ struct DescentResult {
   uint32_t levels = 0;
 
   /// Counters, so the cost of a descent is measurable rather than inferred.
-  uint32_t nodes_read = 0;
+  uint32_t nodes_read = 0;   ///< 64-byte header reads
+  uint32_t vec_reads = 0;    ///< 320-byte vector reads -- the expensive kind
   uint32_t right_hops = 0;
   uint32_t helped_ts = 0;
   uint32_t helped_splits = 0;
@@ -97,7 +98,8 @@ class Descender {
 
     for (uint32_t level = layers; level-- > 0;) {
       // Walk right to the node covering k at this level.
-      if (!seek(cur, k, node, vec, res)) return res;
+      bool have_vec = false;
+      if (!seek(cur, k, node, vec, have_vec, res)) return res;
 
       // Record what this level saw. `first_down` is only meaningful at the
       // directory: it is the value of the covering node's first entry, i.e.
@@ -132,7 +134,8 @@ class Descender {
     // `cur` now names a data node. Walk right there too: a data-level split
     // the directory has not learned about leaves the covering node one or more
     // hops along, which is exactly interface-doc §7a's third case.
-    if (!seek(cur, k, node, vec, res)) return res;
+    bool have_vec = false;
+    if (!seek(cur, k, node, vec, have_vec, res)) return res;
     if (!settle(cur, node, vec, res)) {
       res.status = DescentStatus::ReadFailed;
       return res;
@@ -155,34 +158,84 @@ class Descender {
 
   /// Advance /cur/ along its level until the node covering k is reached.
   ///
-  /// Uses the vector's split descriptor in preference to the header, so a node
-  /// mid-propagation routes correctly without being settled first. That is what
-  /// lets a passing reader avoid helping: it never consults the entries, only
-  /// where the range ends and what comes next.
+  /// Hops on the 64-byte header alone. That is the whole reason next_id and
+  /// next_k_min live in the header rather than the vector: a node we are only
+  /// passing over never needs its 320-byte vector fetched, and passing over is
+  /// the common case while splitting is rare.
+  ///
+  /// The vector is consulted in exactly two situations:
+  ///
+  ///   - the node is unstable, so the header's next_id / next_k_min are
+  ///     mid-propagation and the vector's descriptor is authoritative
+  ///   - the node covers k, so we are about to read its entries anyway
+  ///
+  /// On return, /have_vec/ says whether /vec/ was already fetched, so the
+  /// caller does not re-read it.
   bool seek(RemoteAddr &cur, Key k, NodeRecord &node, VecRecord &vec,
-            DescentResult &res) {
+            bool &have_vec, DescentResult &res) {
+    have_vec = false;
     for (uint32_t hop = 0;; ++hop) {
       if (hop > detail::kMaxHopsPerLevel) {
         res.status = DescentStatus::Exhausted;
         return false;
       }
-      if (!ops_.read(cur, node, vec)) {
+      if (!ops_.readNode(cur, node)) {
         res.status = DescentStatus::ReadFailed;
         return false;
       }
       ++res.nodes_read;
 
-      if (k < rangeEnd(node, vec)) return true;
+      Key end;
+      RemoteAddr next;
+      if (node.isStable()) {
+        // The common case: the header is settled, so it can be trusted, and
+        // no vector read happens unless this node turns out to cover k.
+        end = node.next_k_min;
+        next = RemoteAddr{node.next_id};
+      } else {
+        // Mid-propagation. The header's link fields may not have landed yet,
+        // so fall back to the descriptor the writer left in the new vector.
+        if (!ops_.readVec(node.handle.offset(), vec)) {
+          res.status = DescentStatus::ReadFailed;
+          return false;
+        }
+        ++res.vec_reads;
+        have_vec = true;
+        end = rangeEnd(node, vec);
+        next = nextNode(node, vec);
+      }
 
-      RemoteAddr const next = nextNode(node, vec);
+      if (k < end) {
+        // This node covers k, so its entries are needed. Fetch the vector if
+        // the unstable path has not already done so.
+        if (!have_vec) {
+          if (!ops_.readVec(node.handle.offset(), vec)) {
+            res.status = DescentStatus::ReadFailed;
+            return false;
+          }
+          ++res.vec_reads;
+          have_vec = true;
+        }
+        return true;
+      }
+
       if (next.isNull()) {
         // The chain ends here, so this node owns everything above its k_min.
         // Reaching this with k past the range end means next_k_min lied, which
         // the verifier would reject in a quiescent structure.
+        if (!have_vec) {
+          if (!ops_.readVec(node.handle.offset(), vec)) {
+            res.status = DescentStatus::ReadFailed;
+            return false;
+          }
+          ++res.vec_reads;
+          have_vec = true;
+        }
         return true;
       }
       cur = next;
       ++res.right_hops;
+      have_vec = false;
     }
   }
 
@@ -226,8 +279,10 @@ class Descender {
         ++res.helped_splits;
       }
 
-      if (!ops_.read(addr, node, vec)) return false;
+      if (!ops_.readNode(addr, node)) return false;
       ++res.nodes_read;
+      if (!ops_.readVec(node.handle.offset(), vec)) return false;
+      ++res.vec_reads;
     }
     return false;
   }

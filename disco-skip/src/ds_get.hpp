@@ -37,7 +37,8 @@ struct GetStats {
   uint64_t kmin_mismatch = 0;   ///< C4: named node no longer covers k
   uint64_t descents = 0;        ///< full remote traversals
   uint64_t reconciles = 0;      ///< paths fed back to the cache
-  uint64_t nodes_read = 0;
+  uint64_t nodes_read = 0;   ///< 64-byte header reads
+  uint64_t vec_reads = 0;    ///< 320-byte vector reads
   uint64_t right_hops = 0;
   uint64_t helped = 0;          ///< in-flight operations completed for a writer
   uint64_t not_found = 0;       ///< resolved, and k genuinely does not exist
@@ -66,9 +67,30 @@ class Getter {
     if (!hinted.isNull()) {
       NodeRecord node;
       VecRecord vec;
-      if (ops_.read(hinted, node, vec)) {
+      // The header alone answers the range check on a stable node, so a bad
+      // hint is detected for 64 bytes rather than 384. Only a hint that looks
+      // good, or a node mid-propagation, pays for the vector.
+      if (ops_.readNode(hinted, node)) {
         ++stats_.nodes_read;
-        if (covers(node, vec, k)) {
+        bool const stable = node.isStable();
+        bool have_vec = false;
+        if (!stable) {
+          if (ops_.readVec(node.handle.offset(), vec)) {
+            ++stats_.vec_reads;
+            have_vec = true;
+          }
+        }
+        bool const in_range =
+            stable ? coversByHeader(node, k) : (have_vec && covers(node, vec, k));
+        if (in_range) {
+          if (!have_vec) {
+            if (ops_.readVec(node.handle.offset(), vec)) {
+              ++stats_.vec_reads;
+              have_vec = true;
+            }
+          }
+        }
+        if (in_range && have_vec) {
           // ── 2. The hint was good. Answer from this node alone. ──────────
           ++stats_.cache_hits;
           int const idx = findLte(vec, k);
@@ -99,6 +121,7 @@ class Getter {
     DescentResult const r = d.descend(k, layers_, path);
 
     stats_.nodes_read += r.nodes_read;
+    stats_.vec_reads += r.vec_reads;
     stats_.right_hops += r.right_hops;
     stats_.helped += r.helped_ts + r.helped_splits;
 

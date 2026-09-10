@@ -138,12 +138,30 @@ static void checkCacheActuallyReducesWork() {
   size_t const ops_cached = run(true, cached);
   size_t const ops_uncached = run(false, uncached);
 
-  double const per_op_cached = double(cached.nodes_read) / double(ops_cached);
-  double const per_op_uncached = double(uncached.nodes_read) / double(ops_uncached);
+  // Bytes, not just reads: a header is 64 B and a vector 320 B, and keeping
+  // pass-through hops header-only is the whole reason next_id lives in the
+  // header. Counting reads alone would hide that.
+  auto bytes = [](ds::GetStats const &st) {
+    return double(st.nodes_read) * double(ds::kNodeRecordBytes) +
+           double(st.vec_reads) * double(ds::kVecRecordBytes);
+  };
+  double const per_op_cached = double(cached.nodes_read + cached.vec_reads) /
+                               double(ops_cached);
+  double const per_op_uncached = double(uncached.nodes_read + uncached.vec_reads) /
+                                 double(ops_uncached);
 
-  std::printf("  nodes read per Get: %.2f with cache, %.2f without (%.1fx)\n",
+  std::printf("  reads per Get:  %.2f with cache, %.2f without (%.1fx)\n",
               per_op_cached, per_op_uncached,
               per_op_cached > 0 ? per_op_uncached / per_op_cached : 0.0);
+  std::printf("  bytes per Get:  %.0f with cache, %.0f without (%.1fx)\n",
+              bytes(cached) / double(ops_cached),
+              bytes(uncached) / double(ops_uncached),
+              bytes(cached) > 0 ? bytes(uncached) / bytes(cached) : 0.0);
+  std::printf("  headers/vectors: %llu/%llu cached, %llu/%llu uncached\n",
+              (unsigned long long)cached.nodes_read,
+              (unsigned long long)cached.vec_reads,
+              (unsigned long long)uncached.nodes_read,
+              (unsigned long long)uncached.vec_reads);
   std::printf("  cache: %llu hits, %llu misses, %llu C4 mismatches, %llu reconciles\n",
               (unsigned long long)cached.cache_hits,
               (unsigned long long)cached.cache_misses,
@@ -158,8 +176,13 @@ static void checkCacheActuallyReducesWork() {
   CHECK(uncached.descents == ops_uncached, "the baseline descends on every Get");
   CHECK(cached.descents < ops_cached, "the cache avoids descending on most Gets");
   CHECK(cached.cache_hits > 0, "the cache does hit once warm");
-  CHECK(per_op_cached < per_op_uncached,
-        "the cache reduces nodes read per Get");
+  CHECK(per_op_cached < per_op_uncached, "the cache reduces reads per Get");
+  // The header/vector split must actually be exploited: a descent that hops
+  // over N nodes should read far fewer vectors than headers, or seek() is
+  // fetching vectors it does not need.
+  CHECK(uncached.vec_reads < uncached.nodes_read,
+        "pass-through hops are header-only, so vectors are read less often "
+        "than headers");
   // Reconciles must taper: the cache is meant to converge on a static
   // structure, not reconcile on every operation forever.
   CHECK(cached.reconciles < ops_cached,
