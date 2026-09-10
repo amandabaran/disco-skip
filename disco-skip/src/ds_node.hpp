@@ -254,6 +254,16 @@ struct NodeRecord {
 };
 
 inline constexpr size_t kNodeHeaderSize = 64;
+
+/// The record size as a uint32_t, which is what ibverbs takes for a
+/// scatter-gather length. Named so the narrowing happens once, next to the
+/// static_assert that proves it cannot truncate, rather than implicitly at
+/// every call site. Cosmetic rather than a fix -- sizeof is a constant that
+/// provably fits, so no compiler warns about it -- but it documents the bound.
+inline constexpr uint32_t kNodeRecordBytes =
+    static_cast<uint32_t>(sizeof(NodeRecord));
+static_assert(sizeof(NodeRecord) <= 0xFFFFFFFFu,
+              "a node record must fit in an ibverbs sge length");
 static_assert(offsetof(NodeRecord, handle) == 0,
               "the CAS target must be at offset 0 so a node's address is its "
               "handle's address");

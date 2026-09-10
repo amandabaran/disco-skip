@@ -50,8 +50,16 @@ STRICTFLAGS := -std=c++17 -O1 -Werror -Wall -Wextra -Wpedantic -Wconversion \
                -Wold-style-cast -Wredundant-decls -Wundef -Wno-unused \
                -Wno-nested-anon-types
 
-.PHONY: all check strict debug clean
-all: check strict
+# ds_rdma.hpp sits on dory and libibverbs, which do not exist off-cluster, so it
+# is compiled against the stub in dory_stub/ instead. Compile-only: the stub
+# moves no data, so nothing asserts behaviour through it.
+#
+# LIMIT: -Wsign-promo is GCC-only and there is no GCC here, so the class of bug
+# it catches (an unsigned enum picking the int overload) stays cluster-only.
+STUBFLAGS := -I dory_stub
+
+.PHONY: all check strict rdma debug clean
+all: check strict rdma
 
 $(MACHINE_DEFINES): $(CACHE_DIR)/include-cache/common/machine_defines.template.h
 	cp $< $@
@@ -93,6 +101,13 @@ strict: | obj
 	@$(CXX) $(STRICTFLAGS) $(INCLUDES) -DDS_CACHE_ENABLED=0 -DDS_N_REPLICAS=1 \
 	  -DDS_MAX_LAYERS=8 -DDS_IDX_EXP=3 strict_headers.cc -o obj/strict $(LDFLAGS)
 	@obj/strict > /dev/null; echo "==== headers clean under the strict warning set ===="
+
+rdma: | obj
+	@echo "[CXX] ds_rdma.hpp against the dory stub"
+	@$(CXX) $(STRICTFLAGS) $(INCLUDES) $(STUBFLAGS) \
+	  -DDS_CACHE_ENABLED=0 -DDS_N_REPLICAS=1 -DDS_MAX_LAYERS=8 -DDS_IDX_EXP=3 \
+	  -c rdma_compile.cc -o obj/rdma_compile.o
+	@echo "==== ds_rdma.hpp compiles clean against the dory surface ===="
 
 clean:
 	rm -rf obj

@@ -46,8 +46,11 @@ inline void awaitOne(dory::conn::ReliableConnection &rc, char const *what) {
     }
     if (wces.empty()) continue;
     if (wces[0].status != IBV_WC_SUCCESS) {
+      // ibv_wc_status is an unsigned enum, and handing it straight to
+      // std::to_string picks the int overload -- which -Wsign-promo rejects.
+      // Widened explicitly rather than left to promotion.
       throw std::runtime_error(std::string("RDMA ") + what + " failed: status " +
-                               std::to_string(wces[0].status));
+                               std::to_string(static_cast<unsigned>(wces[0].status)));
     }
     return;
   }
@@ -99,7 +102,7 @@ template <class Conns>
 void writeNodeAllReplicas(Conns &conns, NodeRecord *staging, RemoteAddr addr) {
   for (size_t r = 0; r < conns.size(); ++r) {
     auto &rc = *conns[r];
-    blockingWrite(rc, staging, sizeof(NodeRecord),
+    blockingWrite(rc, staging, kNodeRecordBytes,
                   Layout::nodeAddrOf(rc.remoteBuf(), addr));
   }
 }
@@ -125,7 +128,7 @@ class RdmaNodeReader {
     uintptr_t const remote = Layout::nodeAddrOf(rc.remoteBuf(), a);
 
     for (int attempt = 0; attempt < kTornReadRetries; ++attempt) {
-      blockingRead(rc, buf_, sizeof(NodeRecord), remote);
+      blockingRead(rc, buf_, kNodeRecordBytes, remote);
       ++reads_;
       if (slotIsConsistent(*buf_)) {
         out = *buf_;

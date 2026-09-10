@@ -541,7 +541,8 @@ int main(int argc, char** argv) {
         // that was never told them reports a miss for every key left of the
         // first boundary at every level, which is correct but silently slow
         // (interface doc §5).
-        ds::bootstrapHeads(state.cache_sv, ds::headAddrs(layout.cache_layers));
+        ds::bootstrapHeads(state.cache_sv,
+                           ds::headAddrs(static_cast<uint32_t>(layout.cache_layers)));
         if (!ds::headsBootstrapped(state.cache_sv)) {
             std::cerr << "Cache heads were not bootstrapped" << std::endl;
             return 1;
