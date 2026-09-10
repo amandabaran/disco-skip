@@ -23,10 +23,7 @@
 #include <dory/shared/match.hpp>
 
 // Disco-skip headers
-#include "layout.hpp"
-#include "ds_bootstrap.hpp"
-#include "ds_rdma.hpp"
-#include "ds_verify.hpp"
+#include "ds.hpp"
 #include "disco_skip_client.hpp"
 #include "op_future.hpp"
 #include "register.hpp"

@@ -4,13 +4,11 @@
 // header type-checks and is warning-clean before it reaches the cluster, which
 // three failed cluster builds argue is worth a file.
 
-#include "ds_bootstrap.hpp"
-#include "ds_node.hpp"
-#include "ds_descend.hpp"
-#include "ds_get.hpp"
-#include "ds_rdma.hpp"
-#include "ds_verify.hpp"
-#include "layout.hpp"
+// The umbrella header, exactly as main.cpp includes it. That is the point:
+// main.cpp is the one translation unit that cannot be compiled off-cluster, so
+// checking ds.hpp here is what stops a missing include in it costing a cluster
+// round trip -- which it has done once already.
+#include "ds.hpp"
 
 // Force instantiation of the templates; being templates, nothing above would.
 using Conns = std::vector<dory::conn::ReliableConnection *>;
