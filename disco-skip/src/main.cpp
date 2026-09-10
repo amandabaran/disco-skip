@@ -337,7 +337,8 @@ int main(int argc, char** argv) {
             ["--writeback"]("Enable or disable writeback in the CAS-ABD protocol (1 or 0)") |
         lyra::opt(run_selftest, "selftest").optional()["--selftest"](
             "Bootstrap the structure, verify invariants I1-I4 over RDMA, and "
-            "exit. Needs no YCSB and runs on a single server/client pair.") |
+            "exit (1 or 0). Needs no YCSB and runs on a single server/client "
+            "pair. Takes a value, like --cache and --ml: pass --selftest 1.") |
         lyra::opt(run_ml_workload, "ml").optional()["--ml"] |
         lyra::opt(think_time, "think").optional()["--think"];
 
