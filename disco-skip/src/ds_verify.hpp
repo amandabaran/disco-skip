@@ -153,6 +153,28 @@ class StructureVerifier {
       err(idStr(id) + ": last key " + std::to_string(s.e[s.size - 1].key) +
           " is at or past next_k_min " + std::to_string(s.next_k_min));
     }
+
+    // Timestamps must not go backwards across the slot ring. The ring
+    // alternates, so `previous` is exactly one version behind `current`, and a
+    // snapshot read walking back for the version with ts <= T relies on that
+    // ordering to know when to stop. An inversion would make it stop early and
+    // read the wrong version.
+    //
+    // Trivially satisfied today, since nothing writes a timestamp yet -- it is
+    // here so the insert path cannot introduce an inversion unnoticed.
+    if (n.current().ts < n.previous().ts) {
+      err(idStr(id) + ": current version's ts " + std::to_string(n.current().ts) +
+          " is older than the previous version's " +
+          std::to_string(n.previous().ts));
+    }
+
+    // old_ver is reserved and must be zero until the out-of-line version chain
+    // is built (A10). A non-zero value here would mean something wrote a chain
+    // that nothing knows how to read.
+    if (s.old_ver != 0) {
+      err(idStr(id) + ": old_ver is set to " + std::to_string(s.old_ver) +
+          " but the out-of-line version chain is not implemented");
+    }
   }
 
   /// Walks one level's next chain. Returns via rep_/down_/seen_orphan_.

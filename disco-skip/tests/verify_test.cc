@@ -209,6 +209,41 @@ static void checkVerifierCatchesBreakage() {
     rejects(ds::verifyStructure(a, layers), "one child with two parents");
   }
 
+  // Timestamps must not go backwards across the slot ring, or a snapshot read
+  // walking back for the version with ts <= T stops at the wrong one.
+  {
+    FakeArena a = buildInitial(layers);
+    ds::NodeRecord &n = a.at(ds::headAddr(1));
+    n.current().ts = 100;
+    n.slot[n.freeSlot()].ts = 500;  // previous version is somehow newer
+    a.restamp(ds::headAddr(1).id);
+    rejects(ds::verifyStructure(a, layers), "a timestamp inversion across the ring");
+  }
+
+  // A plain forward timestamp is fine and must not be reported.
+  {
+    FakeArena a = buildInitial(layers);
+    ds::NodeRecord &n = a.at(ds::headAddr(1));
+    n.slot[n.freeSlot()].ts = 100;
+    n.current().ts = 500;
+    a.restamp(ds::headAddr(1).id);
+    ds::VerifyReport const r = ds::verifyStructure(a, layers);
+    if (!r.ok()) {
+      std::printf("FAIL: verifier rejected a valid timestamp ordering:\n");
+      for (auto const &e : r.errors) std::printf("    %s\n", e.c_str());
+      ++g_failures;
+    }
+  }
+
+  // old_ver is reserved: a non-zero value means something wrote a version chain
+  // that nothing can read.
+  {
+    FakeArena a = buildInitial(layers);
+    a.at(ds::headAddr(1)).current().old_ver = 7;
+    a.restamp(ds::headAddr(1).id);
+    rejects(ds::verifyStructure(a, layers), "old_ver set while the chain is unimplemented");
+  }
+
   // A torn node must be reported, not silently walked past.
   {
     FakeArena a = buildInitial(layers);

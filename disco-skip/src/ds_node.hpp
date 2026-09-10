@@ -156,9 +156,25 @@ static_assert(std::is_trivially_copyable_v<Handle>);
 /// current; the other is the immediately previous version, which is what C2's
 /// `old_ver*` chase reads. Two rather than one because F1 and F2 both need to
 /// publish a *new* vector without destroying the one concurrent readers are
-/// still reading. Two rather than many because one step back is what a reader
-/// that lost a race actually needs -- a deeper chase can just re-read, and
-/// every extra slot is bytes on every node read.
+/// still reading.
+///
+/// TWO SLOTS BOUND THE VERSION HISTORY AT ONE STEP, and that is a real
+/// constraint rather than a tuning choice. It is sufficient for C2: a Get that
+/// raced a single write looks one version back and is done. It is NOT obviously
+/// sufficient for A10's range queries, which fix a snapshot T and need, per
+/// node, the version whose ts <= T. A node written twice since T has no such
+/// version in either slot, and the range query cannot be served -- so under
+/// sustained writes a long range would fail repeatedly. The doc's model avoids
+/// this by allocating vectors separately and keeping arbitrarily many linked by
+/// `old_ver*` until epoch GC reclaims them (invariants.md §5 E3).
+///
+/// `VecSlot::old_ver` is the escape hatch, reserved now and unused: an older
+/// version written out of line into the writing client's own arena stripe, with
+/// the inline ring kept as the fast path. That keeps point operations at one
+/// RDMA per node while letting a range query pay extra hops only when it
+/// actually needs history. It costs nothing to reserve the field and would cost
+/// a re-layout of every deployed structure to add later, which is why it is
+/// here before A10 is decided.
 ///
 /// `next_id` and `next_k_min` live *here*, inside the versioned region, rather
 /// than in the node header. This deviates from invariants.md's F2, which writes
@@ -184,6 +200,31 @@ struct VecSlot {
   /// standalone.
   uint32_t is_orphan;
 
+  /// The timestamp this version was committed at -- F1's and F2's WRITE(ts).
+  ///
+  /// This is what makes a linearizable range query possible: a range fixes a
+  /// snapshot T and, per node, needs the version whose ts <= T, walking back
+  /// through older versions until it finds one (interface doc §0, A10).
+  ///
+  /// It lives inside the bookended region, and is written *before* the CAS
+  /// rather than after it as F1 and F2 have it. Both follow from the same
+  /// argument as next_id below: the CAS is the linearization point, so a
+  /// timestamp taken before it and published by it is exactly what commit-wait
+  /// wants (take T, wait epsilon, then make visible). Writing ts after the CAS
+  /// instead leaves a window where a committed version carries a stale
+  /// timestamp, which is precisely the thing a snapshot read must not see.
+  ///
+  /// Zero on a node that has never been written by a timestamped operation.
+  uint64_t ts;
+
+  /// The previous version, when it no longer fits in this node's slot ring.
+  ///
+  /// NOT YET USED -- reserved, and zero everywhere today. See the note on the
+  /// slot ring in NodeRecord for why it has to exist in the layout now even
+  /// though A10 is deferred: adding a field later would change the record size
+  /// and invalidate every already-written structure.
+  uint64_t old_ver;
+
   /// The next node at this level, and where its range starts. 0 == end of
   /// chain, in which case next_k_min is kReservedKey (an upper bound above
   /// every real key).
@@ -197,7 +238,10 @@ struct VecSlot {
   uint32_t trail_content_ver;
   uint32_t trail_struct_ver;
 
-  uint64_t _pad[3];
+  /// Pads the slot to a 64B multiple so each one starts 64B-aligned (F4).
+  /// Sized to the fields above -- the static_asserts below fail if it drifts,
+  /// which is how adding ts and old_ver got caught.
+  uint64_t _pad[1];
 };
 
 /// A remote node: stable identity plus its CoW versions.
@@ -393,6 +437,8 @@ inline void initNode(NodeRecord &n, Key k_min, uint32_t level,
     s.is_orphan = is_orphan ? 1u : 0u;
     s.next_id = 0;
     s.next_k_min = kReservedKey;
+    s.ts = 0;        // never written by a timestamped operation
+    s.old_ver = 0;   // no out-of-line history
     stampSlot(s, n.handle);
   }
 }
