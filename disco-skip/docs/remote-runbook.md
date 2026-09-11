@@ -97,6 +97,40 @@ ssh w5 'cat /users/adb321/disco-skip-artifacts/logs/selftest/vN/client1.txt'
 
 Read the teed log, not the tmux pane. Panes can vanish; the log persists.
 
+## Running at three replicas
+
+The replication factor is the **server count**, not a build flag —
+`DS_N_REPLICAS` drives no logic (see `remote-design.md`). So both arms of the
+comparison are the same binary:
+
+```sh
+./scripts/run.sh disco-skip-exe selftest/n1 oops-workloada-uniform 1 1 --selftest 1
+./scripts/run.sh disco-skip-exe selftest/n3 oops-workloada-uniform 3 1 --selftest 1
+```
+
+The `Quorum` block reports what CAS-ABD actually did. On a healthy cluster with
+one client, expect **0 stale votes, 0 tag ties, 0 re-polls and 0 writebacks** —
+nothing lags and nothing contends, so none of the interesting paths execute.
+That is the point of `tests/quorum_test.cc`: a passing 3-server run proves the
+three connections work, and proves nothing about the disagreement handling.
+
+Expected 3-server write phase, against the 1-server numbers:
+
+| | 1 server | 3 servers |
+|---|---|---|
+| round trips | 16 | 16 |
+| operations carried | 57 | 133 |
+| bytes written | 5,312 | 15,936 |
+| CAS total | 38 | 114 |
+
+One failure mode specific to this path, since it cost a run: a chained batch
+dying with `RDMA chained batch failed: status 4`. Status 4 is
+`IBV_WC_LOC_PROT_ERR` — a *local* protection error, meaning the source buffer is
+outside the registered MR. It appeared only at three servers, from indexing the
+staging region per replica when the layout allocates it once. A fake arena has
+no memory region to be outside of, so this class is cluster-only; if it recurs,
+look at what `stageBatchPayloads` was handed rather than at the remote side.
+
 ## Two recurring cluster faults
 
 **`Failed to set to the store ... (SERVER HAS FAILED AND IS DISABLED UNTIL TIMED RETRY)`**

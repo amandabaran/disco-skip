@@ -211,6 +211,19 @@ only tolerates an unreferenced node in a layer if it is one (interface doc §3).
 right; they answer different questions. Easy to trip over when comparing the selftest's
 orphan count against the cache's.
 
+### The offset hint is currently dead on this path
+
+Worth stating plainly rather than leaving a 0% hit rate to be discovered. The
+hint existed so a header read and its vector read could go out in one doorbell,
+and it was consumed by `RdmaNodeReader::read()`. The selftest now runs over
+`QuorumOps`, which issues `readNode` and then `readVec` and never speculates, so
+the hint is neither used nor scored — `offset hint: 0.000 (0 hit / 0 miss)`.
+
+The capability is now *more* reachable than before, not less: a quorum read
+could chain the speculative vector read into the same batch as the three header
+reads, which is exactly what `ds_batch.hpp` makes expressible. It is simply not
+wired. Until it is, the hint is a measurement of nothing.
+
 ### The offset hint
 
 Header and vector reads are ordinarily serialised, because the offset is not known until
@@ -265,7 +278,7 @@ Recorded so they are not re-proposed.
 | Chained work-request batches | `src/ds_batch.hpp` | done, tested |
 | CAS-ABD quorum (L1-L5) | `src/ds_quorum.hpp` | done, tested against a fake replica set; not yet run on 3 servers |
 | Future-based (pipelined) path | — | not started; blocking helpers are sequential, so the offset hint's doorbell batching is not yet realised |
-| 3-way replication | `src/ds_quorum.hpp` | quorum read, 2-of-3 commit and writeback built and tested; a 3-server cluster run is the remaining step |
+| 3-way replication | `src/ds_quorum.hpp` | done; passes on 3 servers with `WRITE PASS`, readback 9/9 and I1-I4 holding |
 | Deletes, reclamation, range queries | — | deferred (A7, A9, A10) |
 
 ### How the write path is split across the two headers
@@ -308,15 +321,27 @@ one `postSend`, which is one round trip for the whole chain -- the idiom
 `chimera/src/put_future.hpp` does it: every replica's chain is posted *before*
 any of them is drained, so the three overlap.
 
-Measured over the `--selftest` script, nine puts:
+Measured on the cluster over the `--selftest` script, nine puts, one client:
 
-| | round trips | operations carried |
-|---|---|---|
-| `DS_N_REPLICAS=1` | 16 | 57 |
-| `DS_N_REPLICAS=3` | **16** | 133 |
+| | 1 server | 3 servers | ratio |
+|---|---|---|---|
+| **round trips** | 16 | **16** | **1.0x** |
+| operations carried | 57 | 133 | 2.3x |
+| bytes written | 5,312 | 15,936 | 3.0x |
+| CAS total | 38 | 114 | 3.0x |
+| replica reads | 335 | 657 | 2.0x |
 
-The round trips do not move. That is the property to preserve, and
-`quorum_test.cc` asserts it directly rather than leaving it to be re-derived.
+The round trips do not move; the bytes triple. That is the property to preserve,
+and `quorum_test.cc` asserts it directly rather than leaving it to be
+re-derived. The figures match what the fake replica set predicts exactly, which
+is the cross-check worth having: the local tests are not a rough model of the
+cluster here, they are the same arithmetic.
+
+**The 2.0x on reads rather than 3.0x is L4 working.** A header read fans out to
+all three replicas, but the vector is read only from a replica that voted with
+the winning handle: 161 x 3 + 174 x 1 = 657. So replication triples the header
+traffic and leaves the 320-byte vector reads alone, which is the opposite of
+where the cost would have fallen without L4.
 
 Two things the chain buys beyond speed:
 
@@ -353,6 +378,21 @@ the uncommitted one would return contents no majority ever held. Reading every
 replica makes it decidable. **This is a deliberate strengthening of L2 and
 `invariants.md` should say so** -- flagged rather than adopted silently, since
 that document governs both halves.
+
+### What DS_N_REPLICAS actually does: nothing
+
+`invariants.md` §9 describes it as the toggle selecting a "single-replica code
+path". In this half it selects nothing — `kNumReplicas` is a constant with a
+static_assert and drives no logic. **The replication factor is the number of
+memory servers the run connects to**, and `QuorumOps` derives its majority from
+that at runtime, so at one server the majority is one and every quorum rule
+degenerates to the direct operation.
+
+That is deliberate, and better than two code paths: "zero overhead at N=1" is
+true by construction rather than by keeping two implementations in step, and it
+is what makes the comparison above a single binary run twice rather than two
+builds. The toggle is left as a declared expectation rather than wired into an
+assert, because an assert would forbid exactly that comparison.
 
 ### Height-driven splits
 

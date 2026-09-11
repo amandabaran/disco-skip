@@ -126,19 +126,58 @@ void bootstrap_structure(ds::DsState& state) {
 int run_structure_selftest(ds::DsState& state) {
     uint32_t const layers = static_cast<uint32_t>(state.layout.cache_layers);
 
-    ds::RdmaNodeReader<decltype(state.server_conns)> reader(
-        state.server_conns, state.layout, state.layout.getNodeBufs(0),
-        state.layout.getVecBufs(0), &state.vec_hint);
-
-    // The write phase needs the staging buffers and this client's allocators;
-    // future 0's slots are free, since no future has started.
-    ds::RdmaOps<decltype(state.server_conns)> ops(
+    // ONE path, whatever the replica count.
+    //
+    // The replication factor is the number of memory servers this run connects
+    // to, decided at runtime: QuorumOps derives its majority from
+    // set.replicas(), so at one server it is a majority of one and every
+    // quorum rule degenerates to the direct operation. That is why there is no
+    // separate single-replica implementation to pick between here, and why
+    // "zero overhead at N=1" is true by construction rather than by keeping two
+    // code paths in step. quorum_test.cc asserts it at both counts.
+    //
+    // NOTE on DS_N_REPLICAS: invariants.md §9 describes it as the toggle that
+    // selects a "single-replica code path". In the skip-vector path it selects
+    // nothing -- kNumReplicas is a constant with a static_assert and drives no
+    // logic. The factor that matters is the server count. Left as a declared
+    // expectation rather than wired into an assert, because comparing a 1-server
+    // and a 3-server run is exactly the microbench §9 asks for and an assert
+    // would forbid it.
+    //
+    // Passed as BOTH the reader and the ops: at three servers the verifier
+    // should check the *committed* structure, which is what a quorum read
+    // returns, rather than whatever one replica happens to hold.
+    ds::RdmaReplicaSet<decltype(state.server_conns)> replicas(
         state.server_conns, state.layout, state.layout.getNodeBufs(0),
         state.layout.getVecBufs(0), state.layout.getCasBufs(0),
-        &state.vec_hint, /*replica=*/0, state.layout.getStageNode(0),
-        state.layout.getStageVec(0), &state.node_alloc, &state.vec_alloc);
+        state.layout.getStageNode(0), state.layout.getStageVec(0),
+        &state.node_alloc, &state.vec_alloc, &state.vec_hint);
+    ds::QuorumStats qstats;
+    ds::QuorumOps<decltype(replicas)> ops(replicas, qstats);
 
-    return ds::runSelftest(reader, ops, layers, &state.vec_hint, std::cout);
+    std::cout << "replication:  " << replicas.replicas()
+              << " server(s), majority " << ops.majority() << " (DS_N_REPLICAS="
+              << ds::kNumReplicas << " declared)" << std::endl;
+
+    int const rc = ds::runSelftest(ops, ops, layers, &state.vec_hint, std::cout);
+
+    // Quorum accounting. At one server these are all trivial; at three they are
+    // the evidence that CAS-ABD ran at all rather than the code happening to
+    // work against replica 0.
+    std::cout << "\n################ Quorum:" << std::endl;
+    std::cout << "reads:        " << qstats.node_reads << " header quorum reads -> "
+              << qstats.replica_reads << " replica reads" << std::endl;
+    std::cout << "              " << qstats.stale_votes << " stale votes, "
+              << qstats.tag_ties << " tag ties, " << qstats.read_retries
+              << " re-polls" << std::endl;
+    std::cout << "commits:      " << qstats.commits << " committed, "
+              << qstats.commits_lost << " lost (" << qstats.partial_commits
+              << " partial)" << std::endl;
+    std::cout << "writebacks:   " << qstats.writebacks << " lagged replica(s) repaired"
+              << std::endl;
+    std::cout << "round trips:  " << qstats.batches << " chained batches"
+              << std::endl;
+    return rc;
 }
 
 

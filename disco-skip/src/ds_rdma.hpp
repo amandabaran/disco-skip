@@ -149,9 +149,19 @@ void writeVecAllReplicas(Conns &conns, Layout const &layout, VecRecord *staging,
 ///     they cannot share one. Those slots are only meaningful once the chain's
 ///     completion has landed.
 ///
-/// @param stage_vecs  kMaxBatchVecWrites slots; each vector write gets its own,
-///                    because all of them are in flight at once
-/// @param cas_bufs    kMaxBatchOps slots, indexed by position in the batch
+/// Payloads must already be staged by stageBatchPayloads(); this only refers to
+/// them. That split matters: the same bytes go to every replica, so they are
+/// copied into the registered MR ONCE and every replica's work requests read
+/// from the same source buffer -- which is what writeVecAllReplicas has always
+/// done. Copying per replica would also mean writing over a buffer whose bytes
+/// another replica's HCA might still be reading.
+///
+/// @param stage_vecs  kMaxBatchVecWrites slots. Distinct *within* a chain,
+///                    because every write in it is in flight at once; shared
+///                    *across* replicas, because the bytes are identical.
+/// @param cas_bufs    kMaxBatchOps slots for THIS replica -- a CAS reports its
+///                    pre-CAS value into its own slot, so these cannot be
+///                    shared across replicas the way the staging can
 /// @return the number of signalled requests to drain, or 0 if nothing was posted
 template <class Conn>
 size_t postBatchChain(Conn &rc, Layout const &layout, Batch const &b,
@@ -170,7 +180,6 @@ size_t postBatchChain(Conn &rc, Layout const &layout, Batch const &b,
     switch (o.kind) {
       case BatchKind::WriteVec: {
         VecRecord *slot = &stage_vecs[vec_slot++];
-        *slot = *o.vec;
         rc.prepareSingle(wr[i], sg[i],
                          dory::conn::ReliableConnection::RdmaWrite,
                          kBlockingWrId, slot, kVecRecordBytes,
@@ -179,7 +188,6 @@ size_t postBatchChain(Conn &rc, Layout const &layout, Batch const &b,
       }
       case BatchKind::WriteNode: {
         NodeRecord *slot = &stage_nodes[node_slot++];
-        *slot = *o.node;
         rc.prepareSingle(wr[i], sg[i],
                          dory::conn::ReliableConnection::RdmaWrite,
                          kBlockingWrId, slot, kNodeRecordBytes,
@@ -235,6 +243,26 @@ size_t postBatchChain(Conn &rc, Layout const &layout, Batch const &b,
     }
   }
   return b.size();
+}
+
+/// Copy a batch's write payloads into the registered staging slots.
+///
+/// Called once per batch, before any replica's chain is posted. The HCA reads
+/// the source buffer directly, so the payload has to be MR-resident -- a
+/// Writer's stack-local staged record is not. Getting this wrong shows up as
+/// IBV_WC_LOC_PROT_ERR (status 4) and only on the cluster, since a fake arena
+/// has no memory region to be outside of.
+inline void stageBatchPayloads(Batch const &b, NodeRecord *stage_nodes,
+                               VecRecord *stage_vecs) {
+  size_t vec_slot = 0, node_slot = 0;
+  for (size_t i = 0; i < b.size(); ++i) {
+    BatchOp const &o = b[i];
+    if (o.kind == BatchKind::WriteVec) {
+      stage_vecs[vec_slot++] = *o.vec;
+    } else if (o.kind == BatchKind::WriteNode) {
+      stage_nodes[node_slot++] = *o.node;
+    }
+  }
 }
 
 /// Did the publishing CAS in /b/ take, given the swapbacks it wrote?
@@ -525,6 +553,7 @@ class RdmaOps : public RdmaNodeReader<Conns> {
     if (!b.wellFormed()) return out;
     auto &rc = *conns_[replica_];
     uint64_t *cas = cas_buf_;
+    stageBatchPayloads(b, stage_node_, stage_vec_);
     size_t const to_drain =
         postBatchChain(rc, layout_, b, stage_node_, stage_vec_, cas, doorbell_);
     if (to_drain == 0) return out;
@@ -659,12 +688,18 @@ class RdmaReplicaSet {
     size_t const n = conns_.size();
     size_t to_drain[kMaxReplicaFanout] = {};
 
+    // Stage the payloads once. Every replica's work requests read from these
+    // same buffers, because the bytes are identical on all of them -- which is
+    // also why the staging region is sized for one chain rather than for one
+    // chain per replica.
+    stageBatchPayloads(b, stage_node_, stage_vec_);
+
     // Phase 1: post everywhere. Nothing is awaited yet.
     for (size_t r = 0; r < n; ++r) {
       submitted[r] = false;
       committed[r] = false;
-      to_drain[r] = postBatchChain(*conns_[r], layout_, b, stageNodesFor(r),
-                                   stageVecsFor(r), &cas_bufs_[r * kMaxBatchOps],
+      to_drain[r] = postBatchChain(*conns_[r], layout_, b, stage_node_,
+                                   stage_vec_, &cas_bufs_[r * kMaxBatchOps],
                                    doorbell_);
       if (to_drain[r] > 0) {
         writes_ += b.vecWrites() + b.nodeWrites();
@@ -710,16 +745,6 @@ class RdmaReplicaSet {
   void setDoorbell(bool on) { doorbell_ = on; }
 
  private:
-  /// Staging is per replica: every write in a chain is in flight at once, and
-  /// three replicas' chains are in flight simultaneously, so a shared slot
-  /// would be overwritten while an HCA was still reading it.
-  NodeRecord *stageNodesFor(size_t r) {
-    return stage_node_ + r * kMaxBatchNodeWrites;
-  }
-  VecRecord *stageVecsFor(size_t r) {
-    return stage_vec_ + r * kMaxBatchVecWrites;
-  }
-
   /// Bound on the per-replica scratch arrays. invariants.md §9 restricts the
   /// toggle to 1 or 3.
   static constexpr size_t kMaxReplicaFanout = 8;
