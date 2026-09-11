@@ -21,6 +21,7 @@
 // combination the cluster actually runs.
 #include "ds_traverse.hpp"
 #include "ds_get.hpp"
+#include "ds_get_future.hpp"
 #include "ds_insert.hpp"
 #include "ds_put.hpp"
 #include "ds_async.hpp"

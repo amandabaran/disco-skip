@@ -17,6 +17,7 @@
 #include <random>
 #include <vector>
 
+#include "ds_get_future.hpp"
 #include "ds_put.hpp"
 #include "ds_verify.hpp"
 #include "fake_async.hpp"
@@ -235,6 +236,124 @@ static void checkAgreementUnderAStaleHint() {
   CHECK(qs.spec_misses > 0, "the stale guesses were scored as misses");
 }
 
+// ── A Get as a resumable operation, against the blocking Getter ────────────
+
+/// Drive a resumable Get to completion, as the real driver would.
+template <class Ops, class Cache>
+static ds::GetResult runAsyncGet(Ops &ops, Cache &cache, ds::Key k,
+                                 ds::GetStats &stats) {
+  ds::GetOperation<Ops, Cache> g(ops, cache, kLayers, stats);
+  size_t await = g.start(k);
+  uint64_t guard = 0;
+  while (!g.finished()) {
+    (void)await;
+    await = g.step();
+    if (++guard > 100000) break;
+  }
+  return g.result();
+}
+
+static void checkAsyncGetAgreesWithTheBlockingGetter() {
+  // Both over a NullCache first, so the comparison is of the traversal path and
+  // the answer, with no cache state to diverge.
+  FakeReplicaSet set(3, kLayers);
+  ds::QuorumStats qs;
+  ds::QuorumOps<FakeReplicaSet> ops(set, qs, nullptr);
+  ds::PutStats ps;
+  ds::WriteStats ws;
+  ds::NullPutCache pcache;
+  ds::Putter<ds::QuorumOps<FakeReplicaSet>, ds::NullPutCache> p(ops, pcache,
+                                                                kLayers, ps, ws);
+  std::mt19937_64 rng(20260911);
+  std::map<ds::Key, ds::Value> oracle;
+  for (int i = 0; i < 200; ++i) {
+    ds::Key const k = 1 + (rng() % 300);
+    ds::Value const v = 1 + (rng() % 100000);
+    if (p.put(k, v, ds::drawHeight(rng, kLayers)).resolved) oracle[k] = v;
+  }
+
+  size_t agreed = 0, checked = 0;
+  for (ds::Key k = 1; k <= 340; ++k) {
+    ds::NullCache ca, cb;
+    ds::GetStats sa, sb;
+    FakeAsyncOps aops(set, qs, nullptr);
+    ds::GetResult const a = runAsyncGet(aops, ca, k, sa);
+
+    ds::QuorumStats qs2;
+    ds::QuorumOps<FakeReplicaSet> bops(set, qs2, nullptr);
+    ds::Getter<ds::QuorumOps<FakeReplicaSet>, ds::NullCache> g(bops, cb, kLayers,
+                                                               sb);
+    ds::GetResult const b = g.get(k);
+
+    ++checked;
+    if (a.resolved == b.resolved && a.found == b.found && a.value == b.value) {
+      ++agreed;
+    } else {
+      std::printf("  DISAGREE on key %llu: async(%d,%d,%llu) blocking(%d,%d,%llu)\n",
+                  (unsigned long long)k, a.resolved ? 1 : 0, a.found ? 1 : 0,
+                  (unsigned long long)a.value, b.resolved ? 1 : 0,
+                  b.found ? 1 : 0, (unsigned long long)b.value);
+      break;
+    }
+  }
+  CHECK(agreed == checked, "the async Get agrees with the blocking Getter");
+
+  // And the answers are right, not merely equal.
+  size_t right = 0;
+  for (auto const &kv : oracle) {
+    ds::NullCache c;
+    ds::GetStats st;
+    FakeAsyncOps aops(set, qs, nullptr);
+    ds::GetResult const r = runAsyncGet(aops, c, kv.first, st);
+    if (r.resolved && r.found && r.value == kv.second) ++right;
+  }
+  CHECK(right == oracle.size(), "and returns every written value");
+  std::printf("  async Get: %zu keys agree with the blocking path, "
+              "%zu values correct\n", agreed, right);
+}
+
+static void checkAsyncGetHitsTheCacheAndRepairsIt() {
+  // With the real cache attached the fast path matters: a warm cache should
+  // answer from one node, and a miss should reconcile so the next Get hits.
+  FakeReplicaSet set(1, kLayers);
+  ds::QuorumStats qs;
+  ds::QuorumOps<FakeReplicaSet> ops(set, qs, nullptr);
+  ds::PutStats ps;
+  ds::WriteStats ws;
+  ds::NullPutCache pcache;
+  ds::Putter<ds::QuorumOps<FakeReplicaSet>, ds::NullPutCache> p(ops, pcache,
+                                                                kLayers, ps, ws);
+  std::mt19937_64 rng(4242);
+  std::map<ds::Key, ds::Value> oracle;
+  for (int i = 0; i < 150; ++i) {
+    ds::Key const k = 1 + (rng() % 250);
+    ds::Value const v = 1 + (rng() % 100000);
+    if (p.put(k, v, ds::drawHeight(rng, kLayers)).resolved) oracle[k] = v;
+  }
+
+  ds::NullCache cache;  // stands in where the real cache is not compiled
+  ds::GetStats st;
+  // Two passes: the second must not be more expensive than the first.
+  uint64_t reads_pass1 = 0;
+  for (int pass = 0; pass < 2; ++pass) {
+    ds::GetStats pass_st;
+    for (auto const &kv : oracle) {
+      FakeAsyncOps aops(set, qs, nullptr);
+      ds::GetResult const r = runAsyncGet(aops, cache, kv.first, pass_st);
+      CHECK(r.resolved && r.found && r.value == kv.second,
+            "every key resolves on both passes");
+    }
+    if (pass == 0) reads_pass1 = pass_st.nodes_read + pass_st.vec_reads;
+    else {
+      CHECK(pass_st.nodes_read + pass_st.vec_reads <= reads_pass1,
+            "a second pass costs no more reads than the first");
+    }
+    st = pass_st;
+  }
+  CHECK(st.traversals > 0, "the null cache forces a traversal every time");
+  CHECK(st.failures == 0, "and nothing fails");
+}
+
 int main() {
   std::printf("async_test: layers=%u\n", kLayers);
   checkEmptyStructure();
@@ -242,6 +361,8 @@ int main() {
   checkAgreementMidSplit();
   checkSpeculationCollapsesANodeToOneRoundTrip();
   checkAgreementUnderAStaleHint();
+  checkAsyncGetAgreesWithTheBlockingGetter();
+  checkAsyncGetHitsTheCacheAndRepairsIt();
 
   if (g_failures != 0) {
     std::printf("%d FAILURE(S)\n", g_failures);

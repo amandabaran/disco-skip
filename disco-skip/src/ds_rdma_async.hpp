@@ -48,13 +48,23 @@ namespace ds {
 template <class Conns, class Counters>
 class RdmaAsyncOps {
  public:
+  /// @param to_poll  the driver's per-server outstanding tally
+  /// @param ongoing  THIS future's per-server tally
+  ///
+  /// Both are bumped on every post, and the driver decrements both on every
+  /// completion. Two counters rather than one because they answer different
+  /// questions: the driver polls a server while `to_poll` is positive, and a
+  /// future may only step once its own `ongoing` is zero. Bumping only one
+  /// would either stop a server being polled or let a future step on partial
+  /// results.
   RdmaAsyncOps(Conns &conns, Layout const &layout, Counters &to_poll,
-               uint64_t future_id, QuorumStats &stats,
+               Counters &ongoing, uint64_t future_id, QuorumStats &stats,
                VecOffsetHint *hint = nullptr, NodeAllocator *nodes = nullptr,
                VecAllocator *vecs = nullptr)
       : conns_(conns),
         layout_(layout),
         to_poll_(to_poll),
+        ongoing_(ongoing),
         future_id_(future_id),
         stats_(stats),
         hint_(hint),
@@ -105,14 +115,14 @@ class RdmaAsyncOps {
         }
         // One chain, one signalled request, one completion.
         completions += 1;
-        to_poll_[r] += 1;
+        bump(r, 1);
       } else {
         if (!rc.postSendSingle(dory::conn::ReliableConnection::RdmaRead,
                                future_id_, &hdrs[r], kNodeRecordBytes, remote)) {
           throw std::runtime_error("failed to post a quorum header read");
         }
         completions += 1;
-        to_poll_[r] += 1;
+        bump(r, 1);
       }
     }
     ++stats_.node_reads;
@@ -184,7 +194,7 @@ class RdmaAsyncOps {
                            layout_.vecAddrOf(rc.remoteBuf(), off))) {
       throw std::runtime_error("failed to post a vector read");
     }
-    to_poll_[winner_] += 1;
+    bump(winner_, 1);
     ++stats_.vec_reads;
     ++stats_.replica_reads;
     return 1;
@@ -213,7 +223,7 @@ class RdmaAsyncOps {
           layout_.getStageVec(future_id_),
           layout_.casBufsFor(future_id_, r), /*doorbell=*/true);
       completions += c;
-      to_poll_[r] += static_cast<int64_t>(c);
+      bump(r, static_cast<int64_t>(c));
     }
     ++stats_.batches;
     return completions;
@@ -252,9 +262,15 @@ class RdmaAsyncOps {
   }
 
  private:
+  void bump(size_t r, int64_t n) {
+    to_poll_[r] += n;
+    ongoing_[r] += n;
+  }
+
   Conns &conns_;
   Layout const &layout_;
   Counters &to_poll_;
+  Counters &ongoing_;
   uint64_t future_id_;
   QuorumStats &stats_;
   VecOffsetHint *hint_;

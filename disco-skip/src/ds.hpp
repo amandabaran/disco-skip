@@ -24,6 +24,7 @@
 #include "ds_bootstrap.hpp"
 #include "ds_traverse.hpp"
 #include "ds_get.hpp"
+#include "ds_get_future.hpp"
 #include "ds_insert.hpp"
 #include "ds_put.hpp"
 #include "ds_quorum.hpp"
