@@ -24,6 +24,16 @@ further than it goes:
   in `main.cpp`, which needs lyra, fmt and the dory control plane too, and is
   well past what is worth stubbing.
 
+**On that last point, the approach has since changed.** Stubbing `main.cpp` is
+still not worth it, but *emptying* it is: the `--selftest` body was moved into
+`src/ds_selftest.hpp`, templated over the reader and the Ops surface, and
+`rdma_compile.cc` now instantiates it against the real RDMA types through this
+stub. So that class of error is caught here after all — not by stubbing more,
+but by leaving less in the one file that cannot be compiled.
+
+The rule that follows: logic added to `main.cpp` is unverified until a cluster
+build, so it belongs in a header with an instantiation in `tests/`.
+
 What it *does* buy is type-checking of the RDMA-facing headers and everything
 built on them: wrong argument order, a signature that drifted from
 `conn/src/rc.hpp`, a template that does not instantiate, and narrowing of
