@@ -142,8 +142,21 @@ void instantiate_future(ds::DsState &state, ds::QuorumStats &q, ds::GetStats &g,
                         ds::PutStats &p, ds::WriteStats &w);
 void instantiate_future(ds::DsState &state, ds::QuorumStats &q, ds::GetStats &g,
                         ds::PutStats &p, ds::WriteStats &w) {
-  ds::NullCache cache;
-  ds::SvFuture<ds::NullCache> f(state, /*id=*/0, cache, q, g, p, w);
+  // ClientCache, not NullCache: with DS_CACHE_ENABLED=1 that is CacheAdapter,
+  // and the operation templates instantiated over it are different code from
+  // the ones over NullCache. main.cpp instantiates exactly this, so this is
+  // where it gets checked -- compiling only the NullCache arm left the real
+  // one unchecked until a cluster build, which is how a -Wstrict-overflow
+  // error in it reached the cluster.
+#if DS_CACHE_ENABLED
+  // Built from the state's own SkipVec, exactly as DsClient does it.
+  ds::ClientCache cache(state.cache_sv,
+                        static_cast<uint32_t>(state.layout.cache_layers),
+                        state.layout.consult_cache);
+#else
+  ds::ClientCache cache;
+#endif
+  ds::SvFuture<ds::ClientCache> f(state, /*id=*/0, cache, q, g, p, w);
   f.doGet(42);
   f.doPut(43, 4343, 2);
   f.addToOngoingRDMA(0, -1);

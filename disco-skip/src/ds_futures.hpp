@@ -39,6 +39,18 @@
 
 namespace ds {
 
+/// The cache type the client's futures are built over.
+///
+/// One type, not two: DS_CACHE_ENABLED decides whether a cache is compiled in,
+/// and CacheAdapter's `consult` flag decides at runtime whether it is asked.
+/// So the no-cache baseline is a command-line arm of the same binary rather
+/// than a second set of template instantiations.
+#if DS_CACHE_ENABLED
+using ClientCache = CacheAdapter;
+#else
+using ClientCache = NullCache;
+#endif
+
 namespace detail {
 
 /// How many times a future may be stepped without finishing before we call it

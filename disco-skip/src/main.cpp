@@ -6,6 +6,7 @@
 #include <memory>
 #include <vector>
 #include <chrono>
+#include <random>
 #include <thread>
 #include <cstring>
 #include <string>
@@ -25,9 +26,8 @@
 // Disco-skip headers
 #include "ds.hpp"
 #include "disco_skip_client.hpp"
-#include "op_future.hpp"
 #include "register.hpp"
-#include "range_future.hpp" // Integrated your RangeFuture class definition
+#include "range_future.hpp"
 
 using namespace dory;
 using namespace dory::conn;
@@ -224,7 +224,10 @@ void run_ml_prog_tracker_workload(
         if (global_thread_id == 0) {
             client.getFreeRangeFuture().doRange(0, num_clients - 1, false);
         } else {
-            client.getFreeFuture().doPut(global_thread_id, 1, false);
+            // Height 0: this warmup only needs the key present, and a
+            // structural insert would make the warmup's cost depend on the
+            // height draw.
+            client.getFreeFuture().doPut(global_thread_id, 1, /*height=*/0, false);
         }
         client.finishAllFutures();
     }
@@ -278,7 +281,8 @@ void run_ml_prog_tracker_workload(
 
         for (uint64_t op_idx = 0; op_idx < ops_to_run; ++op_idx) {
             bool measuring = (op_idx % 1000 == 0);
-            client.getFreeFuture().doPut(global_thread_id, progress_counter++, measuring);
+            client.getFreeFuture().doPut(global_thread_id, progress_counter++,
+                                         /*height=*/0, measuring);
             if (op_idx % 16 == 0) {
                 client.finishAllFutures();
             }
@@ -665,13 +669,21 @@ int main(int argc, char** argv) {
             std::cout << "Done." << std::endl;
 
             std::cout << "Inserting the initial key-pairs... " << std::flush;
+            // Same seed rule as the measured phase: reproducible per client,
+            // and different between clients so two do not make an identical
+            // structural decision for the same key.
+            std::mt19937_64 pop_rng(0xB0B ^ proc_id);
             for (size_t kvIndex = 0; kvIndex < inserts.size(); kvIndex++) {
-                client.finishAllFutures();
                 
                 // Extract numerical representation of key string for the register mapping
                 uint64_t target_reg = std::stoull(inserts[kvIndex].first.substr(4)) % layout.num_registers;
                 // std::cout << "Inserting register: " << target_reg << std::endl;
-                client.getFreeFuture().doPut(target_reg, 69, false);
+                // Population, so heights are drawn: this is what builds the
+                // index the measured phase then traverses. A populated
+                // structure with no index would measure a linked list.
+                uint32_t const ph = ds::drawHeight(
+                    pop_rng, static_cast<uint32_t>(layout.cache_layers));
+                client.getFreeFuture().doPut(target_reg, 69, ph, false);
             }
             client.finishAllFutures();
             std::cout << " Done." << std::endl;
@@ -752,22 +764,47 @@ int main(int argc, char** argv) {
             bool measuring = false;
             size_t skipped = 0;
 
+            // Heights are drawn here rather than inside the put, because the
+            // cache's geometry expects a geometric distribution with
+            // p = 1/kLevelRatio and the drawing has to be reproducible for a
+            // given seed. Seeded per client so two clients do not make an
+            // identical structural decision for the same key.
+            std::mt19937_64 height_rng(0x5EED ^ proc_id);
+
             for (size_t i = 0; i < total_iter_count; i++) {
                 auto& op = operations[(i + skipped) % operations.size()];
 
                 if (i == start_measurements) {
+                    // Drain before starting the clock: otherwise operations
+                    // issued during warmup complete inside the measured window
+                    // and are counted as its throughput.
+                    client.finishAllFutures();
                     measuring = true;
                     start_time = std::chrono::steady_clock::now();
                 } else if (i == stop_measurements) {
+                    // And drain before stopping it, so operations issued inside
+                    // the window are paid for inside it. Without this the tail
+                    // of the pipeline is free and the number is inflated by
+                    // roughly async_parallelism operations.
+                    client.finishAllFutures();
                     measuring = false;
                     end_time = std::chrono::steady_clock::now();
                 }
                 switch (op.type) {
                     case OpGet: {
+                        // target_reg is the workload's key. It indexed a flat
+                        // register array; it is now a skip-vector key, which is
+                        // the same integer used for a different thing -- so
+                        // these numbers are a fresh baseline and not comparable
+                        // with any register-path measurement.
                         client.getFreeFuture().doGet(op.target_reg, measuring);
                         break;
                     }
                     case OpScan: {
+                        // Still the register path: there is no skip-vector
+                        // range (A10). A scan here measures the old structure,
+                        // so a scan-heavy workload is not yet a disco-skip
+                        // measurement.
                         uint64_t len = op.scan_len;
                         if (len > layout.max_range) len = layout.max_range;
                         if (op.target_reg + len > layout.num_registers) len = layout.num_registers - op.target_reg;
@@ -777,13 +814,19 @@ int main(int argc, char** argv) {
                         break;
                     }
                     case OpPut: {
-                        client.getFreeFuture().doPut(op.target_reg, 69, measuring);
+                        uint32_t const h = ds::drawHeight(
+                            height_rng, static_cast<uint32_t>(layout.cache_layers));
+                        client.getFreeFuture().doPut(op.target_reg, 69, h, measuring);
                         break;
                     }
                     default:
                         break;
                 }
-                client.finishAllFutures();
+                // NO DRAIN HERE. The loop used to call finishAllFutures() every
+                // iteration, which made the client synchronous: one operation
+                // in flight at a time, so async_parallelism did nothing at all.
+                // getFreeFuture() is what bounds concurrency now -- it returns
+                // a slot only once that slot's operation has finished.
             }
 
             client.finishAllFutures();

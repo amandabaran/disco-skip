@@ -58,12 +58,36 @@ file(WRITE ${DS_GEN_DIR}/machine_defines.h
 ")
 
 # ─── 3. Relax GCC 13 strict warning checks ───────────────────────────────────
+#
+# These stay WARNINGS -- we still get told -- they just do not fail the build.
+# Each is here because the cache half triggers it and include/ is the other
+# author's code.
 if(CMAKE_COMPILER_IS_GNUCXX)
     add_compile_options(
         -Wno-error=switch-default
         -Wno-error=conversion
         -Wno-error=missing-declarations
         -Wno-error=undef
+        # -Wstrict-overflow=5 cannot be handled the way the others are.
+        #
+        # The cache is full of signed descending loops -- `int layer = layers-1;
+        # for (; layer >= 1; --layer)` and similar throughout
+        # include/skipvector_disco.h -- which is exactly the `X - C1 cmp C2`
+        # shape level 5 rejects. Marking the cache includes SYSTEM (below) does
+        # not help: this diagnostic is emitted during optimisation, AFTER
+        # inlining, and is attributed to whichever function absorbed the
+        # arithmetic, which is ours. Its reported location is useless -- it
+        # lands on a closing brace or on `int main()` -- so a scoped
+        # `#pragma GCC diagnostic ignored` cannot be placed, and noinline on the
+        # wrapper does not move it either. Both were tried.
+        #
+        # OUR OWN CODE IS STILL COVERED, because the local gate compiles the
+        # DS_CACHE_ENABLED=0 arm with this fatal (tests/Makefile). That arm is
+        # all of src/ with none of the cache, and it is what caught the two
+        # real instances of this in our code: findLte's binary search and the
+        # futures' `++counter > K` guards. So the check that matters is kept
+        # where it can work, and demoted only where the cache is inlined in.
+        -Wno-error=strict-overflow
     )
 endif()
 

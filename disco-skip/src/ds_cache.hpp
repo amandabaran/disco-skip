@@ -230,14 +230,37 @@ inline LevelStats levelStats(SkipVec const &sv, uint32_t level) {
 /// where it can be read next to the interface doc.
 class CacheAdapter {
  public:
-  /// @param layers the runtime level count, which mirrorInsert needs to clamp
+  /// @param layers  the runtime level count, which mirrorInsert needs to clamp
   ///        a height against -- the cache asserts internally if one exceeds it
-  CacheAdapter(SkipVec &sv, uint32_t layers) : sv_(sv), layers_(layers) {}
+  /// @param consult  the runtime arm of the cache toggle. False makes every
+  ///        lookup a miss and every update a no-op, which IS the no-cache
+  ///        baseline: DS_CACHE_ENABLED decides whether the cache is compiled
+  ///        in, this decides whether we ask it. Handling it here rather than by
+  ///        instantiating the operations over two cache types means one binary
+  ///        produces both halves of the headline "RDMAs per op, cache on vs
+  ///        off" measurement without a rebuild, and only one template
+  ///        instantiation exists to keep correct.
+  CacheAdapter(SkipVec &sv, uint32_t layers, bool consult = true)
+      : sv_(sv), layers_(layers), consult_(consult) {}
 
-  [[nodiscard]] RemoteAddr locateData(Key k) { return sv_.locate_data(k); }
+  // ── The three methods that call into the cache ───────────────────────────
+  //
+  // These are why src/CMakeLists.txt demotes -Wstrict-overflow to a warning.
+  // The cache is full of signed descending loops, which is the shape level 5
+  // rejects, and once they inline into these wrappers the diagnostic is
+  // attributed to our function with a useless location -- so it cannot be
+  // scoped away here. A `#pragma GCC diagnostic ignored` around these methods
+  // and `noinline` on them were both tried and neither moves it. The reasoning,
+  // and the note that our own code is still covered by the gate's no-cache arm,
+  // is in CMakeLists next to the flag.
+  [[nodiscard]] RemoteAddr locateData(Key k) {
+    if (!consult_) return RemoteAddr{};  // a miss, so the caller traverses
+    return sv_.locate_data(k);
+  }
 
   void reconcile(Key data_k_min, RemoteAddr data_addr, PathStep const *path,
                  uint32_t levels) {
+    if (!consult_) return;
     ds::reconcile(sv_, data_k_min, data_addr, path, levels);
   }
 
@@ -247,6 +270,7 @@ class CacheAdapter {
   /// does both halves, so the adapter has to cover both.
   void mirrorInsert(Key k, uint32_t height, RemoteAddr data_addr,
                     std::array<RemoteAddr, kMaxLayers> const &index_addrs) {
+    if (!consult_) return;
     ds::mirrorInsert(sv_, k, height, data_addr, index_addrs, layers_);
   }
 
@@ -255,6 +279,7 @@ class CacheAdapter {
  private:
   SkipVec &sv_;
   uint32_t layers_;
+  bool consult_;
 };
 
 }  // namespace ds

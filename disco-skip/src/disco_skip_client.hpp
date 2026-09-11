@@ -7,14 +7,35 @@
 #include <dory/extern/ibverbs.hpp>
 
 #include "disco_skip_state.hpp"
-#include "op_future.hpp"
+#include "ds_futures.hpp"
+#include "range_future.hpp"
 
 namespace ds {
 
+// The skip-vector client.
+//
+// `futures` are skip-vector operations -- SvFuture over GetOperation and
+// PutOperation. The register GetFuture/PutFuture this used to hold are retired:
+// they operated on a flat array of registers, which is not the data structure
+// any more.
+//
+// RangeFuture stays, and is still the register path. It is the ONLY scan
+// capability in the tree -- there is no skip-vector range, A10 being deferred --
+// so retiring it would make workload E unrunnable rather than merely
+// unrepresentative. It should go when A10 lands.
 class DsClient {
 private:
     DsState state;
-    std::vector<OpFuture> futures;
+    QuorumStats qstats;
+    GetStats gstats;
+    PutStats pstats;
+    WriteStats wstats;
+#if DS_CACHE_ENABLED
+    ClientCache cache;
+#else
+    ClientCache cache;
+#endif
+    std::vector<SvFuture<ClientCache>> futures;
     std::vector<bool> progress;
     std::vector<RangeFuture> range_futures;
     std::vector<bool> range_progress;
@@ -22,15 +43,24 @@ public:
     DsClient(Layout layout,
               dory::conn::RcConnectionExchanger<ProcId>& rcx,
               ProcId proc_id)
-    : state{layout, rcx, proc_id} {
+    : state{layout, rcx, proc_id}
+#if DS_CACHE_ENABLED
+    , cache{state.cache_sv,
+            static_cast<uint32_t>(state.layout.cache_layers),
+            state.layout.consult_cache}
+#else
+    , cache{}
+#endif
+    {
         progress.resize(state.layout.async_parallelism, false);
         futures.reserve(state.layout.async_parallelism);
-        
+
         range_progress.resize(state.layout.async_parallelism, false);
         range_futures.reserve(state.layout.async_parallelism);
 
         for (size_t i = 0; i < state.layout.async_parallelism; ++i) {
-            futures.emplace_back(state, i);
+            futures.emplace_back(state, i, cache, qstats, gstats, pstats,
+                                 wstats);
             range_futures.emplace_back(state, i);
         }
     }
@@ -85,7 +115,13 @@ public:
     }
 
     // Returns the first future that is done.  Spins on tickRdma() until one is.
-    OpFuture& getFreeFuture() {
+    //
+    // This is what bounds how many operations are in flight: it hands back a
+    // slot only when that slot's operation has completed, so with
+    // async_parallelism slots there are at most that many outstanding. The
+    // caller must NOT drain between operations -- see the note on
+    // finishAllFutures.
+    SvFuture<ClientCache>& getFreeFuture() {
         while (true) {
             for (uint64_t i = 0; i < state.layout.async_parallelism; ++i) {
                 auto& f = futures[i];
@@ -114,11 +150,24 @@ public:
     }
 
     // Returns a specific future by index (used for round-robin or hashing).
-    OpFuture& getFuture(uint64_t i) {
+    SvFuture<ClientCache>& getFuture(uint64_t i) {
         return futures.at(i % state.layout.async_parallelism);
     }
 
-    // Wait for all futures to drain — call this at end of measurement.
+    [[nodiscard]] QuorumStats const& quorumStats() const { return qstats; }
+    [[nodiscard]] GetStats const& getStats() const { return gstats; }
+    [[nodiscard]] PutStats const& putStats() const { return pstats; }
+    [[nodiscard]] WriteStats const& writeStats() const { return wstats; }
+
+    // Wait for all futures to drain.
+    //
+    // CALL THIS AT MEASUREMENT BOUNDARIES AND AT THE END, NOT BETWEEN
+    // OPERATIONS. Calling it per operation is what the benchmark loop used to
+    // do, and it makes the client synchronous: every operation is drained
+    // before the next is issued, so exactly one is ever in flight and
+    // async_parallelism has no effect whatsoever. Pipelining is the whole point
+    // of this machinery, and one misplaced drain removes it silently -- the
+    // throughput is simply lower, with nothing to indicate why.
     void finishAllFutures() {
         for (size_t idx = 0; idx < state.layout.async_parallelism; ++idx) {
             while (!futures[idx].isDone() || !range_futures[idx].isDone()) {

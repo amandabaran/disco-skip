@@ -177,12 +177,29 @@ strict: | obj
 	  -DDS_MAX_LAYERS=8 -DDS_IDX_EXP=3 strict_headers.cc -o obj/strict $(LDFLAGS)
 	@obj/strict > /dev/null; echo "==== headers clean under the strict warning set ===="
 
+# The cache half is written for a laxer warning set, so the real build marks its
+# include directories SYSTEM (src/CMakeLists.txt) to suppress diagnostics from
+# inside them while our own code stays strict. Mirrored here, or the cache's own
+# headers fail this target for reasons that are not ours.
+SYSINCLUDES := -I$(SRC_DIR) -isystem $(CACHE_DIR) -isystem $(CACHE_DIR)/include-cache
+
 rdma: | obj
 	@echo "[CXX] ds_rdma.hpp against the dory stub"
 	@$(CXX) $(STRICTFLAGS) $(INCLUDES) $(STUBFLAGS) \
 	  -DDS_CACHE_ENABLED=0 -DDS_N_REPLICAS=1 -DDS_MAX_LAYERS=8 -DDS_IDX_EXP=3 \
 	  -c rdma_compile.cc -o obj/rdma_compile.o
 	@echo "==== ds_rdma.hpp compiles clean against the dory surface ===="
+	@echo "[CXX] the same, with the cache compiled in"
+	@# -Wno-error=strict-overflow matches src/CMakeLists.txt, and only on THIS
+	@# arm. The cache's signed descending loops inline into our wrappers and
+	@# the diagnostic is then attributed to our function with a useless
+	@# location, so it cannot be scoped away -- see the comment by the flag in
+	@# CMakeLists. The arm above keeps it fatal, and that arm is all of src/
+	@# with none of the cache, so our own code is still covered.
+	@$(CXX) $(STRICTFLAGS) -Wno-error=strict-overflow $(SYSINCLUDES) $(STUBFLAGS) \
+	  -DDS_CACHE_ENABLED=1 -DDS_N_REPLICAS=3 -DDS_MAX_LAYERS=8 -DDS_IDX_EXP=3 \
+	  -c rdma_compile.cc -o obj/rdma_compile_cache.o
+	@echo "==== and clean with DS_CACHE_ENABLED=1, which is what the build uses ===="
 
 clean:
 	rm -rf obj
