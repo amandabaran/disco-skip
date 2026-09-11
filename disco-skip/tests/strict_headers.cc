@@ -15,6 +15,15 @@
 #include "ds_bootstrap.hpp"
 #include "ds_verify.hpp"
 
+// The templated paths. Including them here checks their declarations under the
+// strict set; their *bodies* are only checked once instantiated, which happens
+// under the same flags in rdma_compile.cc over the real RdmaOps -- the
+// combination the cluster actually runs.
+#include "ds_descend.hpp"
+#include "ds_get.hpp"
+#include "ds_insert.hpp"
+#include "ds_put.hpp"
+
 // Reference enough of each header that the compiler cannot skip instantiating
 // the parts we care about.
 int main() {

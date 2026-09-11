@@ -79,6 +79,69 @@ inline constexpr int kMaxSettleAttempts = 8;
 
 }  // namespace detail
 
+/// What settleNode() cost, so callers with different stat structs can each
+/// fold it into their own counters.
+struct HelpCounters {
+  uint32_t nodes_read = 0;
+  uint32_t vec_reads = 0;
+  uint32_t helped_ts = 0;
+  uint32_t helped_splits = 0;
+};
+
+/// Complete any operation outstanding on this node, then re-read it.
+///
+/// Returns with /node/ and /vec/ settled, or false if it could not get there.
+///
+/// Shared by the descent and by the write path rather than duplicated: this is
+/// the helping protocol of remote-design.md §2, and two copies of it would be
+/// two things to keep in step. Every CAS here ignores its result, because a
+/// failure means another thread already performed that step.
+template <class Ops>
+bool settleNode(Ops &ops, RemoteAddr addr, NodeRecord &node, VecRecord &vec,
+                HelpCounters &c) {
+  for (int attempt = 0; attempt < detail::kMaxSettleAttempts; ++attempt) {
+    bool const pending = vec.isPending();
+    bool const unstable = !node.isStable();
+    if (!pending && !unstable) return true;
+
+    // 1. Fix the timestamp first. A helper stamps with its own clock, which
+    //    orders the write at the moment somebody first needed it -- that is
+    //    the point of leaving it unfixed until visible, since it lets the
+    //    write be ordered after readers that did not see it.
+    if (pending) {
+      ops.casTs(node.handle.offset(), kNullTs, ops.now());
+      ++c.helped_ts;
+    }
+
+    // 2. Propagate the split descriptor into the header. Either order is
+    //    safe: a reader that checks the bookends never trusts these fields
+    //    while the window is open, and one holding the vector prefers its
+    //    copies anyway.
+    if (unstable && vec.hasSplitDescriptor()) {
+      if (node.next_k_min != vec.k_min_next) {
+        ops.casNextKMin(addr, node.next_k_min, vec.k_min_next);
+      }
+      if (node.next_id != vec.next_id) {
+        ops.casNextId(addr, node.next_id, vec.next_id);
+      }
+    }
+
+    // 3. Close the window last. Until this lands, another writer knows the
+    //    node is unsettled and will help rather than start its own split.
+    if (unstable) {
+      ops.casTailWord(addr, packTailWord(node.level, node.tail_struct_ver),
+                      packTailWord(node.level, node.handle.structVer()));
+      ++c.helped_splits;
+    }
+
+    if (!ops.readNode(addr, node)) return false;
+    ++c.nodes_read;
+    if (!ops.readVec(node.handle.offset(), vec)) return false;
+    ++c.vec_reads;
+  }
+  return false;
+}
+
 template <class Ops>
 class Descender {
  public:
@@ -241,50 +304,16 @@ class Descender {
 
   /// Complete any operation outstanding on this node, then re-read it.
   ///
-  /// Returns with /node/ and /vec/ settled, or false if it could not get there.
+  /// Thin wrapper over settleNode(), which the write path shares.
   bool settle(RemoteAddr addr, NodeRecord &node, VecRecord &vec,
               DescentResult &res) {
-    for (int attempt = 0; attempt < detail::kMaxSettleAttempts; ++attempt) {
-      bool const pending = vec.isPending();
-      bool const unstable = !node.isStable();
-      if (!pending && !unstable) return true;
-
-      // 1. Fix the timestamp first. A helper stamps with its own clock, which
-      //    orders the write at the moment somebody first needed it -- that is
-      //    the point of leaving it unfixed until visible, since it lets the
-      //    write be ordered after readers that did not see it.
-      if (pending) {
-        ops_.casTs(node.handle.offset(), kNullTs, ops_.now());
-        ++res.helped_ts;
-      }
-
-      // 2. Propagate the split descriptor into the header. Either order is
-      //    safe: a reader that checks the bookends never trusts these fields
-      //    while the window is open, and one holding the vector prefers its
-      //    copies anyway.
-      if (unstable && vec.hasSplitDescriptor()) {
-        if (node.next_k_min != vec.k_min_next) {
-          ops_.casNextKMin(addr, node.next_k_min, vec.k_min_next);
-        }
-        if (node.next_id != vec.next_id) {
-          ops_.casNextId(addr, node.next_id, vec.next_id);
-        }
-      }
-
-      // 3. Close the window last. Until this lands, another writer knows the
-      //    node is unsettled and will help rather than start its own split.
-      if (unstable) {
-        ops_.casTailWord(addr, packTailWord(node.level, node.tail_struct_ver),
-                         packTailWord(node.level, node.handle.structVer()));
-        ++res.helped_splits;
-      }
-
-      if (!ops_.readNode(addr, node)) return false;
-      ++res.nodes_read;
-      if (!ops_.readVec(node.handle.offset(), vec)) return false;
-      ++res.vec_reads;
-    }
-    return false;
+    HelpCounters c;
+    bool const ok = settleNode(ops_, addr, node, vec, c);
+    res.nodes_read += c.nodes_read;
+    res.vec_reads += c.vec_reads;
+    res.helped_ts += c.helped_ts;
+    res.helped_splits += c.helped_splits;
+    return ok;
   }
 };
 

@@ -86,6 +86,57 @@ class FakeOps {
 
   uint64_t now() { return clock_ += 10; }
 
+  // ── The write half of the Ops concept (F1/F2) ────────────────────────────
+  //
+  // Writes are plain stores here. On the wire they are one-sided RDMA WRITEs to
+  // every replica, so nothing may assume they land atomically as a unit: the
+  // fence plus the publishing CAS is what makes them visible together. A test
+  // that wants to observe a half-finished operation constructs that state
+  // directly (see stageMidSplitOn) rather than interleaving these.
+
+  bool writeVec(ds::VecOffset off, ds::VecRecord const &vec) {
+    if (off == ds::kNullVec || off >= vecs_.size()) return false;
+    vecs_[off] = vec;
+    ++vec_writes_;
+    return true;
+  }
+
+  bool writeNode(ds::RemoteAddr a, ds::NodeRecord const &node) {
+    if (a.isNull() || a.id >= nodes_.size()) return false;
+    nodes_[a.id] = node;
+    ++node_writes_;
+    return true;
+  }
+
+  /// F3's SEND_FENCE. A no-op locally: there is no reordering to guard against
+  /// in a single-threaded fake. Counted so a test can assert that a fence was
+  /// actually issued before the publishing CAS, which is the property that does
+  /// not survive being got wrong on real hardware.
+  void fence() { ++fences_; }
+
+  /// The publishing CAS. Distinct from the others because this is the one that
+  /// linearizes the operation (L1) -- and the only one whose failure means
+  /// "start over" rather than "somebody else already did it".
+  bool casHandle(ds::RemoteAddr a, uint64_t expected, uint64_t desired) {
+    ++cas_handle_;
+    if (a.id >= nodes_.size()) return false;
+    if (nodes_[a.id].handle.raw != expected) return false;
+    nodes_[a.id].handle = ds::Handle{desired};
+    return true;
+  }
+
+  // Client-local bump allocation, mirroring Vec/NodeAllocator. Exposed through
+  // Ops so the F1/F2 logic can allocate without knowing whether it is talking
+  // to RDMA or to this.
+  ds::VecOffset allocVec() {
+    if (next_vec_ >= vecs_.size()) return ds::kNullVec;
+    return static_cast<ds::VecOffset>(next_vec_++);
+  }
+  ds::RemoteAddr allocNode() {
+    if (next_node_ >= nodes_.size()) return ds::RemoteAddr{};
+    return ds::RemoteAddr{next_node_++};
+  }
+
   // ── Test-side manipulation ───────────────────────────────────────────────
 
   ds::NodeRecord &node(ds::RemoteAddr a) { return nodes_[a.id]; }
@@ -96,16 +147,48 @@ class FakeOps {
   uint64_t nodeReads() const { return node_reads_; }
   uint64_t vecReads() const { return vec_reads_; }
   uint64_t reads() const { return node_reads_ + vec_reads_; }
+
+  // The rest of RdmaNodeReader's and RdmaOps' reporting surface, so this is a
+  // complete stand-in and ds_selftest.hpp can be *run* here rather than only
+  // type-checked. The two retry counters are always zero: those retries exist
+  // because a real read can catch a node mid-write, which cannot happen in a
+  // single-threaded fake.
+  uint64_t bytesRead() const {
+    return node_reads_ * ds::kNodeRecordBytes + vec_reads_ * ds::kVecRecordBytes;
+  }
+  uint64_t unstableRetries() const { return 0; }
+  uint64_t staleRetries() const { return 0; }
+  uint64_t casCount() const {
+    return cas_ts_ + cas_next_id_ + cas_next_k_min_ + cas_tail_ + cas_handle_;
+  }
+  uint64_t bytesWritten() const {
+    return node_writes_ * ds::kNodeRecordBytes +
+           vec_writes_ * ds::kVecRecordBytes;
+  }
   uint64_t casTsCalls() const { return cas_ts_; }
   uint64_t casTailCalls() const { return cas_tail_; }
+  uint64_t casNextIdCalls() const { return cas_next_id_; }
+  uint64_t casNextKMinCalls() const { return cas_next_k_min_; }
+  uint64_t casHandleCalls() const { return cas_handle_; }
+  uint64_t nodeWrites() const { return node_writes_; }
+  uint64_t vecWrites() const { return vec_writes_; }
+  uint64_t fences() const { return fences_; }
   uint64_t clockNow() const { return clock_; }
+
+  /// Point the bump allocators somewhere a fixture is not already using.
+  void seedAllocators(uint64_t first_node, ds::VecOffset first_vec) {
+    next_node_ = first_node;
+    next_vec_ = first_vec;
+  }
 
  private:
   std::vector<ds::NodeRecord> nodes_;
   std::vector<ds::VecRecord> vecs_;
   uint64_t clock_ = 1000;
+  uint64_t next_node_ = ds::kFirstDynamicId;
+  uint64_t next_vec_ = ds::kFirstDynamicVec;
   uint64_t node_reads_ = 0, vec_reads_ = 0, cas_ts_ = 0, cas_next_id_ = 0, cas_next_k_min_ = 0,
-           cas_tail_ = 0;
+           cas_tail_ = 0, cas_handle_ = 0, node_writes_ = 0, vec_writes_ = 0, fences_ = 0;
 };
 
 /// Insert a key into a data node sequentially, as a settled write would leave
@@ -123,8 +206,15 @@ inline void seedDataKey(FakeOps &ops, ds::Key k, ds::Value v) {
 
 
 /// Build the initial structure into a fresh arena.
-inline FakeOps buildInitialArena(uint32_t layers) {
-  FakeOps ops(ds::kFirstDynamicId + 512, ds::kFirstDynamicVec + 512);
+///
+/// /slots/ sizes the dynamic part of both arenas. It has to be generous for
+/// write tests: there is no reclamation (invariants.md §5), so *every* write
+/// consumes a vector and a split consumes three plus a node. A workload of N
+/// puts therefore needs well over N vectors, and running out shows up as
+/// Exhausted rather than as a wrong answer -- which is correct behaviour, but
+/// makes a test look broken when it is only under-provisioned.
+inline FakeOps buildInitialArena(uint32_t layers, size_t slots = 512) {
+  FakeOps ops(ds::kFirstDynamicId + slots, ds::kFirstDynamicVec + slots);
   ds::InitialNode built[ds::kMaxLayers + 1];
   uint32_t const n = ds::buildInitialStructure(layers, /*ts=*/1000, built);
   for (uint32_t i = 0; i < n; ++i) {

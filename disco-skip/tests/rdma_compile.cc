@@ -10,6 +10,8 @@
 // round trip -- which it has done once already.
 #include "ds.hpp"
 
+#include <iostream>
+
 // Force instantiation of the templates; being templates, nothing above would.
 using Conns = std::vector<dory::conn::ReliableConnection *>;
 
@@ -65,6 +67,56 @@ void instantiate_ops(Conns &conns, ds::Layout const &layout, Bufs b,
   ds::GetStats stats;
   ds::Getter<ds::RdmaOps<Conns>, ds::NullCache> g(ops, null_cache, layers, stats);
   (void)g.get(42);
+}
+
+// The write path (F1/F2 and Update_Index) over the full RDMA Ops surface. Same
+// argument as above: this is the combination the cluster runs, so it must
+// type-check here rather than costing a build.
+void instantiate_write_paths(Conns &conns, ds::Layout const &layout, Bufs b,
+                             uint64_t *cas_buf, ds::VecOffsetHint *hint,
+                             ds::NodeAllocator *nodes, ds::VecAllocator *vecs,
+                             uint32_t layers);
+void instantiate_write_paths(Conns &conns, ds::Layout const &layout, Bufs b,
+                             uint64_t *cas_buf, ds::VecOffsetHint *hint,
+                             ds::NodeAllocator *nodes, ds::VecAllocator *vecs,
+                             uint32_t layers) {
+  ds::RdmaOps<Conns> ops(conns, layout, b.node, b.vec, cas_buf, hint,
+                         /*replica=*/0, b.stage_node, b.stage_vec, nodes, vecs);
+
+  ds::WriteStats wstats;
+  ds::Writer<ds::RdmaOps<Conns>> w(ops, wstats);
+  ds::RemoteAddr const addr{ds::kInitialDataId};
+  (void)w.insertEntry(addr, 42, 4242);
+  (void)w.insertWithOverflow(addr, 43, 4343, nullptr);
+  ds::Entry const seed{44, 4444};
+  (void)w.splitAt(addr, 44, /*orphan=*/false, &seed);
+
+  ds::PutStats pstats;
+  ds::NullPutCache null_cache;
+  ds::Putter<ds::RdmaOps<Conns>, ds::NullPutCache> p(ops, null_cache, layers,
+                                                     pstats, wstats);
+  (void)p.put(45, 4545, 2);
+
+  (void)ops.bytesWritten();
+  (void)ops.fences();
+}
+
+// The --selftest body, against the real RDMA types. This is the instantiation
+// that closes the gap main.cpp leaves: the selftest logic no longer lives in an
+// uncompilable translation unit, so a mistyped field in it fails here in a
+// second instead of costing a cluster build.
+void instantiate_selftest(Conns &conns, ds::Layout const &layout, Bufs b,
+                          uint64_t *cas_buf, ds::VecOffsetHint *hint,
+                          ds::NodeAllocator *nodes, ds::VecAllocator *vecs,
+                          uint32_t layers);
+void instantiate_selftest(Conns &conns, ds::Layout const &layout, Bufs b,
+                          uint64_t *cas_buf, ds::VecOffsetHint *hint,
+                          ds::NodeAllocator *nodes, ds::VecAllocator *vecs,
+                          uint32_t layers) {
+  ds::RdmaNodeReader<Conns> reader(conns, layout, b.node, b.vec, hint);
+  ds::RdmaOps<Conns> ops(conns, layout, b.node, b.vec, cas_buf, hint,
+                         /*replica=*/0, b.stage_node, b.stage_vec, nodes, vecs);
+  (void)ds::runSelftest(reader, ops, layers, hint, std::cout);
 }
 
 // The bootstrap write loop, in the shape main.cpp uses it.

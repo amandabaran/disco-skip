@@ -270,14 +270,25 @@ class RdmaOps : public RdmaNodeReader<Conns> {
   using Base = RdmaNodeReader<Conns>;
 
  public:
+  /// @param stage_node,stage_vec  MR-resident staging buffers the write path
+  ///        copies into before handing the bytes to the HCA. Only needed for
+  ///        F1/F2; a read-only or verification-only user may pass nullptr.
+  /// @param nodes,vecs  this client's bump allocators. Also optional, for the
+  ///        same reason.
   RdmaOps(Conns &conns, Layout const &layout, NodeRecord *node_buf,
           VecRecord *vec_buf, uint64_t *cas_buf, VecOffsetHint *hint = nullptr,
-          size_t replica = 0)
+          size_t replica = 0, NodeRecord *stage_node = nullptr,
+          VecRecord *stage_vec = nullptr, NodeAllocator *nodes = nullptr,
+          VecAllocator *vecs = nullptr)
       : Base(conns, layout, node_buf, vec_buf, hint, replica),
         conns_(conns),
         layout_(layout),
         cas_buf_(cas_buf),
-        replica_(replica) {}
+        replica_(replica),
+        stage_node_(stage_node),
+        stage_vec_(stage_vec),
+        nodes_(nodes),
+        vecs_(vecs) {}
 
   bool casTs(VecOffset off, uint64_t expected, uint64_t desired) {
     auto &rc = *conns_[replica_];
@@ -317,23 +328,107 @@ class RdmaOps : public RdmaNodeReader<Conns> {
   ///
   /// steady_clock is a placeholder, and deliberately not good enough for A10:
   /// a real snapshot timestamp has to be comparable across machines, which
-  /// means a PTP-disciplined clock read and a measured epsilon. Until that is
+  /// means a disciplined clock read and a measured epsilon. Until that is
   /// decided this is monotonic per process, which is enough to keep the
   /// old_ver chain ordered locally and not enough to order anything across
-  /// clients. Flagged rather than hidden, since a wrong clock here produces
+  /// clients -- its epoch is boot time, so two nodes disagree by their uptime
+  /// difference. Flagged rather than hidden, since a wrong clock here produces
   /// wrong range-query results rather than a crash.
+  ///
+  /// Measured on this testbed (docs/clock-measurements.md): relative TSC
+  /// frequency error across the 12 nodes is 14.31 ppm, so a one-shot reset
+  /// accumulates 143 us of skew over a 10 s run against ~2 us operations. A
+  /// disciplined CLOCK_REALTIME read costs 31.4 ns against rdtscp's 20.1 ns,
+  /// so the fix is to keep rdtsc as the source and let the kernel correct the
+  /// rate -- not to hand-roll the counter. Nothing on the point-read, F1 or F2
+  /// paths compares timestamps, so that change is not a prerequisite for them.
   uint64_t now() {
     return static_cast<uint64_t>(
         std::chrono::steady_clock::now().time_since_epoch().count());
   }
 
+  // ── The write half of the Ops surface (F1/F2) ─────────────────────────────
+
+  /// Stage a vector and write it to every replica.
+  ///
+  /// The bytes must pass through the registered MR, because the HCA reads the
+  /// source buffer directly -- so the caller's VecRecord (which lives in
+  /// ordinary client memory) is copied into the staging slot first. One 320-byte
+  /// write per replica.
+  bool writeVec(VecOffset off, VecRecord const &vec) {
+    if (stage_vec_ == nullptr) return false;
+    *stage_vec_ = vec;
+    writeVecAllReplicas(conns_, layout_, stage_vec_, off);
+    ++vec_writes_;
+    return true;
+  }
+
+  /// Stage a node header and write it to every replica.
+  bool writeNode(RemoteAddr a, NodeRecord const &node) {
+    if (stage_node_ == nullptr) return false;
+    *stage_node_ = node;
+    writeNodeAllReplicas(conns_, stage_node_, a);
+    ++node_writes_;
+    return true;
+  }
+
+  /// F3's SEND_FENCE.
+  ///
+  /// A NO-OP here, and legitimately so: every helper in this header posts one
+  /// signalled work request and spins until its completion lands, so the writes
+  /// preceding a CAS have already been acknowledged by the remote HCA before the
+  /// CAS is even posted. Completion-ordering is strictly stronger than the
+  /// fence.
+  ///
+  /// It stops being a no-op the moment the write path moves onto the
+  /// future-based (pipelined) helpers, where several work requests are in flight
+  /// on one QP at once and F3's same-QP ordering plus an explicit fence is what
+  /// guarantees WRITE-visible-before-CAS. Kept as a call rather than omitted so
+  /// that the ordering requirement is expressed at the call site now, and the
+  /// pipelined implementation has an obvious place to land.
+  void fence() { ++fences_; }
+
+  /// The publishing CAS: the operation's linearization point (L1).
+  ///
+  /// The handle sits at offset 0 in the node, so its address is the node's
+  /// address -- which is why nodeAddrOf doubles as the CAS target.
+  bool casHandle(RemoteAddr a, uint64_t expected, uint64_t desired) {
+    auto &rc = *conns_[replica_];
+    ++cas_;
+    return blockingCas(rc, cas_buf_, Layout::nodeAddrOf(rc.remoteBuf(), a),
+                       expected, desired);
+  }
+
+  /// A fresh vector offset from this client's stripe, or kNullVec when spent.
+  ///
+  /// Exhaustion is a hard error rather than a retry: with no reclamation, it
+  /// means the run outlasted the arena it was sized for, and the fix is a larger
+  /// --vecs-per-client.
+  VecOffset allocVec() { return vecs_ == nullptr ? kNullVec : vecs_->allocate(); }
+  RemoteAddr allocNode() {
+    return nodes_ == nullptr ? RemoteAddr{} : nodes_->allocate();
+  }
+
   [[nodiscard]] uint64_t casCount() const { return cas_; }
+  [[nodiscard]] uint64_t nodeWrites() const { return node_writes_; }
+  [[nodiscard]] uint64_t vecWrites() const { return vec_writes_; }
+  [[nodiscard]] uint64_t fences() const { return fences_; }
+  [[nodiscard]] uint64_t bytesWritten() const {
+    return node_writes_ * kNodeRecordBytes + vec_writes_ * kVecRecordBytes;
+  }
 
  private:
   Conns &conns_;
   Layout const &layout_;
   uint64_t *cas_buf_;
   size_t replica_;
+  NodeRecord *stage_node_ = nullptr;
+  VecRecord *stage_vec_ = nullptr;
+  NodeAllocator *nodes_ = nullptr;
+  VecAllocator *vecs_ = nullptr;
+  uint64_t node_writes_ = 0;
+  uint64_t vec_writes_ = 0;
+  uint64_t fences_ = 0;
   uint64_t cas_ = 0;
 };
 

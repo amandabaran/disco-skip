@@ -23,6 +23,9 @@
 #include "ds_bootstrap.hpp"
 #include "ds_descend.hpp"
 #include "ds_get.hpp"
+#include "ds_insert.hpp"
+#include "ds_put.hpp"
+#include "ds_selftest.hpp"
 #include "ds_verify.hpp"
 
 // Needs dory, so it comes last and is what makes this header cluster-only.
