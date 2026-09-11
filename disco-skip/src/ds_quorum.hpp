@@ -17,6 +17,8 @@
 // ReplicaSet must provide:
 //
 //     size_t replicas() const;
+//     void readNodeAll(RemoteAddr a, NodeRecord *out, bool *ok,
+//                      VecOffset speculate, VecRecord *spec, bool *spec_ok);
 //     bool readNodeFrom(size_t r, RemoteAddr a, NodeRecord &node);
 //     bool readVecFrom(size_t r, VecOffset off, VecRecord &vec);
 //     bool casHandleOn(size_t r, RemoteAddr a, uint64_t exp, uint64_t des);
@@ -25,7 +27,7 @@
 //     VecOffset allocVec();
 //     RemoteAddr allocNode();
 //
-// `submitAll` is where the round trips are won or lost. It must post every
+// `readNodeAll` and `submitAll` are where the round trips are won or lost. It must post every
 // replica's chain BEFORE draining any of them, so that N replicas cost one
 // round trip of latency rather than N -- which is what chimera's put_future
 // does across servers and what a per-replica loop of blocking calls does not.
@@ -70,6 +72,29 @@
 //
 //    Flagged rather than silently adopted: it is a deliberate strengthening of
 //    L2, and if invariants.md is to stay authoritative it should say so.
+//
+// ── The offset hint, and why it belongs here ─────────────────────────────────
+//
+// A node read is a header and then the vector its handle names, and those are
+// ordinarily serialised because the offset is not known until the header lands.
+// The hint breaks that: with a guess, the vector read is issued *alongside* the
+// header reads and validated afterwards.
+//
+// The policy lives here rather than in the ReplicaSet because validating a
+// guess means knowing which handle won the quorum, which is this file's job.
+// The ReplicaSet only offers to carry one extra read.
+//
+// Validation is stricter than "the offset matched", to keep L4 honest. The
+// speculation is accepted only when the replica it was read from voted with the
+// winning handle -- which, since a handle carries its offset, collapses to:
+// replica 0 voted with the winner and the guess equalled that offset. A vector
+// is write-once and written to every replica before the handle CAS publishes
+// it, so a correct guess would give identical bytes from any replica that has
+// it; the strict check costs nothing and does not rely on that.
+//
+// A wrong guess now costs a wasted 320-byte read and NO latency, because the
+// speculation rides in the same doorbell as the headers. That is the trade the
+// toggle exists to measure: rNIC and PCIe bandwidth against round trips.
 
 #include <cstddef>
 #include <cstdint>
@@ -77,6 +102,7 @@
 #include "ds_batch.hpp"
 #include "ds_defs.hpp"
 #include "ds_node.hpp"
+#include "layout.hpp"  // VecOffsetHint
 
 namespace ds {
 
@@ -97,6 +123,10 @@ struct QuorumStats {
   uint64_t vec_writes = 0;      ///< logical vector writes, summed over batches
   uint64_t node_writes = 0;
   uint64_t cas_issued = 0;      ///< CASes carried by batches, all replicas
+  uint64_t speculated = 0;      ///< reads that carried a speculative vector
+  uint64_t spec_hits = 0;       ///< ... whose guess was right, saving a round trip
+  uint64_t spec_misses = 0;     ///< ... whose guess was wrong, costing 320 bytes
+  uint64_t vec_reads_served = 0;///< vector reads answered from a speculation
 };
 
 namespace detail {
@@ -112,7 +142,10 @@ inline constexpr int kMaxQuorumReadAttempts = 8;
 template <class ReplicaSet>
 class QuorumOps {
  public:
-  QuorumOps(ReplicaSet &set, QuorumStats &stats) : set_(set), stats_(stats) {}
+  /// @param hint  optional; when present, a node read speculates the vector
+  ///              read alongside the headers instead of serialising after them
+  QuorumOps(ReplicaSet &set, QuorumStats &stats, VecOffsetHint *hint = nullptr)
+      : set_(set), stats_(stats), hint_(hint) {}
 
   /// Replicas that must agree for a value to count as committed.
   [[nodiscard]] size_t majority() const { return set_.replicas() / 2 + 1; }
@@ -127,14 +160,27 @@ class QuorumOps {
   bool readNode(RemoteAddr a, NodeRecord &node) {
     ++stats_.node_reads;
     size_t const n = set_.replicas();
+    spec_valid_ = false;  // any previous speculation is stale now
 
     for (int attempt = 0; attempt < detail::kMaxQuorumReadAttempts; ++attempt) {
       NodeRecord seen[kMaxReplicas];
       bool ok[kMaxReplicas] = {};
+
+      // One fan-out, optionally carrying the speculative vector read. Every
+      // request is posted before any is drained, so this is one round trip
+      // whatever the replica count -- and the speculation is free in latency.
+      VecOffset const guess = hint_ != nullptr ? hint_->guess(a) : kNullVec;
+      VecRecord spec;
+      bool spec_ok = false;
+      set_.readNodeAll(a, seen, ok, guess, &spec, &spec_ok);
+      stats_.replica_reads += n;
+      if (guess != kNullVec) {
+        ++stats_.speculated;
+        ++stats_.replica_reads;  // the speculative read is a real read
+      }
+
       size_t got = 0;
       for (size_t r = 0; r < n; ++r) {
-        ok[r] = set_.readNodeFrom(r, a, seen[r]);
-        ++stats_.replica_reads;
         if (ok[r]) ++got;
       }
       if (got < majority()) {
@@ -184,6 +230,22 @@ class QuorumOps {
       last_max_replica_ = best;
       last_max_valid_ = true;
       (void)best_votes;
+
+      // Was the guess right? Accepted only if replica 0 voted with the winning
+      // handle, which is the strict reading of L4 -- see the header note.
+      VecOffset const truth = seen[best].handle.offset();
+      if (guess != kNullVec) {
+        if (spec_ok && ok[0] && seen[0].handle == seen[best].handle &&
+            guess == truth) {
+          spec_valid_ = true;
+          spec_off_ = guess;
+          spec_vec_ = spec;
+          ++stats_.spec_hits;
+        } else {
+          ++stats_.spec_misses;
+        }
+      }
+      if (hint_ != nullptr) hint_->record(a, truth, guess);
       return true;
     }
     ++stats_.read_failures;
@@ -206,6 +268,18 @@ class QuorumOps {
   /// and whose read would fail anyway.
   bool readVec(VecOffset off, VecRecord &vec) {
     ++stats_.vec_reads;
+
+    // Already in hand: the preceding readNode speculated this offset and the
+    // winning handle confirmed it, so there is no round trip to make. Consumed
+    // rather than cached, because the next readNode may publish a new version
+    // and a stale speculation is exactly the thing that would return old bytes.
+    if (spec_valid_ && off == spec_off_) {
+      vec = spec_vec_;
+      spec_valid_ = false;
+      ++stats_.vec_reads_served;
+      return true;
+    }
+
     size_t const start = last_max_valid_ ? last_max_replica_ : 0;
     size_t const n = set_.replicas();
     for (size_t i = 0; i < n; ++i) {
@@ -357,9 +431,15 @@ class QuorumOps {
 
   ReplicaSet &set_;
   QuorumStats &stats_;
+  VecOffsetHint *hint_ = nullptr;
   RemoteAddr last_read_addr_{};
   size_t last_max_replica_ = 0;
   bool last_max_valid_ = false;
+
+  /// A validated speculation, waiting for the readVec that wants it.
+  bool spec_valid_ = false;
+  VecOffset spec_off_ = kNullVec;
+  VecRecord spec_vec_{};
 };
 
 }  // namespace ds

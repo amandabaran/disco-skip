@@ -275,6 +275,15 @@ selftest can build a structure with right-hops in it.
 The cache reporting **1 orphan per level** while the verifier reports 0 is expected, not a
 disagreement — see the orphan-flag note in [`remote-design.md`](remote-design.md) §3.
 
-The **offset hint's hit rate is not a performance number** yet. The blocking helpers post one
-work request at a time, so nothing is doorbell-batched; the hint only warms and scores. On a
-static structure it reads 100%, which is the best possible case by construction.
+The **offset hint is now a real mechanism, but its hit rate is still not a performance
+number.** It used to warm and score without doing anything, because the blocking helpers
+posted one work request at a time. It now chains the speculative vector read into the same
+doorbell as the quorum's header reads, so a hit genuinely removes a round trip -- the
+selftest reports `140 vector read(s) served without a round trip`.
+
+What makes the *rate* unrepresentative is the workload, not the mechanism. The script is 9
+puts against 153 reads, and the misses are exactly the 13 commits: a write moves its node's
+vector, so the next read of that node necessarily misses, and nothing else does. 91.5% here
+is the floor on miss count for a read-heavy script over a nearly static structure. Miss rate
+tracks the write rate, so expect it to fall away under write-heavy load -- which is the
+crossover the toggle exists to find.

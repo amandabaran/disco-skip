@@ -658,6 +658,85 @@ class RdmaReplicaSet {
     return true;
   }
 
+  /// Read the header from every replica, optionally carrying a speculative
+  /// vector read alongside, all posted before anything is drained.
+  ///
+  /// TWO ROUND-TRIP WINS IN ONE CALL.
+  ///
+  ///   * The fan-out. Every replica's read is posted first and drained second,
+  ///     so a quorum read costs one round trip rather than one per replica. A
+  ///     loop of blocking reads -- which this file did originally -- makes
+  ///     replication multiply latency.
+  ///
+  ///   * The speculation. Replica 0's header read and the guessed vector read
+  ///     go out as ONE chain on ONE queue pair, so a correct guess removes the
+  ///     serialisation between a header and the vector its handle names. That
+  ///     dependency is the reason a node read was ever two round trips.
+  ///
+  /// The other replicas get a single read each: they are separate queue pairs,
+  /// so there is nothing to chain them to, only to overlap them with.
+  void readNodeAll(RemoteAddr a, NodeRecord *out, bool *ok,
+                   VecOffset speculate, VecRecord *spec, bool *spec_ok) {
+    size_t const n = conns_.size();
+    *spec_ok = false;
+    bool const want_spec = speculate != kNullVec;
+
+    // Phase 1: post everything.
+    struct ibv_send_wr wr[2];
+    struct ibv_sge sg[2];
+    for (size_t r = 0; r < n; ++r) {
+      ok[r] = false;
+      auto &rc = *conns_[r];
+      if (r == 0 && want_spec) {
+        // Header and speculation chained: one doorbell, one completion.
+        rc.prepareSingle(wr[0], sg[0],
+                         dory::conn::ReliableConnection::RdmaRead,
+                         kBlockingWrId, &node_bufs_[0], kNodeRecordBytes,
+                         Layout::nodeAddrOf(rc.remoteBuf(), a), false);
+        rc.prepareSingle(wr[1], sg[1],
+                         dory::conn::ReliableConnection::RdmaRead,
+                         kBlockingWrId, &vec_bufs_[0], kVecRecordBytes,
+                         layout_.vecAddrOf(rc.remoteBuf(), speculate), true);
+        if (doorbell_) {
+          wr[0].next = &wr[1];
+          if (!rc.postSend(wr[0])) {
+            throw std::runtime_error("failed to post a speculative read chain");
+          }
+        } else {
+          wr[0].next = nullptr;
+          wr[0].send_flags |= IBV_SEND_SIGNALED;
+          if (!rc.postSend(wr[0]) || !rc.postSend(wr[1])) {
+            throw std::runtime_error("failed to post a speculative read");
+          }
+        }
+      } else {
+        if (!rc.postSendSingle(dory::conn::ReliableConnection::RdmaRead,
+                               kBlockingWrId, &node_bufs_[r], kNodeRecordBytes,
+                               Layout::nodeAddrOf(rc.remoteBuf(), a))) {
+          throw std::runtime_error("failed to post a quorum header read");
+        }
+      }
+    }
+
+    // Phase 2: drain. The reads have been overlapping since phase 1.
+    for (size_t r = 0; r < n; ++r) {
+      auto &rc = *conns_[r];
+      size_t const expect =
+          (r == 0 && want_spec && !doorbell_) ? 2 : 1;
+      for (size_t i = 0; i < expect; ++i) {
+        detail::awaitOne(rc, "quorum header read");
+      }
+      ++reads_;
+      out[r] = node_bufs_[r];
+      ok[r] = true;
+    }
+    if (want_spec) {
+      ++reads_;
+      *spec = vec_bufs_[0];
+      *spec_ok = true;
+    }
+  }
+
   bool readVecFrom(size_t r, VecOffset off, VecRecord &vec) {
     if (off == kNullVec) return false;
     auto &rc = *conns_[r];

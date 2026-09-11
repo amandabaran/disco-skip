@@ -211,18 +211,42 @@ only tolerates an unreferenced node in a layer if it is one (interface doc §3).
 right; they answer different questions. Easy to trip over when comparing the selftest's
 orphan count against the cache's.
 
-### The offset hint is currently dead on this path
+### The offset hint, speculated inside the quorum read
 
-Worth stating plainly rather than leaving a 0% hit rate to be discovered. The
-hint existed so a header read and its vector read could go out in one doorbell,
-and it was consumed by `RdmaNodeReader::read()`. The selftest now runs over
-`QuorumOps`, which issues `readNode` and then `readVec` and never speculates, so
-the hint is neither used nor scored — `offset hint: 0.000 (0 hit / 0 miss)`.
+A node read is a header and then the vector its handle names, and those are
+ordinarily serialised because the offset is not known until the header lands.
+The hint breaks that dependency: with a guess, `readNode` issues the vector read
+*alongside* the header reads — replica 0's header and the speculation chained on
+one queue pair, one doorbell, one completion — and `readVec` is then answered
+from it with no round trip at all.
 
-The capability is now *more* reachable than before, not less: a quorum read
-could chain the speculative vector read into the same batch as the three header
-reads, which is exactly what `ds_batch.hpp` makes expressible. It is simply not
-wired. Until it is, the hint is a measurement of nothing.
+The policy lives in `ds_quorum.hpp` rather than in the replica set, because
+validating a guess means knowing which handle won the quorum. Validation is the
+strict reading of L4: accepted only when **replica 0 voted with the winning
+handle** and the guess equalled that offset. A vector is write-once and written
+to every replica before the handle CAS publishes it, so a correct guess would
+give identical bytes from any replica that has it — the strict check costs
+nothing and does not lean on that.
+
+**A wrong guess now costs a wasted 320-byte read and no latency**, because the
+speculation rides in the same doorbell as the headers and the real read lands
+where the unspeculated one would have. That is the trade the toggle exists to
+measure: rNIC and PCIe bandwidth against round trips.
+
+Measured on the cluster over the selftest script, identical at one and three
+servers since the speculation is per-read rather than per-replica:
+
+```
+speculation:  153 reads speculated, 140 hit / 13 miss;
+              140 vector read(s) served without a round trip
+```
+
+**The 13 misses are exactly the 13 commits.** A write moves its node's vector,
+so the next read of that node necessarily misses — which means the hint misses
+once per published version and never otherwise. That is the floor: on this
+workload it is as accurate as any such hint could be. It also makes the
+write-heavy prediction concrete rather than hand-waved — miss rate tracks the
+*write* rate, so the crossover is where writes stop being rare.
 
 ### The offset hint
 

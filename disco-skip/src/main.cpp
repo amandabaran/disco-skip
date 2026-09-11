@@ -153,7 +153,9 @@ int run_structure_selftest(ds::DsState& state) {
         state.layout.getStageNode(0), state.layout.getStageVec(0),
         &state.node_alloc, &state.vec_alloc, &state.vec_hint);
     ds::QuorumStats qstats;
-    ds::QuorumOps<decltype(replicas)> ops(replicas, qstats);
+    // The hint makes a node read speculate its vector read alongside the
+    // headers rather than serialising after them -- see ds_quorum.hpp.
+    ds::QuorumOps<decltype(replicas)> ops(replicas, qstats, &state.vec_hint);
 
     std::cout << "replication:  " << replicas.replicas()
               << " server(s), majority " << ops.majority() << " (DS_N_REPLICAS="
@@ -177,6 +179,10 @@ int run_structure_selftest(ds::DsState& state) {
               << std::endl;
     std::cout << "round trips:  " << qstats.batches << " chained batches"
               << std::endl;
+    std::cout << "speculation:  " << qstats.speculated << " reads speculated, "
+              << qstats.spec_hits << " hit / " << qstats.spec_misses
+              << " miss; " << qstats.vec_reads_served
+              << " vector read(s) served without a round trip" << std::endl;
     return rc;
 }
 

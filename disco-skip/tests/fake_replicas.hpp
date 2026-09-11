@@ -34,6 +34,26 @@ class FakeReplicaSet {
 
   size_t replicas() const { return arenas_.size(); }
 
+  /// Read the header from every replica, optionally carrying a speculative
+  /// vector read alongside.
+  ///
+  /// On the wire every request is posted before any is drained, and replica 0's
+  /// header plus the speculation are one chain on one QP -- so the whole thing
+  /// is a single round trip regardless of replica count. Here it is a loop,
+  /// which models the *cost* faithfully (the reads are all counted) without the
+  /// latency there is nothing to overlap.
+  void readNodeAll(ds::RemoteAddr a, ds::NodeRecord *out, bool *ok,
+                   ds::VecOffset speculate, ds::VecRecord *spec,
+                   bool *spec_ok) {
+    for (size_t r = 0; r < arenas_.size(); ++r) {
+      ok[r] = readNodeFrom(r, a, out[r]);
+    }
+    *spec_ok = false;
+    if (speculate != ds::kNullVec && !down_[0]) {
+      *spec_ok = arenas_[0].readVec(speculate, *spec);
+    }
+  }
+
   bool readNodeFrom(size_t r, ds::RemoteAddr a, ds::NodeRecord &node) {
     if (down_[r]) return false;
     return arenas_[r].readNode(a, node);

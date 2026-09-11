@@ -442,6 +442,145 @@ static void checkReplicationCostsBandwidthNotRoundTrips() {
               (unsigned long long)batches[0], (unsigned long long)batches[1]);
 }
 
+// ── The offset hint, speculated inside the quorum read ─────────────────────
+
+/// A rig whose quorum ops carry a warm offset hint.
+struct HintRig {
+  FakeReplicaSet set;
+  ds::QuorumStats qs;
+  ds::VecOffsetHint hint;
+  ds::QuorumOps<FakeReplicaSet> ops;
+
+  explicit HintRig(size_t replicas = 3)
+      : set(replicas, kLayers),
+        hint(ds::kFirstDynamicId + 4096, /*enabled=*/true),
+        ops(set, qs, &hint) {}
+};
+
+static void checkSpeculationSavesTheSerialisedVectorRead() {
+  HintRig r;
+  ds::NodeRecord node;
+  ds::VecRecord vec;
+
+  // First read: the hint is cold, so nothing is speculated -- but the true
+  // offset is learned.
+  CHECK(r.ops.readNode(kData, node), "the cold read succeeds");
+  CHECK(r.ops.readVec(node.handle.offset(), vec), "and its vector read succeeds");
+  CHECK(r.qs.speculated == 0, "a cold hint speculates nothing");
+  CHECK(r.hint.guess(kData) == node.handle.offset(),
+        "but it now holds the true offset");
+
+  uint64_t const reads_before = r.qs.replica_reads;
+
+  // Second read: the guess rides along with the headers, and the vector read is
+  // answered from it with no further round trip.
+  CHECK(r.ops.readNode(kData, node), "the warm read succeeds");
+  CHECK(r.qs.speculated == 1, "having speculated the vector");
+  CHECK(r.qs.spec_hits == 1, "and guessed right");
+
+  CHECK(r.ops.readVec(node.handle.offset(), vec), "the vector read succeeds");
+  CHECK(r.qs.vec_reads_served == 1,
+        "served from the speculation, so it cost no round trip");
+
+  // The bytes are the same either way: a hit costs 3 headers + 1 vector, which
+  // is exactly what the unspeculated pair costs. What it saves is the
+  // serialisation between them, not bandwidth.
+  CHECK(r.qs.replica_reads - reads_before == r.set.replicas() + 1,
+        "a hit moves the same bytes as the serialised pair");
+  CHECK(vec.size == 0, "and the vector really is this node's");
+}
+
+static void checkAStaleGuessNeverServesOldBytes() {
+  // The case that matters. A write moves the vector, so the hint's offset is a
+  // version behind. The speculation must be rejected and the CURRENT vector
+  // returned -- serving the stale one would be a wrong answer, not a slow one.
+  HintRig r;
+  ds::NodeRecord node;
+  ds::VecRecord vec;
+  CHECK(r.ops.readNode(kData, node), "warm the hint");
+  CHECK(r.ops.readVec(node.handle.offset(), vec), "and read the vector");
+  ds::VecOffset const old_off = node.handle.offset();
+
+  ds::WriteStats ws;
+  ds::Writer<ds::QuorumOps<FakeReplicaSet>> w(r.ops, ws);
+  CHECK(w.insertEntry(kData, 100, 700) == ds::WriteOutcome::Published,
+        "a write publishes a new version");
+
+  // The hint still names the superseded offset.
+  CHECK(r.hint.guess(kData) == old_off, "the hint is now a version behind");
+
+  uint64_t const misses_before = r.qs.spec_misses;
+  uint64_t const served_before = r.qs.vec_reads_served;
+  CHECK(r.ops.readNode(kData, node), "the read succeeds");
+  CHECK(node.handle.offset() != old_off, "the node has moved on");
+  CHECK(r.qs.spec_misses == misses_before + 1, "the guess is scored as a miss");
+
+  CHECK(r.ops.readVec(node.handle.offset(), vec), "the vector read succeeds");
+  CHECK(r.qs.vec_reads_served == served_before,
+        "NOT served from the stale speculation");
+  int const idx = ds::findLte(vec, 100);
+  CHECK(idx >= 0 && vec.e[idx].key == 100 && vec.e[idx].val == 700,
+        "and it returns the version the write published, not the stale one");
+}
+
+static void checkSpeculationIsRejectedWhenReplicaZeroDissents() {
+  // L4, strictly: the speculation is read from replica 0, so it is only usable
+  // if replica 0 voted with the winning handle. Here it does not, and the
+  // guess must be discarded even though the offset would have matched.
+  HintRig r;
+  ds::NodeRecord node;
+  ds::VecRecord vec;
+  CHECK(r.ops.readNode(kData, node), "warm the hint");
+  CHECK(r.ops.readVec(node.handle.offset(), vec), "and read the vector");
+
+  // Replica 0 becomes the odd one out; the other two still hold the truth.
+  ds::Handle const base = r.set.arena(1).node(kData).handle;
+  r.set.forceHandle(0, kData, ds::Handle::make(base.structVer(), 7, 111));
+
+  uint64_t const served_before = r.qs.vec_reads_served;
+  CHECK(r.ops.readNode(kData, node), "the read succeeds");
+  CHECK(node.handle == base, "picking the majority handle");
+  CHECK(r.qs.spec_misses >= 1, "and rejecting the speculation");
+  CHECK(r.ops.readVec(node.handle.offset(), vec), "the vector read succeeds");
+  CHECK(r.qs.vec_reads_served == served_before,
+        "from a replica that voted with the winner, not from the speculation");
+}
+
+static void checkHintHelpsADescentAndCostsNothingWrong() {
+  // End to end: a descent with a warm hint must return the same answers as one
+  // without, and serve some of its vector reads from speculation.
+  HintRig warm;
+  Rig cold;
+  ds::WriteStats ws_w, ws_c;
+  ds::Writer<ds::QuorumOps<FakeReplicaSet>> w_warm(warm.ops, ws_w);
+  ds::Writer<ds::QuorumOps<FakeReplicaSet>> w_cold(cold.ops, ws_c);
+  for (ds::Key k : {ds::Key{100}, ds::Key{200}, ds::Key{300}}) {
+    CHECK(w_warm.insertEntry(kData, k, k * 7) == ds::WriteOutcome::Published, "w");
+    CHECK(w_cold.insertEntry(kData, k, k * 7) == ds::WriteOutcome::Published, "c");
+  }
+
+  ds::PathStep path[ds::kMaxLayers];
+  for (int pass = 0; pass < 3; ++pass) {
+    for (ds::Key k : {ds::Key{100}, ds::Key{200}, ds::Key{300}, ds::Key{999}}) {
+      ds::Descender<ds::QuorumOps<FakeReplicaSet>> dw(warm.ops);
+      ds::Descender<ds::QuorumOps<FakeReplicaSet>> dc(cold.ops);
+      ds::DescentResult const rw = dw.descend(k, kLayers, path);
+      ds::DescentResult const rc = dc.descend(k, kLayers, path);
+      CHECK(rw.ok() == rc.ok() && rw.found == rc.found && rw.value == rc.value,
+            "a warm hint changes no answer a descent gives");
+    }
+  }
+
+  CHECK(warm.qs.spec_hits > 0, "and by the later passes it is hitting");
+  CHECK(warm.qs.vec_reads_served > 0, "serving vector reads without a round trip");
+  std::printf("  hint: %llu speculated, %llu hit / %llu miss, "
+              "%llu vector reads served\n",
+              (unsigned long long)warm.qs.speculated,
+              (unsigned long long)warm.qs.spec_hits,
+              (unsigned long long)warm.qs.spec_misses,
+              (unsigned long long)warm.qs.vec_reads_served);
+}
+
 int main() {
   std::printf("quorum_test: layers=%u\n", kLayers);
   checkMajorityIsComputedFromTheReplicaCount();
@@ -458,6 +597,10 @@ int main() {
   checkConvergenceWithAPersistentlyLaggingReplica();
   checkSingleReplicaBehavesLikeTheDirectPath();
   checkReplicationCostsBandwidthNotRoundTrips();
+  checkSpeculationSavesTheSerialisedVectorRead();
+  checkAStaleGuessNeverServesOldBytes();
+  checkSpeculationIsRejectedWhenReplicaZeroDissents();
+  checkHintHelpsADescentAndCostsNothingWrong();
 
   if (g_failures != 0) {
     std::printf("%d FAILURE(S)\n", g_failures);
