@@ -39,17 +39,46 @@ BINS    := $(addprefix obj/smoke-,$(CONFIGS))
 VERIFY  := obj/verify
 DESCEND := obj/descend
 GET     := obj/get
+INSERT  := obj/insert
+PUT     := obj/put
+SELFTEST := obj/selftest
 
-# Approximation of the dory toolchain's warning set, which is far stricter than
-# the cache half's own Makefile. Clang-only equivalents are used where GCC's
-# spelling differs, and the GCC-specific flags it does not know are dropped.
+# The dory toolchain's warning set, copied from the actual compile line rather
+# than approximated. This target's job is to fail here instead of on the
+# cluster, so it must not be weaker than the real build in any respect.
+#
+# Reproduce the reference list with:
+#   ./build.py disco-skip  (then read the g++ invocation for main.cpp)
+#
+# Three things this must keep matching:
+#   * -O2, not -O1. -Wstrict-overflow and -Wdisabled-optimization are
+#     optimiser-driven, so a lower level silently stops reporting them.
+#   * -Wstrict-overflow=5 and -Wsign-promo are GCC-only. Earlier revisions of
+#     this file dropped them as unavailable, because the dev box was a Mac with
+#     no GCC -- but the cluster build runs on toad, which has the same g++ the
+#     dory toolchain uses, so there is no reason to approximate. Dropping
+#     -Wstrict-overflow=5 cost a cluster build (findLte in ds_node.hpp).
+#   * the -Wno-error= list. The real build demotes four of these to warnings;
+#     matching that keeps the gate from failing on something the cluster
+#     tolerates, which would be its own kind of false signal.
+#
 # -Wno-nested-anon-types exempts register.hpp's pre-existing anonymous struct in
 # an anonymous union (chimera's code, and GCC accepts it).
-STRICTFLAGS := -std=c++17 -O1 -Werror -Wall -Wextra -Wpedantic -Wconversion \
-               -Wfloat-equal -Wpointer-arith -Wpacked -Wmissing-field-initializers \
-               -Wunreachable-code -Wcast-align -Wcast-qual -Wformat=2 \
-               -Wformat-nonliteral -Wuninitialized -Wformat-security -Winit-self \
-               -Wold-style-cast -Wredundant-decls -Wundef -Wno-unused \
+STRICTWARN := -Werror -Wall -Wextra -Wpedantic -Wconversion -Wfloat-equal \
+              -Wpointer-arith -Wswitch-default -Wpacked -Winvalid-pch \
+              -Wmissing-field-initializers -Wunreachable-code -Wcast-align \
+              -Wcast-qual -Wdisabled-optimization -Wformat=2 -Wformat-nonliteral \
+              -Wuninitialized -Wformat-security -Wformat-y2k -Winit-self \
+              -Wmissing-declarations -Wmissing-include-dirs -Wredundant-decls \
+              -Wstrict-overflow=5 -Wundef -Wno-unused -Wctor-dtor-privacy \
+              -Wsign-promo -Woverloaded-virtual -Wold-style-cast -Wlogical-op \
+              -Wstrict-null-sentinel -Wnoexcept
+
+# Exactly what src/CMakeLists.txt demotes, so the gate matches the build.
+STRICTNOERR := -Wno-error=switch-default -Wno-error=conversion \
+               -Wno-error=missing-declarations -Wno-error=undef
+
+STRICTFLAGS := -std=c++17 -O2 -g -DNDEBUG $(STRICTWARN) $(STRICTNOERR) \
                -Wno-nested-anon-types
 
 # ds_rdma.hpp sits on dory and libibverbs, which do not exist off-cluster, so it
@@ -98,10 +127,28 @@ $(GET): get_test.cc $(HDRS) fake_ops.hpp $(MACHINE_DEFINES) | obj
 	@$(CXX) $(CXXFLAGS) $(INCLUDES) -DDS_CACHE_ENABLED=1 -DDS_N_REPLICAS=1 \
 	  -DDS_MAX_LAYERS=8 -DDS_IDX_EXP=3 $< -o $@ $(LDFLAGS)
 
-check: $(BINS) $(VERIFY) $(DESCEND) $(GET)
+$(INSERT): insert_test.cc $(HDRS) fake_ops.hpp $(MACHINE_DEFINES) | obj
+	@echo "[CXX] insert"
+	@$(CXX) $(CXXFLAGS) $(INCLUDES) -DDS_CACHE_ENABLED=0 -DDS_N_REPLICAS=1 \
+	  -DDS_MAX_LAYERS=8 -DDS_IDX_EXP=3 $< -o $@ $(LDFLAGS)
+
+$(PUT): put_test.cc $(HDRS) fake_ops.hpp $(MACHINE_DEFINES) | obj
+	@echo "[CXX] put"
+	@$(CXX) $(CXXFLAGS) $(INCLUDES) -DDS_CACHE_ENABLED=0 -DDS_N_REPLICAS=1 \
+	  -DDS_MAX_LAYERS=8 -DDS_IDX_EXP=3 $< -o $@ $(LDFLAGS)
+
+$(SELFTEST): selftest_test.cc $(HDRS) fake_ops.hpp $(MACHINE_DEFINES) | obj
+	@echo "[CXX] selftest"
+	@$(CXX) $(CXXFLAGS) $(INCLUDES) -DDS_CACHE_ENABLED=0 -DDS_N_REPLICAS=1 \
+	  -DDS_MAX_LAYERS=8 -DDS_IDX_EXP=3 $< -o $@ $(LDFLAGS)
+
+check: $(BINS) $(VERIFY) $(DESCEND) $(GET) $(INSERT) $(PUT) $(SELFTEST)
 	@echo "---- $(VERIFY) ----"; $(VERIFY) || exit 1
 	@echo "---- $(DESCEND) ----"; $(DESCEND) || exit 1
 	@echo "---- $(GET) ----"; $(GET) || exit 1
+	@echo "---- $(INSERT) ----"; $(INSERT) || exit 1
+	@echo "---- $(PUT) ----"; $(PUT) || exit 1
+	@echo "---- $(SELFTEST) ----"; $(SELFTEST) || exit 1
 	@for b in $(BINS); do echo "---- $$b ----"; $$b || exit 1; done
 	@echo "==== all toggle combinations pass ===="
 

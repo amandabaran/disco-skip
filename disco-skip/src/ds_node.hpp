@@ -389,17 +389,24 @@ inline constexpr RemoteAddr headAddr(uint32_t level) {
 /// Binary search: entries are kept sorted, so this is the remote-side twin of
 /// the cache's vector_sfra::find_lte, and it is what turns one vector read into
 /// one step of the descent.
+/// The search runs over a half-open unsigned range. A closed signed range needs
+/// `mid - 1`, and at `-Wstrict-overflow=5` the dory toolchain rejects the
+/// `lo <= hi` comparison that follows it -- the optimiser wants to rewrite
+/// `X +- C1 cmp C2`, which is only valid if signed overflow cannot occur. There
+/// is no unsigned equivalent of that diagnostic, and `hi = mid` cannot underflow
+/// the way `hi = mid - 1` can, so this formulation sidesteps it rather than
+/// suppressing it. Costs one cluster build; see the gate note in tests/Makefile.
 [[nodiscard]] inline int findLte(VecRecord const &v, Key k) noexcept {
-  int lo = 0;
-  int hi = static_cast<int>(v.size) - 1;
+  uint32_t lo = 0;
+  uint32_t hi = v.size; // candidates live in [lo, hi)
   int found = -1;
-  while (lo <= hi) {
-    int const mid = lo + (hi - lo) / 2;
+  while (lo < hi) {
+    uint32_t const mid = lo + (hi - lo) / 2;
     if (v.e[mid].key <= k) {
-      found = mid;
+      found = static_cast<int>(mid);
       lo = mid + 1;
     } else {
-      hi = mid - 1;
+      hi = mid;
     }
   }
   return found;
