@@ -134,4 +134,25 @@ void instantiate_bootstrap(Conns &conns, ds::Layout const &layout, Bufs b,
   }
 }
 
+// The driver glue: a skip-vector future bound to DsState, in the contract
+// DsClient drives. This is the piece that was previously unverifiable until a
+// cluster build -- it needs DsState, which needs fmt and the connection
+// exchanger, both now stubbed for exactly this reason.
+void instantiate_future(ds::DsState &state, ds::QuorumStats &q, ds::GetStats &g,
+                        ds::PutStats &p, ds::WriteStats &w);
+void instantiate_future(ds::DsState &state, ds::QuorumStats &q, ds::GetStats &g,
+                        ds::PutStats &p, ds::WriteStats &w) {
+  ds::NullCache cache;
+  ds::SvFuture<ds::NullCache> f(state, /*id=*/0, cache, q, g, p, w);
+  f.doGet(42);
+  f.doPut(43, 4343, 2);
+  f.addToOngoingRDMA(0, -1);
+  (void)f.tryStepForward();
+  (void)f.isDone();
+  (void)f.isMeasuring();
+  (void)f.getStart();
+  (void)f.getResult().resolved;
+  (void)f.putResult().resolved;
+}
+
 int main() { return 0; }

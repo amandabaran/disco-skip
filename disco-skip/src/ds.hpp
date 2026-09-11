@@ -35,3 +35,6 @@
 // Needs dory, so it comes last and is what makes this header cluster-only.
 #include "ds_rdma.hpp"
 #include "ds_rdma_async.hpp"
+
+// Needs DsState, so it comes after the dory-facing headers.
+#include "ds_futures.hpp"

@@ -27,6 +27,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
+#include <string>
 
 #include <dory/conn/rc.hpp>
 #include <dory/extern/ibverbs.hpp>
@@ -90,6 +91,7 @@ class RdmaAsyncOps {
   /// @return completions the driver will see for this post
   size_t postHeaders(RemoteAddr a, VecOffset speculate) {
     size_t const n = conns_.size();
+    bumped_ = 0;
     spec_pending_ = speculate;
     NodeRecord *const hdrs = layout_.getNodeBufs(future_id_);
     VecRecord *const spec = layout_.getVecBufs(future_id_);
@@ -128,7 +130,7 @@ class RdmaAsyncOps {
     ++stats_.node_reads;
     stats_.replica_reads += n + (speculate != kNullVec ? 1u : 0u);
     if (speculate != kNullVec) ++stats_.speculated;
-    return completions;
+    return postedExactly(completions, "postHeaders");
   }
 
   /// Resolve the quorum over the buffered headers.
@@ -188,6 +190,7 @@ class RdmaAsyncOps {
   // ── A vector read, from a replica that voted with the winner (L4) ────────
 
   size_t postVec(VecOffset off) {
+    bumped_ = 0;
     auto &rc = *conns_[winner_];
     if (!rc.postSendSingle(dory::conn::ReliableConnection::RdmaRead, future_id_,
                            layout_.getDataVecBufs(future_id_), kVecRecordBytes,
@@ -197,7 +200,7 @@ class RdmaAsyncOps {
     bump(winner_, 1);
     ++stats_.vec_reads;
     ++stats_.replica_reads;
-    return 1;
+    return postedExactly(1, "postVec");
   }
 
   bool resolveVec(VecRecord &vec) {
@@ -212,6 +215,7 @@ class RdmaAsyncOps {
   /// rather than spinning, which is the whole point.
   size_t postBatch(Batch const &b) {
     if (!b.wellFormed()) return 0;
+    bumped_ = 0;
     size_t const n = conns_.size();
     batch_ = &b;
     stageBatchPayloads(b, layout_.getStageNode(future_id_),
@@ -226,7 +230,7 @@ class RdmaAsyncOps {
       bump(r, static_cast<int64_t>(c));
     }
     ++stats_.batches;
-    return completions;
+    return postedExactly(completions, "postBatch");
   }
 
   /// Did the batch's publishing CAS reach a majority (L1)?
@@ -265,6 +269,34 @@ class RdmaAsyncOps {
   void bump(size_t r, int64_t n) {
     to_poll_[r] += n;
     ongoing_[r] += n;
+    bumped_ += static_cast<size_t>(n);
+  }
+
+  /// Check that what we told the caller to await is what we actually queued.
+  ///
+  /// This is the one arithmetic error in the whole path that fails *silently*.
+  /// Return too few and the future steps on partial results -- a torn read it
+  /// will not notice. Return too many and it waits for a completion that never
+  /// comes, which on the cluster looks like a hung client with no error
+  /// anywhere. Neither is something a test off-cluster can catch, because the
+  /// fake applies posts immediately and never has an outstanding count.
+  ///
+  /// The value at risk is specifically the speculation chain: its first request
+  /// is unsignalled, so a post that speculates yields one completion for
+  /// replica 0's pair rather than two. It would be very easy to write
+  /// `replicas + 1`.
+  ///
+  /// Throws rather than asserts, because the release build defines NDEBUG and
+  /// this is a correctness invariant rather than a debugging aid. One integer
+  /// compare per post.
+  size_t postedExactly(size_t claimed, char const *what) {
+    if (claimed != bumped_) {
+      throw std::runtime_error(
+          std::string("completion accounting is wrong in ") + what +
+          ": told the driver to await " + std::to_string(claimed) +
+          " but queued " + std::to_string(bumped_));
+    }
+    return claimed;
   }
 
   Conns &conns_;
@@ -277,6 +309,7 @@ class RdmaAsyncOps {
   NodeAllocator *nodes_;
   VecAllocator *vecs_;
 
+  size_t bumped_ = 0;  ///< completions queued by the post in progress
   VecOffset spec_pending_ = kNullVec;
   size_t winner_ = 0;
   Batch const *batch_ = nullptr;

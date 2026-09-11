@@ -230,7 +230,9 @@ inline LevelStats levelStats(SkipVec const &sv, uint32_t level) {
 /// where it can be read next to the interface doc.
 class CacheAdapter {
  public:
-  explicit CacheAdapter(SkipVec &sv) : sv_(sv) {}
+  /// @param layers the runtime level count, which mirrorInsert needs to clamp
+  ///        a height against -- the cache asserts internally if one exceeds it
+  CacheAdapter(SkipVec &sv, uint32_t layers) : sv_(sv), layers_(layers) {}
 
   [[nodiscard]] RemoteAddr locateData(Key k) { return sv_.locate_data(k); }
 
@@ -239,10 +241,20 @@ class CacheAdapter {
     ds::reconcile(sv_, data_k_min, data_addr, path, levels);
   }
 
+  /// The write side. Absent until now, because the only caller was the blocking
+  /// Putter and it was always driven with a null cache -- so a real Put has
+  /// never reported a structural change to a real cache. An operation future
+  /// does both halves, so the adapter has to cover both.
+  void mirrorInsert(Key k, uint32_t height, RemoteAddr data_addr,
+                    std::array<RemoteAddr, kMaxLayers> const &index_addrs) {
+    ds::mirrorInsert(sv_, k, height, data_addr, index_addrs, layers_);
+  }
+
   SkipVec &sv() { return sv_; }
 
  private:
   SkipVec &sv_;
+  uint32_t layers_;
 };
 
 }  // namespace ds

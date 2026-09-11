@@ -73,7 +73,7 @@ static void checkGetAgainstOracleWithCache() {
   cfg.layers = static_cast<int>(kLayers);
   ds::SkipVec sv(&cfg);
   ds::bootstrapHeads(sv, ds::headAddrs(kLayers));
-  ds::CacheAdapter cache(sv);
+  ds::CacheAdapter cache(sv, kLayers);
 
   ds::GetStats stats;
   ds::Getter<FakeOps, ds::CacheAdapter> g(ops, cache, kLayers, stats);
@@ -111,7 +111,7 @@ static void checkCacheActuallyReducesWork() {
     cfg.layers = static_cast<int>(kLayers);
     ds::SkipVec sv(&cfg);
     ds::bootstrapHeads(sv, ds::headAddrs(kLayers));
-    ds::CacheAdapter cache(sv);
+    ds::CacheAdapter cache(sv, kLayers);
     ds::NullCache null_cache;
 
     std::vector<ds::Key> keys;
@@ -201,7 +201,7 @@ static void checkC4IsDetectedNotMisanswered() {
   cfg.layers = static_cast<int>(kLayers);
   ds::SkipVec sv(&cfg);
   ds::bootstrapHeads(sv, ds::headAddrs(kLayers));
-  ds::CacheAdapter cache(sv);
+  ds::CacheAdapter cache(sv, kLayers);
 
   // Install a deliberately wrong hint: every key in the range claims to live
   // in the first data node.
@@ -235,7 +235,7 @@ static void checkGetHelpsInFlightWrites() {
   cfg.layers = static_cast<int>(kLayers);
   ds::SkipVec sv(&cfg);
   ds::bootstrapHeads(sv, ds::headAddrs(kLayers));
-  ds::CacheAdapter cache(sv);
+  ds::CacheAdapter cache(sv, kLayers);
 
   ds::GetStats stats;
   ds::Getter<FakeOps, ds::CacheAdapter> g(ops, cache, kLayers, stats);

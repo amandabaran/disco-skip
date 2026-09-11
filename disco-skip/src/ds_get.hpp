@@ -21,6 +21,7 @@
 // Step 3 is the whole reason a stale cache costs round trips rather than wrong
 // answers: the range check is what turns a bad hint into a detected one.
 
+#include <array>
 #include <cstdint>
 
 #include "ds_defs.hpp"
@@ -161,9 +162,15 @@ class Getter {
 /// A cache that never hints and never learns, for the DS_CACHE_ENABLED=0
 /// baseline. Every Get then costs a full traversal, which is the number the
 /// cache has to beat.
+/// Satisfies the WHOLE operation surface -- both halves -- because a single
+/// future runs either a Get or a Put and is constructed with one cache type.
+/// ds_put.hpp's NullPutCache remains the write-only subset, for the blocking
+/// Putter's existing call sites.
 struct NullCache {
   [[nodiscard]] RemoteAddr locateData(Key) const { return RemoteAddr{}; }
   void reconcile(Key, RemoteAddr, PathStep const *, uint32_t) {}
+  void mirrorInsert(Key, uint32_t, RemoteAddr,
+                    std::array<RemoteAddr, kMaxLayers> const &) {}
 };
 
 }  // namespace ds

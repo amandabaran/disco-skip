@@ -111,7 +111,9 @@ class PutOperation {
   }
 
   size_t beginTraversal() {
-    if (++attempts_ > detail::kMaxPutAttempts) return done(false);
+    if (++attempts_ > static_cast<uint32_t>(detail::kMaxPutAttempts)) {
+      return done(false);
+    }
     step_ = PutStep::Traversing;
     ++stats_.traversals;
     return trav_.start(k_, layers_, path_);
@@ -441,7 +443,7 @@ class PutOperation {
 
       case PutPhase::ClimbSplit:
         if (created_ != path_[level_].addr) ++stats_.index_splits;
-        index_[static_cast<size_t>(level_)] = created_;
+        index_[level_] = created_;
         down_ = created_;
         ++level_;
         return nextClimbOrTop();
@@ -466,7 +468,7 @@ class PutOperation {
   }
 
   size_t nextClimbOrTop() {
-    if (static_cast<uint32_t>(level_) + 2 <= height_) {
+    if (level_ + 2 <= height_) {
       phase_ = PutPhase::ClimbSplit;
       target_ = path_[level_].addr;
       split_key_ = k_;
@@ -517,11 +519,11 @@ class PutOperation {
   PutStep step_ = PutStep::Idle;
   PutPhase phase_ = PutPhase::DataInsert;
   PutPhase resume_phase_ = PutPhase::DataInsert;
-  int attempts_ = 0;
+  uint32_t attempts_ = 0;  ///< unsigned: see the note in ds_async.hpp
 
   RemoteAddr target_{}, data_addr_{}, created_{}, created_data_{}, down_{};
   RemoteAddr top_orphan_{};
-  int level_ = 0;
+  uint32_t level_ = 0;  ///< unsigned: see the note in ds_async.hpp
   Key split_key_ = 0;
   Entry seed_{};
   bool have_seed_ = false;

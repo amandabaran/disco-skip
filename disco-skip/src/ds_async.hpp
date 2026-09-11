@@ -77,8 +77,9 @@ class TraversalFuture {
     for (uint32_t i = 0; i < layers; ++i) path[i] = PathStep{};
 
     res_ = TraversalResult{};
-    level_ = static_cast<int>(layers) - 1;
-    cur_ = headAddr(static_cast<uint32_t>(level_));
+    level_ = layers - 1;
+    at_data_ = false;
+    cur_ = headAddr(level_);
     have_vec_ = false;
     hops_ = 0;
     settle_tries_ = 0;
@@ -133,7 +134,7 @@ class TraversalFuture {
     if (!ops_.resolveHeaders(cur_, node_, have_vec_, vec_)) {
       // No majority-supported handle yet: a commit is in flight. Re-poll
       // rather than guess, exactly as the blocking quorum read does.
-      if (++settle_tries_ > detail::kMaxSettleAttempts) {
+      if (++settle_tries_ > static_cast<uint32_t>(detail::kMaxSettleAttempts)) {
         return fail(TraversalStatus::ReadFailed);
       }
       return postHeaders();
@@ -191,7 +192,7 @@ class TraversalFuture {
     bool const pending = vec_.isPending();
     bool const unstable = !node_.isStable();
     if (pending || unstable) {
-      if (++settle_tries_ > detail::kMaxSettleAttempts) {
+      if (++settle_tries_ > static_cast<uint32_t>(detail::kMaxSettleAttempts)) {
         return fail(TraversalStatus::ReadFailed);
       }
       // The same batch settleNode() would build, in the same order -- the tail
@@ -219,7 +220,7 @@ class TraversalFuture {
     }
     settle_tries_ = 0;
 
-    if (level_ < 0) {
+    if (at_data_) {
       // The data node. Report it, and whether k is actually here.
       res_.data_addr = cur_;
       res_.data_k_min = node_.k_min;
@@ -234,7 +235,7 @@ class TraversalFuture {
     }
 
     // An index level. Record what it saw, then step down.
-    uint32_t const L = static_cast<uint32_t>(level_);
+    uint32_t const L = level_;
     path_[L].k_min = node_.k_min;
     path_[L].addr = cur_;
     path_[L].first_down =
@@ -245,7 +246,16 @@ class TraversalFuture {
     if (idx < 0) return fail(TraversalStatus::Miss);
 
     cur_ = RemoteAddr{vec_.e[idx].val};
-    --level_;
+    // Unsigned cursor plus an explicit at-data flag, rather than letting the
+    // level go to -1. A signed decrement followed by `level_ < 0` is the
+    // `X - C1 cmp C2` shape the dory toolchain rejects at
+    // -Wstrict-overflow=5 -- the same diagnostic that cost a cluster build in
+    // findLte. There is no unsigned equivalent of that warning.
+    if (L == 0) {
+      at_data_ = true;
+    } else {
+      --level_;
+    }
     have_vec_ = false;
     hops_ = 0;
     return postHeaders();
@@ -257,13 +267,15 @@ class TraversalFuture {
   PathStep *path_ = nullptr;
 
   TraversalStep step_ = TraversalStep::Idle;
-  int level_ = 0;            ///< >= 0 is an index level; -1 is the data node
+  uint32_t level_ = 0;       ///< the index level being traversed
+  bool at_data_ = false;     ///< past level 0: `cur_` is a data node
   RemoteAddr cur_{};
   NodeRecord node_{};
   VecRecord vec_{};
   bool have_vec_ = false;
   uint32_t hops_ = 0;
-  int settle_tries_ = 0;
+  uint32_t settle_tries_ = 0;  ///< unsigned: `++x > C` on an int is the
+                              ///< shape -Wstrict-overflow=5 rejects
   TraversalResult res_{};
 };
 
