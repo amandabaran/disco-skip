@@ -37,7 +37,7 @@ const uint64_t default_iter_count = 1'000'000;
 const uint64_t default_keepwarm   =   500'000;
 
 
-enum OpType { OpGet, OpPut, OpScan };
+enum OpType { OpGet, OpPut, OpScan, OpInsert };
 
 struct YcsbOp {
     uint64_t target_reg;
@@ -776,6 +776,27 @@ int main(int argc, char** argv) {
                         uint64_t target_reg = std::stoull(key.substr(4)) % layout.num_registers;
                         operations.push_back({target_reg, OpPut, 0});
                     } 
+                    else if (!(std::strncmp("INSERT ", line.c_str(), 7))) {
+                        auto keystart = std::string("INSERT usertable ").length();
+                        auto keyend = line.find(" [", keystart);
+                        auto key = line.substr(keystart, keyend - keystart);
+
+                        // NO MODULO, unlike every other op here, and that is the
+                        // whole point. YCSB draws run-phase insert keys from a
+                        // counter that starts at recordcount, so `% num_registers`
+                        // would fold them straight back onto keys the load phase
+                        // already wrote -- turning every insert into an update and
+                        // silently deleting the only difference between workload D
+                        // or E and workload B or C. The skip vector takes an
+                        // arbitrary uint64 key, so the raw value is used.
+                        //
+                        // BUDGET THE ARENA FOR THESE. An insert allocates a vector
+                        // and may split, and nothing is reclaimed, so
+                        // --vecs-per-client has to cover recordcount plus the
+                        // inserts the run will issue.
+                        uint64_t const insert_key = std::stoull(key.substr(4));
+                        operations.push_back({insert_key, OpInsert, 0});
+                    }
                     else if (!(std::strncmp("SCAN ", line.c_str(), 5))) {
                         auto keystart = std::string("SCAN usertable ").length();
                         auto keyend = line.find(" ", keystart);
@@ -790,7 +811,25 @@ int main(int argc, char** argv) {
                     }
                 }
             }
-            std::cout << "Done. Packed " << operations.size() << " operations structural states." << std::endl;
+            {
+                // Report the mix. The run phase used to parse READ/UPDATE/SCAN
+                // and drop INSERT on the floor, so a workload with inserts ran
+                // silently short and looked like a different workload. Printing
+                // the breakdown is how that stays visible.
+                size_t n_get = 0, n_put = 0, n_scan = 0, n_ins = 0;
+                for (auto const &o : operations) {
+                    switch (o.type) {
+                        case OpGet:    ++n_get;  break;
+                        case OpPut:    ++n_put;  break;
+                        case OpScan:   ++n_scan; break;
+                        case OpInsert: ++n_ins;  break;
+                    }
+                }
+                std::cout << "Done. Packed " << operations.size()
+                          << " operations: " << n_get << " read, " << n_put
+                          << " update, " << n_scan << " scan, " << n_ins
+                          << " insert." << std::endl;
+            }
 
             std::cout << "Waiting for the initialization of other clients... " << std::flush;
             ce.announceReady(store, "qp", "initialized");
@@ -854,6 +893,24 @@ int main(int argc, char** argv) {
                         break;
                     }
                     case OpPut: {
+                        uint32_t const h = ds::drawHeight(
+                            height_rng, static_cast<uint32_t>(layout.cache_layers));
+                        client.getFreeFuture().doPut(op.target_reg, 69, h, measuring);
+                        break;
+                    }
+                    case OpInsert: {
+                        // Mechanically the same call as OpPut -- a put of an
+                        // absent key IS an insert, and F1/F2 decide which by
+                        // looking at the node. Kept as its own case so the
+                        // counts below can separate "rewrote a loaded key" from
+                        // "grew the structure", which are different costs: an
+                        // insert is the only op that can force a split.
+                        //
+                        // CAVEAT ON LONG RUNS. `operations` is cycled when
+                        // total_iter_count exceeds its length, so on the second
+                        // pass these keys already exist and the op degrades to
+                        // an update. The counter below reports issued inserts,
+                        // not distinct keys.
                         uint32_t const h = ds::drawHeight(
                             height_rng, static_cast<uint32_t>(layout.cache_layers));
                         client.getFreeFuture().doPut(op.target_reg, 69, h, measuring);
