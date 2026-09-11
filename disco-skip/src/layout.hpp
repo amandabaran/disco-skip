@@ -59,6 +59,19 @@ struct Layout {
     bool consult_cache;
     bool writeback;
 
+    // Whether to time individual operations.
+    //
+    // ON BY DEFAULT, and that is the fair setting rather than the convenient
+    // one: swarm-kv and fusee both record latency unconditionally inside their
+    // measurement window and neither has a switch, so a disco-skip run with
+    // this off is not comparable with them. Turning it off costs two
+    // clock_gettime calls and a profiler update per operation -- tens of ns
+    // against a ~4 us operation, so low single-digit percent -- which is worth
+    // removing for a pure throughput figure and worth keeping for anything
+    // that plots latency. A run with it off reports no GET/PUT stats sections
+    // at all, so the omission is visible rather than silent.
+    bool measure_latency;
+
     // Where a version's timestamp comes from. Clock is the default and the only
     // mode that is correct at more than one client while keeping the fault
     // tolerance replication exists to provide; Tsc and Faa are here so that the

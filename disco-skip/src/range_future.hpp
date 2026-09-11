@@ -40,7 +40,9 @@ public:
     void doRange(uint64_t sk, uint64_t ek, bool _measuring = false) {
         start_key = sk;
         range_len = (ek - sk) + 1;
-        measuring = _measuring;
+        // See Layout::measure_latency. Gated before the timestamp, not just
+        // before the recording, so --latency 0 really removes the cost.
+        measuring = _measuring && state.layout.measure_latency;
         if (measuring) start_time = std::chrono::steady_clock::now();
 
         if (range_len > state.layout.max_range) {

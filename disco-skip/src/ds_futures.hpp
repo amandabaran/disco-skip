@@ -94,12 +94,14 @@ class SvFuture : public BasicFuture {
     begin(Kind::Get, measuring);
     awaiting_ = get_.start(k);
     settleIfImmediate();
+    recordIfDone();
   }
 
   void doPut(Key k, Value v, uint32_t height, bool measuring = false) {
     begin(Kind::Put, measuring);
     awaiting_ = put_.start(k, v, height);
     settleIfImmediate();
+    recordIfDone();
   }
 
   void addToOngoingRDMA(size_t server_idx, int64_t n) {
@@ -126,6 +128,7 @@ class SvFuture : public BasicFuture {
     }
     awaiting_ = (kind_ == Kind::Get) ? get_.step() : put_.step();
     settleIfImmediate();
+    recordIfDone();
     return true;
   }
 
@@ -143,9 +146,40 @@ class SvFuture : public BasicFuture {
  private:
   void begin(Kind k, bool measuring) {
     kind_ = k;
-    measuring_ = measuring;
+    // Gated HERE rather than in recordIfDone() so that --latency 0 also skips
+    // the start_ timestamp: gating only the recording would leave one of the
+    // two clock_gettime calls in place and quietly halve the saving.
+    measuring_ = measuring && state.layout.measure_latency;
     steps_ = 0;
+    recorded_ = false;
     if (measuring) start_ = std::chrono::steady_clock::now();
+  }
+
+  /// Feed the latency profilers when the operation completes.
+  ///
+  /// THIS WAS MISSING, and silently. begin() stamped start_ and exposed it
+  /// through isMeasuring()/getStart() for a caller to use, and no caller ever
+  /// did -- only RangeFuture recorded anything. So get_profiler and
+  /// put_profiler stayed empty, reportStats() skipped both (it prints a section
+  /// only when getMeasurementCount() > 0), and a benchmark log contained no
+  /// per-operation latency at all. The failure mode was a MISSING SECTION
+  /// rather than a zero, which is why it survived: nothing looked wrong, the
+  /// latency panel of a figure was simply blank for this system while the
+  /// comparison systems filled theirs in.
+  ///
+  /// Recorded here rather than in the driver because "the operation finished"
+  /// is a fact this class owns; asking every call site to notice it is how it
+  /// came to be missed. Guarded by recorded_ so a future that is stepped again
+  /// after completing cannot double-count.
+  void recordIfDone() {
+    if (!measuring_ || recorded_ || !isDone()) return;
+    recorded_ = true;
+    timepoint const end = std::chrono::steady_clock::now();
+    if (kind_ == Kind::Get) {
+      state.addGetMeasurement(start_, end);
+    } else if (kind_ == Kind::Put) {
+      state.addPutMeasurement(start_, end);
+    }
   }
 
   /// An operation can finish without ever going to the fabric -- a cache miss
@@ -171,6 +205,7 @@ class SvFuture : public BasicFuture {
 
   Kind kind_ = Kind::None;
   bool measuring_ = false;
+  bool recorded_ = false;
   timepoint start_{};
   size_t awaiting_ = 0;
   uint64_t steps_ = 0;

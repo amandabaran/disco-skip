@@ -332,6 +332,7 @@ int main(int argc, char** argv) {
     layout.consult_cache     = DS_CACHE_ENABLED ? true : false;
     layout.writeback         = DS_REG_WRITEBACK_ENABLED ? true : false;
     layout.ts_mode           = ds::TsMode::Clock;
+    layout.measure_latency   = true;
 
     // Set by client at runtime after MR is allocated.
     // (Same pattern as swarm-kv: see Layout::client_local_region)
@@ -406,6 +407,15 @@ int main(int argc, char** argv) {
             "Bootstrap the structure, verify invariants I1-I4 over RDMA, and "
             "exit (1 or 0). Needs no YCSB and runs on a single server/client "
             "pair. Takes a value, like --cache and --ml: pass --selftest 1.") |
+        lyra::opt(layout.measure_latency, "measure_latency")
+            .optional()["--latency"](
+                "Time individual operations (1 or 0, default 1). 0 removes two "
+                "clock_gettime calls and a profiler update per operation, for a "
+                "throughput figure that is not paying for latency it will not "
+                "plot. NOT COMPARABLE with swarm-kv or fusee when off: both "
+                "record unconditionally and neither has a switch. With 0 the "
+                "GET/PUT stats sections are absent from the log rather than "
+                "zero, so the omission is visible.") |
         lyra::opt(ts_mode_name, "ts_mode").optional()["--ts"](
             "Timestamp source: clock|tsc|faa (default clock). clock is a "
             "disciplined CLOCK_REALTIME and is the only mode correct at more "
@@ -521,6 +531,21 @@ int main(int argc, char** argv) {
 
     if (is_client) {
         std::cout << "Workload: " << workload << std::endl;
+        // RECORD THE CONFIGURATION IN THE LOG, not just in the shell history
+        // that launched it. The timestamp mode was printed only by the
+        // --selftest path, so a benchmark log carried no record of which clock
+        // produced its old_ver chains -- and `clock` vs `tsc` vs `faa` changes
+        // both the per-write round-trip count and what the numbers mean. A
+        // result whose configuration has to be reconstructed from a script is
+        // a result nobody can check.
+        std::cout << "timestamps:   " << ds::tsModeName(layout.ts_mode)
+                  << std::endl;
+        std::cout << "cache:        " << (layout.consult_cache ? "on" : "off")
+                  << "  offset-hint: " << (layout.offset_hint ? "on" : "off")
+                  << "  async: " << layout.async_parallelism
+                  << "  maxrange: " << layout.max_range
+                  << "  latency: " << (layout.measure_latency ? "on" : "off")
+                  << std::endl;
     }
 
     // ─── Device + port ─────────────────────────────────────────────
