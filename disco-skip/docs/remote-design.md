@@ -259,11 +259,37 @@ Recorded so they are not re-proposed.
 | Point-read orchestration | `src/ds_get.hpp` | done, tested against the real cache |
 | Cache glue | `src/ds_cache.hpp` | done |
 | Blocking RDMA + `RdmaOps` | `src/ds_rdma.hpp` | written, compiles, validated only via `--selftest` |
-| **F1 insert** | — | **not started** |
-| **F2 split + Update_Index** | — | **not started** |
+| **F1 insert, F2 split** | `src/ds_insert.hpp` | done, tested |
+| **Write orchestration + Update_Index** | `src/ds_put.hpp` | done, tested |
+| `--selftest` body | `src/ds_selftest.hpp` | done; templated so it runs off-cluster too |
 | Future-based (pipelined) path | — | not started; blocking helpers are sequential, so the offset hint's doorbell batching is not yet realised |
 | 3-way replication | — | not started; `DS_N_REPLICAS=1` only |
 | Deletes, reclamation, range queries | — | deferred (A7, A9, A10) |
+
+### How the write path is split across the two headers
+
+`ds_insert.hpp` is the mechanism and knows nothing about levels: `insertEntry` is F1,
+`splitAt` is F2, `insertWithOverflow` is F1 with a capacity split behind it. All three are
+level-agnostic, because a split of an index node and a split of a data node are the same
+operation on the same layout.
+
+`ds_put.hpp` is the policy, and is where height enters — the climb of §5, plus the one
+`mirror_insert` call. It is the write-side twin of `ds_get.hpp`, and like it composes the
+cache and the wire without either calling the other.
+
+Two properties worth knowing before changing either:
+
+- **The helping protocol lives in one place.** `settleNode()` in `ds_descend.hpp` is shared
+  by the descent and by both write primitives rather than copied into each. A write must
+  settle a node *and find it stable* before CASing its handle, because a stable node has had
+  any split descriptor propagated into its header — which is what makes it safe for the new
+  version to carry no descriptor of its own.
+- **Every step is idempotent, which is what makes a partially applied climb safe to
+  abandon.** `splitAt` at a key that is already a node's `k_min` is a no-op returning that
+  node, so a retry after the data split succeeded but a level-1 split lost its CAS re-derives
+  the same structure instead of building a second copy. That no-op path must still apply the
+  seed: skipping it made a repeated height-driven put report success while never writing the
+  value, which is a silently stale payload over a structurally correct index.
 
 ### Height-driven splits
 
@@ -282,7 +308,20 @@ no index structure and needs no cache call at all.
    work. But if `ts` were ever to become the tag, it lives in the vector and a tag read
    would drag the vector along. Fine as is; revisit with replication.
 2. **The helper's clock.** `RdmaOps::now()` is `steady_clock`: monotonic per process, which
-   keeps `old_ver` locally ordered and orders **nothing across clients**. A10 needs a
-   PTP-disciplined read and a measured ε. A wrong clock here produces wrong range-query
-   results rather than a crash.
+   keeps `old_ver` locally ordered and orders **nothing across clients** — its epoch is boot
+   time, so two nodes' values differ by their uptime difference. A10 needs a disciplined read
+   and a measured ε. A wrong clock here produces wrong range-query results rather than a
+   crash.
+
+   **Now measured** — see [`clock-measurements.md`](clock-measurements.md). Relative TSC
+   frequency error across the 12 testbed nodes is **14.31 ppm** (noise floor 0.43 ppm), which
+   from a single sync point accumulates to **143 µs over a 10 s run** against ~2 µs
+   operations. So `rdtsc` plus a one-shot reset does not work: the reset fixes offset and
+   leaves rate error to accumulate. A disciplined `CLOCK_REALTIME` read through the vDSO
+   costs only 11 ns more than raw `rdtscp` (31.4 ns vs 20.1 ns), so keeping `rdtsc` and
+   dropping the one-shot reset is not a trade-off. Three consequences, which differ and
+   should not be conflated: **no effect** on point reads, F1 or F2, since nothing compares
+   timestamps; **detectable** in the verifier, whose `old_ver` chain check becomes a
+   cross-machine clock assertion once F1 runs multi-client; **a silent wrong answer** only
+   in A10. Step 3/4 is therefore unblocked.
 3. **A7 / A9** — deletes and reclamation, both deferred deliberately.
