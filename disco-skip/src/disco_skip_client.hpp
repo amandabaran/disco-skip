@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstdint>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 #include <dory/conn/rc-exchanger.hpp>
@@ -95,8 +97,34 @@ public:
                 }
                 
                 uint64_t raw_id = wc.wr_id;
+
+                // A completion whose id is not a future's is a routing bug, and
+                // it has to be caught here: the id is used as an index, so the
+                // alternative is an out_of_range from inside a vector with a
+                // number like 9223372036854775807 in it and nothing to say what
+                // posted it. That is exactly what happened when postBatchChain
+                // hardcoded kBlockingWrId -- every async batch completion
+                // routed to range_futures.at(2^63 - 1).
+                //
+                // kBlockingWrId is all ones, so it survives the top-bit strip
+                // as INT64_MAX and cannot be a legal future index.
+                if (raw_id == kBlockingWrId) {
+                    throw std::runtime_error(
+                        "a blocking helper's completion reached the future "
+                        "driver: something on the async path posted with "
+                        "kBlockingWrId instead of its future id, so its "
+                        "completions cannot be routed");
+                }
+
                 bool is_range_op = (raw_id >> 63) != 0;
                 uint64_t clean_id = raw_id & ~(1ULL << 63);
+                uint64_t const slots = state.layout.async_parallelism;
+                if (clean_id >= slots) {
+                    throw std::runtime_error(
+                        "completion for future " + std::to_string(clean_id) +
+                        " but only " + std::to_string(slots) +
+                        " slots exist: a work-request id was not a future id");
+                }
 
                 if (is_range_op) {
                     range_futures.at(clean_id).addToOngoingRDMA(s, -1);

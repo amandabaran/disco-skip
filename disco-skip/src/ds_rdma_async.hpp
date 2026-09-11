@@ -225,7 +225,8 @@ class RdmaAsyncOps {
       size_t const c = postBatchChain(
           *conns_[r], layout_, b, layout_.getStageNode(future_id_),
           layout_.getStageVec(future_id_),
-          layout_.casBufsFor(future_id_, r), /*doorbell=*/true);
+          layout_.casBufsFor(future_id_, r), /*doorbell=*/true,
+          /*wr_id=*/future_id_);
       completions += c;
       bump(r, static_cast<int64_t>(c));
     }

@@ -156,6 +156,17 @@ void writeVecAllReplicas(Conns &conns, Layout const &layout, VecRecord *staging,
 /// done. Copying per replica would also mean writing over a buffer whose bytes
 /// another replica's HCA might still be reading.
 ///
+/// @param wr_id  the work-request id every request in the chain carries. THIS
+///        IS HOW A COMPLETION FINDS ITS OWNER: the blocking path passes
+///        kBlockingWrId because it drains its own completions, and the async
+///        path MUST pass the future's id or the driver routes the completion to
+///        whatever future that number names. It was hardcoded to kBlockingWrId
+///        here, which sent every async batch completion to
+///        `range_futures.at(2^63 - 1)` -- kBlockingWrId is all ones, and the
+///        driver reserves the top bit for range futures, so it strips it and
+///        indexes with the rest. A smoke run found it immediately; the
+///        completion-count assertion could not, because the counts were right
+///        and only the routing was wrong.
 /// @param stage_vecs  kMaxBatchVecWrites slots. Distinct *within* a chain,
 ///                    because every write in it is in flight at once; shared
 ///                    *across* replicas, because the bytes are identical.
@@ -166,7 +177,7 @@ void writeVecAllReplicas(Conns &conns, Layout const &layout, VecRecord *staging,
 template <class Conn>
 size_t postBatchChain(Conn &rc, Layout const &layout, Batch const &b,
                       NodeRecord *stage_nodes, VecRecord *stage_vecs,
-                      uint64_t *cas_bufs, bool doorbell) {
+                      uint64_t *cas_bufs, bool doorbell, uint64_t wr_id) {
   if (b.size() == 0 || !b.wellFormed()) return 0;
 
   struct ibv_send_wr wr[kMaxBatchOps];
@@ -182,7 +193,7 @@ size_t postBatchChain(Conn &rc, Layout const &layout, Batch const &b,
         VecRecord *slot = &stage_vecs[vec_slot++];
         rc.prepareSingle(wr[i], sg[i],
                          dory::conn::ReliableConnection::RdmaWrite,
-                         kBlockingWrId, slot, kVecRecordBytes,
+                         wr_id, slot, kVecRecordBytes,
                          layout.vecAddrOf(rc.remoteBuf(), o.off), signaled);
         break;
       }
@@ -190,34 +201,34 @@ size_t postBatchChain(Conn &rc, Layout const &layout, Batch const &b,
         NodeRecord *slot = &stage_nodes[node_slot++];
         rc.prepareSingle(wr[i], sg[i],
                          dory::conn::ReliableConnection::RdmaWrite,
-                         kBlockingWrId, slot, kNodeRecordBytes,
+                         wr_id, slot, kNodeRecordBytes,
                          Layout::nodeAddrOf(rc.remoteBuf(), o.addr), signaled);
         break;
       }
       case BatchKind::CasHandle:
-        rc.prepareSingleCas(wr[i], sg[i], kBlockingWrId, &cas_bufs[i],
+        rc.prepareSingleCas(wr[i], sg[i], wr_id, &cas_bufs[i],
                             Layout::nodeAddrOf(rc.remoteBuf(), o.addr),
                             o.expected, o.desired, signaled);
         // F3. Must come after prepareSingleCas, which assigns send_flags.
         wr[i].send_flags |= IBV_SEND_FENCE;
         break;
       case BatchKind::CasTs:
-        rc.prepareSingleCas(wr[i], sg[i], kBlockingWrId, &cas_bufs[i],
+        rc.prepareSingleCas(wr[i], sg[i], wr_id, &cas_bufs[i],
                             layout.vecTsAddrOf(rc.remoteBuf(), o.off),
                             o.expected, o.desired, signaled);
         break;
       case BatchKind::CasNextId:
-        rc.prepareSingleCas(wr[i], sg[i], kBlockingWrId, &cas_bufs[i],
+        rc.prepareSingleCas(wr[i], sg[i], wr_id, &cas_bufs[i],
                             Layout::nextIdAddrOf(rc.remoteBuf(), o.addr),
                             o.expected, o.desired, signaled);
         break;
       case BatchKind::CasNextKMin:
-        rc.prepareSingleCas(wr[i], sg[i], kBlockingWrId, &cas_bufs[i],
+        rc.prepareSingleCas(wr[i], sg[i], wr_id, &cas_bufs[i],
                             Layout::nextKMinAddrOf(rc.remoteBuf(), o.addr),
                             o.expected, o.desired, signaled);
         break;
       case BatchKind::CasTailWord:
-        rc.prepareSingleCas(wr[i], sg[i], kBlockingWrId, &cas_bufs[i],
+        rc.prepareSingleCas(wr[i], sg[i], wr_id, &cas_bufs[i],
                             Layout::tailWordAddrOf(rc.remoteBuf(), o.addr),
                             o.expected, o.desired, signaled);
         break;
@@ -555,7 +566,8 @@ class RdmaOps : public RdmaNodeReader<Conns> {
     uint64_t *cas = cas_buf_;
     stageBatchPayloads(b, stage_node_, stage_vec_);
     size_t const to_drain =
-        postBatchChain(rc, layout_, b, stage_node_, stage_vec_, cas, doorbell_);
+        postBatchChain(rc, layout_, b, stage_node_, stage_vec_, cas, doorbell_,
+                       kBlockingWrId);
     if (to_drain == 0) return out;
     for (size_t i = 0; i < to_drain; ++i) detail::awaitOne(rc, "chained batch");
     ++batches_;
@@ -779,7 +791,7 @@ class RdmaReplicaSet {
       committed[r] = false;
       to_drain[r] = postBatchChain(*conns_[r], layout_, b, stage_node_,
                                    stage_vec_, &cas_bufs_[r * kMaxBatchOps],
-                                   doorbell_);
+                                   doorbell_, kBlockingWrId);
       if (to_drain[r] > 0) {
         writes_ += b.vecWrites() + b.nodeWrites();
         cas_ += b.size() - b.vecWrites() - b.nodeWrites();
