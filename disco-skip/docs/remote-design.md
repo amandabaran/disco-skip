@@ -262,8 +262,10 @@ Recorded so they are not re-proposed.
 | **F1 insert, F2 split** | `src/ds_insert.hpp` | done, tested |
 | **Write orchestration + Update_Index** | `src/ds_put.hpp` | done, tested |
 | `--selftest` body | `src/ds_selftest.hpp` | done; templated so it runs off-cluster too |
+| Chained work-request batches | `src/ds_batch.hpp` | done, tested |
+| CAS-ABD quorum (L1-L5) | `src/ds_quorum.hpp` | done, tested against a fake replica set; not yet run on 3 servers |
 | Future-based (pipelined) path | — | not started; blocking helpers are sequential, so the offset hint's doorbell batching is not yet realised |
-| 3-way replication | — | not started; `DS_N_REPLICAS=1` only |
+| 3-way replication | `src/ds_quorum.hpp` | quorum read, 2-of-3 commit and writeback built and tested; a 3-server cluster run is the remaining step |
 | Deletes, reclamation, range queries | — | deferred (A7, A9, A10) |
 
 ### How the write path is split across the two headers
@@ -290,6 +292,67 @@ Two properties worth knowing before changing either:
   the same structure instead of building a second copy. That no-op path must still apply the
   seed: skipping it made a repeated height-driven put report success while never writing the
   value, which is a silently stale payload over a structurally correct index.
+
+### Round trips, and why writes go out as batches
+
+The operations of §2 are sequences -- F1 is a write then two CASes, F2 is three
+writes then six. Issued one at a time each costs a round trip, and at three
+replicas a per-replica loop multiplies that, so replication would cost *latency*
+rather than only bandwidth. That is the wrong shape: the whole reason the cache
+exists is that round trips are the scarce thing.
+
+So the Ops surface takes **batches** (`ds_batch.hpp`) at the points where a
+sequence is issued. A batch becomes a linked list of work requests posted with
+one `postSend`, which is one round trip for the whole chain -- the idiom
+`swarm-kv/src/unreliable_maxreg.hpp` uses. Replicas are fanned out the way
+`chimera/src/put_future.hpp` does it: every replica's chain is posted *before*
+any of them is drained, so the three overlap.
+
+Measured over the `--selftest` script, nine puts:
+
+| | round trips | operations carried |
+|---|---|---|
+| `DS_N_REPLICAS=1` | 16 | 57 |
+| `DS_N_REPLICAS=3` | **16** | 133 |
+
+The round trips do not move. That is the property to preserve, and
+`quorum_test.cc` asserts it directly rather than leaving it to be re-derived.
+
+Two things the chain buys beyond speed:
+
+- **Ordering becomes structural.** F2 needs `tail_struct_ver` CAS'd last, and
+  that used to hold because the calls appeared in the right order in the source.
+  Same-QP RC ordering now enforces it.
+- **The fence has somewhere to live.** F3 needs the staged writes visible at the
+  remote HCA before the publishing CAS. With blocking helpers that came free --
+  each waited for its own completion, which is strictly stronger. In a chain
+  nothing waits, so the publishing CAS carries `IBV_SEND_FENCE`. **dory never
+  sets that flag** (nothing in `conn/`, `swarm-kv/`, `chimera/` or `fusee/`
+  does), and `prepareSingleCas` *assigns* `send_flags` rather than OR-ing, so it
+  has to be added after preparing. F3 was, until now, an invariant no code
+  implemented.
+
+### Replication: two decisions beyond what invariants.md spells out
+
+**The commit attempts every replica, not a fixed majority subset.**
+`DsState::quorum_indices` picks a fixed majority per client and the legacy
+register path uses it; doing that here deadlocks. Client A holding `{0,1}` commits
+and leaves R2 lagged; client B holding `{1,2}` then CASes the value it read on
+`{1,2}`, R1 succeeds, R2 fails because it still holds the old handle -- one
+success, short of majority, forever, because nothing in that loop repairs R2. So
+L1's "2/3 CAS success" must mean *attempt three, require two*, which also demotes
+L5's writeback to the accelerant §4.1 claims it is rather than something
+correctness quietly depends on.
+
+**The read takes the highest tag with majority support**, which is stronger than
+L2 as written. L2's max-tag rule is right whenever every distinct handle is either
+committed or absent. A *partially* applied commit breaks that: two writers bumping
+from the same predecessor produce two different handles with the **same** tag,
+since both bump `content_ver` once, so L3's order cannot separate them and picking
+the uncommitted one would return contents no majority ever held. Reading every
+replica makes it decidable. **This is a deliberate strengthening of L2 and
+`invariants.md` should say so** -- flagged rather than adopted silently, since
+that document governs both halves.
 
 ### Height-driven splits
 

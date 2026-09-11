@@ -198,6 +198,7 @@ DESCENT PASS: every probe reached the data node and reported absent
 puts:         9 resolved, 0 failed (6 data-only, 3 structural)
 splits:       2 data, 1 index, 0 capacity; 1 boundary no-op(s)
 rdma writes:  3 nodes, 16 vectors, 5312 bytes; 38 CAS total
+round trips:  16 chained batches carrying 57 operations
 readback:     9/9 keys match
 index nodes:  5 (0 orphans, 7 entries)
 data nodes:   3 (8 entries)
