@@ -110,14 +110,25 @@ class FakeAsyncOps {
   }
 
   size_t postBatch(ds::Batch const &b) {
-    ds::BatchResult const r = quorum_.submit(b);
-    last_batch_ = r;
+    // Applied immediately, and the outcome stashed for resolveBatch. On the
+    // wire the two halves are genuinely separate: the chains are posted, the
+    // future suspends, and the swapbacks only become meaningful once the
+    // completions land.
+    last_batch_ = quorum_.submit(b);
     ++posts_;
     return set_.replicas();
   }
-  ds::BatchResult lastBatch() const { return last_batch_; }
+
+  /// Whether the batch's publishing CAS reached a majority (L1).
+  ds::BatchResult resolveBatch(ds::Batch const &) { return last_batch_; }
 
   uint64_t now() { return set_.now(); }
+
+  // Allocation is client-local, so it comes from the replica set's single
+  // allocator pair rather than per replica -- a RemoteAddr and a VecOffset mean
+  // the same thing on every replica, which is what lets one batch serve all.
+  ds::VecOffset allocVec() { return set_.allocVec(); }
+  ds::RemoteAddr allocNode() { return set_.allocNode(); }
 
   /// How many times this operation went to the fabric. The quantity the future
   /// path exists to overlap across operations, so a test can compare it against
