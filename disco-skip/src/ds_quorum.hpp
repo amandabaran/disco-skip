@@ -1,0 +1,365 @@
+#pragma once
+
+// CAS-ABD over three replicas: the quorum read (L2/L3/L4), the 2-of-3 commit
+// (L1) and the async writeback (L5) of invariants.md §4.
+//
+// This sits BEHIND the Ops surface, which is the point. `QuorumOps` provides
+// exactly the surface ds_descend.hpp and ds_insert.hpp already expect, so the
+// descent, the Writer and the Putter are unchanged and unaware: replication is
+// not a parameter of the algorithms, it is a property of the storage under them.
+//
+// It is templated over a ReplicaSet of per-replica primitives so the whole thing
+// runs against a fake in disco-skip/tests. That matters more here than anywhere
+// else in the project: every interesting state involves one replica disagreeing
+// with two others, which is trivial to construct locally and essentially
+// impossible to provoke on a healthy cluster.
+//
+// ReplicaSet must provide:
+//
+//     size_t replicas() const;
+//     bool readNodeFrom(size_t r, RemoteAddr a, NodeRecord &node);
+//     bool readVecFrom(size_t r, VecOffset off, VecRecord &vec);
+//     bool casHandleOn(size_t r, RemoteAddr a, uint64_t exp, uint64_t des);
+//     void submitAll(Batch const &b, bool *submitted, bool *committed);
+//     uint64_t now();
+//     VecOffset allocVec();
+//     RemoteAddr allocNode();
+//
+// `submitAll` is where the round trips are won or lost. It must post every
+// replica's chain BEFORE draining any of them, so that N replicas cost one
+// round trip of latency rather than N -- which is what chimera's put_future
+// does across servers and what a per-replica loop of blocking calls does not.
+// It reports per-replica outcomes; deciding what a majority of them means is
+// this file's job.
+//
+// ── Two decisions worth reading before changing anything here ────────────────
+//
+// 1. THE COMMIT ATTEMPTS EVERY REPLICA, not a fixed majority subset.
+//
+//    `DsState::quorum_indices` picks a fixed majority per client, rotated by
+//    client index, and the legacy register path uses it. Doing that here
+//    deadlocks. With replicas R0/R1/R2, client A holding {0,1} and client B
+//    holding {1,2}:
+//
+//      - A commits: CAS R0 and R1 both succeed, 2 of 3. R2 is now lagged.
+//      - B writes: its majority read of {1,2} sees R1's new handle as the max.
+//        It CASes that expected value on {1,2}: R1 succeeds, R2 fails because
+//        it still holds the old handle. One success, short of majority.
+//      - B retries forever. Nothing in that loop ever repairs R2.
+//
+//    So L1's "2/3 CAS success" has to mean *attempt three, require two*. That
+//    also demotes the writeback of L5 to what §4.1 claims it is -- an
+//    accelerant -- rather than something correctness secretly depends on.
+//
+// 2. THE READ TAKES THE HIGHEST TAG WITH MAJORITY SUPPORT, which is slightly
+//    stronger than L2 as written.
+//
+//    L2 says a read linearizes at a quorum read taking the max tag. That is
+//    right whenever every distinct handle value is either committed or absent.
+//    A *partially* applied commit breaks that assumption: two writers bumping
+//    from the same predecessor produce two different handles with the SAME tag,
+//    since both bump content_ver once. Tags then tie and L3's order cannot
+//    separate them, and picking the uncommitted one would return contents that
+//    no majority ever held.
+//
+//    Reading every replica makes the ambiguity decidable, so this takes the
+//    highest tag that at least a majority actually holds. A state with no
+//    majority-supported value is transient -- the writers involved are still
+//    retrying -- so it is reported as a failed read for the caller to retry
+//    rather than resolved by guessing.
+//
+//    Flagged rather than silently adopted: it is a deliberate strengthening of
+//    L2, and if invariants.md is to stay authoritative it should say so.
+
+#include <cstddef>
+#include <cstdint>
+
+#include "ds_batch.hpp"
+#include "ds_defs.hpp"
+#include "ds_node.hpp"
+
+namespace ds {
+
+struct QuorumStats {
+  uint64_t node_reads = 0;      ///< logical reads, not per-replica RDMAs
+  uint64_t vec_reads = 0;
+  uint64_t replica_reads = 0;   ///< the per-replica RDMAs those cost
+  uint64_t read_retries = 0;    ///< no majority-supported value yet
+  uint64_t read_failures = 0;
+  uint64_t tag_ties = 0;        ///< distinct handles sharing the highest tag
+  uint64_t stale_votes = 0;     ///< replicas that voted below the winner
+  uint64_t commits = 0;         ///< handle CASes that reached majority
+  uint64_t commits_lost = 0;    ///< handle CASes that did not
+  uint64_t partial_commits = 0; ///< ... of those, with at least one success
+  uint64_t writebacks = 0;      ///< lagged replicas repaired
+  uint64_t batches = 0;         ///< chained submissions, i.e. round trips
+  uint64_t write_shortfalls = 0;///< a batch landed on fewer than a majority
+  uint64_t vec_writes = 0;      ///< logical vector writes, summed over batches
+  uint64_t node_writes = 0;
+  uint64_t cas_issued = 0;      ///< CASes carried by batches, all replicas
+};
+
+namespace detail {
+
+/// How many times a read re-polls before reporting failure. A state with no
+/// majority-supported handle means writers are mid-commit, so this bounds our
+/// own spinning rather than guarding a livelock.
+inline constexpr int kMaxQuorumReadAttempts = 8;
+
+}  // namespace detail
+
+/// The Ops surface, over a replica set, with CAS-ABD underneath.
+template <class ReplicaSet>
+class QuorumOps {
+ public:
+  QuorumOps(ReplicaSet &set, QuorumStats &stats) : set_(set), stats_(stats) {}
+
+  /// Replicas that must agree for a value to count as committed.
+  [[nodiscard]] size_t majority() const { return set_.replicas() / 2 + 1; }
+
+  // ── Reads: L2, L3, L4 ─────────────────────────────────────────────────────
+
+  /// Quorum header read.
+  ///
+  /// Reads every replica, groups by exact handle value, and takes the highest
+  /// tag that a majority holds. Records which replica supplied it, so the
+  /// vector read can honour L4.
+  bool readNode(RemoteAddr a, NodeRecord &node) {
+    ++stats_.node_reads;
+    size_t const n = set_.replicas();
+
+    for (int attempt = 0; attempt < detail::kMaxQuorumReadAttempts; ++attempt) {
+      NodeRecord seen[kMaxReplicas];
+      bool ok[kMaxReplicas] = {};
+      size_t got = 0;
+      for (size_t r = 0; r < n; ++r) {
+        ok[r] = set_.readNodeFrom(r, a, seen[r]);
+        ++stats_.replica_reads;
+        if (ok[r]) ++got;
+      }
+      if (got < majority()) {
+        ++stats_.read_failures;
+        return false;
+      }
+
+      // Group by exact handle. Distinct handles can share a tag when a commit
+      // was partially applied, which is why votes are counted per value rather
+      // than per tag.
+      size_t best = n;  // index of the winning replica
+      uint64_t best_tag = 0;
+      size_t best_votes = 0;
+      bool tie = false;
+      for (size_t r = 0; r < n; ++r) {
+        if (!ok[r]) continue;
+        size_t votes = 0;
+        for (size_t q = 0; q < n; ++q) {
+          if (ok[q] && seen[q].handle == seen[r].handle) ++votes;
+        }
+        if (votes < majority()) continue;
+        uint64_t const tag = seen[r].handle.tag();
+        if (best == n || tag > best_tag) {
+          best = r;
+          best_tag = tag;
+          best_votes = votes;
+        } else if (tag == best_tag && seen[r].handle != seen[best].handle) {
+          tie = true;
+        }
+      }
+      if (tie) ++stats_.tag_ties;
+
+      if (best == n) {
+        // Every value is short of majority support, so a commit is in flight.
+        // Re-poll rather than pick: returning a value no majority holds would
+        // publish contents that were never committed.
+        ++stats_.read_retries;
+        continue;
+      }
+
+      for (size_t r = 0; r < n; ++r) {
+        if (ok[r] && seen[r].handle != seen[best].handle) ++stats_.stale_votes;
+      }
+
+      node = seen[best];
+      last_read_addr_ = a;
+      last_max_replica_ = best;
+      last_max_valid_ = true;
+      (void)best_votes;
+      return true;
+    }
+    ++stats_.read_failures;
+    return false;
+  }
+
+  /// Vector read, from a replica that voted with the winning handle (L4).
+  ///
+  /// The replica is remembered from the preceding readNode. That coupling is
+  /// safe because every caller pairs the two -- the descent reads a header and
+  /// then, only if it needs the entries, that node's vector -- but it is a
+  /// coupling, so it falls back to replica 0 rather than misbehaving if the
+  /// pairing is ever broken.
+  ///
+  /// Worth knowing why the fallback is harmless in this failure model: a vector
+  /// is written to every replica at the same offset before the handle CAS
+  /// publishes it, and it is write-once, so all replicas that have offset `off`
+  /// have identical bytes there. L4 matters for a replica that missed the write,
+  /// which under fail-stop with no partitions (§8) means a replica that is down
+  /// and whose read would fail anyway.
+  bool readVec(VecOffset off, VecRecord &vec) {
+    ++stats_.vec_reads;
+    size_t const start = last_max_valid_ ? last_max_replica_ : 0;
+    size_t const n = set_.replicas();
+    for (size_t i = 0; i < n; ++i) {
+      size_t const r = (start + i) % n;
+      ++stats_.replica_reads;
+      if (set_.readVecFrom(r, off, vec)) return true;
+    }
+    ++stats_.read_failures;
+    return false;
+  }
+
+  /// Both, for the verifier's Reader concept.
+  bool read(RemoteAddr a, NodeRecord &node, VecRecord &vec) {
+    if (!readNode(a, node)) return false;
+    return readVec(node.handle.offset(), vec);
+  }
+
+  // ── Batch submission: the fan-out ────────────────────────────────────────
+
+  /// Issue a chained batch on every replica, then decide what happened.
+  ///
+  /// The publishing CAS follows L1: committed iff a majority of replicas took
+  /// it. Everything else in the batch is a helping step -- idempotent, and with
+  /// no majority to reach, since the field simply has to arrive everywhere for
+  /// the replicas to converge.
+  ///
+  /// A batch with no publishing CAS is reported committed, so a caller that
+  /// only wanted the helping steps does not have to special-case it.
+  BatchResult submit(Batch const &b) {
+    BatchResult out;
+    if (!b.wellFormed()) return out;
+
+    size_t const n = set_.replicas();
+    bool submitted[kMaxReplicas] = {};
+    bool committed[kMaxReplicas] = {};
+    set_.submitAll(b, submitted, committed);
+
+    size_t landed = 0, took = 0;
+    for (size_t r = 0; r < n; ++r) {
+      if (submitted[r]) ++landed;
+      if (submitted[r] && committed[r]) ++took;
+    }
+
+    ++stats_.batches;
+    stats_.vec_writes += b.vecWrites();
+    stats_.node_writes += b.nodeWrites();
+    stats_.cas_issued +=
+        (b.size() - b.vecWrites() - b.nodeWrites()) * set_.replicas();
+    if (landed < majority()) {
+      ++stats_.write_shortfalls;
+      return out;  // submitted == false: nothing may be assumed to have landed
+    }
+    out.submitted = true;
+
+    if (!b.hasCommit()) {
+      out.committed = true;
+      return out;
+    }
+
+    if (took < majority()) {
+      ++stats_.commits_lost;
+      if (took > 0) ++stats_.partial_commits;
+      // Deliberately NOT rolled back. There is nothing safer to roll back to:
+      // the replicas that took it hold a value with the same tag as any rival
+      // winner's, and a later commit from the majority supersedes it. A rollback
+      // would need its own CAS that could itself lose.
+      return out;
+    }
+
+    ++stats_.commits;
+    out.committed = true;
+    writeBack(b, submitted, committed);
+    last_max_valid_ = false;  // the winning replica is no longer meaningful
+    return out;
+  }
+
+  // ── Reporting, so the same selftest can run over this surface ────────────
+  //
+  // Deliberately the same names RdmaNodeReader and RdmaOps expose, because
+  // ds_selftest.hpp is templated over both and must not care which it has. The
+  // unstable-retry counter is always zero here: a read caught mid-write is
+  // resolved by the majority rule rather than by re-reading one replica.
+
+  [[nodiscard]] uint64_t nodeReads() const { return stats_.node_reads; }
+  [[nodiscard]] uint64_t vecReads() const { return stats_.vec_reads; }
+  [[nodiscard]] uint64_t reads() const {
+    return stats_.node_reads + stats_.vec_reads;
+  }
+  /// Bytes off the wire, counted per replica -- the honest number under
+  /// replication, since a quorum read really does move N headers.
+  [[nodiscard]] uint64_t bytesRead() const {
+    return stats_.node_reads * set_.replicas() * kNodeRecordBytes +
+           stats_.vec_reads * kVecRecordBytes;
+  }
+  [[nodiscard]] uint64_t unstableRetries() const { return 0; }
+  [[nodiscard]] uint64_t staleRetries() const { return stats_.read_retries; }
+  [[nodiscard]] uint64_t casCount() const { return stats_.cas_issued; }
+  [[nodiscard]] uint64_t nodeWrites() const { return stats_.node_writes; }
+  [[nodiscard]] uint64_t vecWrites() const { return stats_.vec_writes; }
+  [[nodiscard]] uint64_t bytesWritten() const {
+    return (stats_.node_writes * kNodeRecordBytes +
+            stats_.vec_writes * kVecRecordBytes) * set_.replicas();
+  }
+  /// Round trips spent writing. Independent of the replica count, which is the
+  /// property the chaining exists to create.
+  [[nodiscard]] uint64_t batches() const { return stats_.batches; }
+
+  uint64_t now() { return set_.now(); }
+  VecOffset allocVec() { return set_.allocVec(); }
+  RemoteAddr allocNode() { return set_.allocNode(); }
+
+  /// L5's async writeback, for the replicas whose publishing CAS did not take.
+  ///
+  /// Not required for correctness -- any later majority read intersects the
+  /// committed set -- but leaving a replica behind makes every subsequent
+  /// commit depend on the other two, turning one slow replica into a single
+  /// point of failure.
+  ///
+  /// Repaired by CAS rather than by write, so a replica that has meanwhile
+  /// moved *ahead* of this commit is left alone rather than clobbered.
+  void writeBack(Batch const &b, bool const *submitted, bool const *committed) {
+    RemoteAddr addr{};
+    uint64_t desired = 0;
+    for (size_t i = 0; i < b.size(); ++i) {
+      if (b[i].kind == BatchKind::CasHandle) {
+        addr = b[i].addr;
+        desired = b[i].desired;
+        break;
+      }
+    }
+    if (addr.isNull()) return;
+
+    for (size_t r = 0; r < set_.replicas(); ++r) {
+      if (!submitted[r] || committed[r]) continue;
+      NodeRecord cur;
+      ++stats_.replica_reads;
+      if (!set_.readNodeFrom(r, addr, cur)) continue;
+      if (cur.handle.raw == desired) continue;                 // caught up
+      if (cur.handle.tag() > Handle{desired}.tag()) continue;  // newer: leave it
+      if (set_.casHandleOn(r, addr, cur.handle.raw, desired)) ++stats_.writebacks;
+    }
+  }
+
+ private:
+  /// Bound on the replica arrays above. invariants.md §9 restricts the toggle
+  /// to 1 or 3; this leaves room without making the arrays dynamic, since they
+  /// are per-call scratch on a path that runs per node read.
+  static constexpr size_t kMaxReplicas = 8;
+
+  ReplicaSet &set_;
+  QuorumStats &stats_;
+  RemoteAddr last_read_addr_{};
+  size_t last_max_replica_ = 0;
+  bool last_max_valid_ = false;
+};
+
+}  // namespace ds
