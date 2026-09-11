@@ -12,18 +12,22 @@
 //
 //     bool readNode(RemoteAddr a, NodeRecord &node);
 //     bool readVec(VecOffset off, VecRecord &vec);
-//     bool casTs(VecOffset off, uint64_t expected, uint64_t desired);
-//     bool casNextId(RemoteAddr a, uint64_t expected, uint64_t desired);
-//     bool casNextKMin(RemoteAddr a, Key expected, Key desired);
-//     bool casTailWord(RemoteAddr a, uint64_t expected, uint64_t desired);
+//     BatchResult submit(Batch const &b);
 //     uint64_t now();
 //
-// Every CAS returns whether it succeeded, and every caller here ignores that:
-// a failure means another thread already performed the step, which is exactly
-// as good as doing it ourselves.
+// Helping issues a BATCH rather than individual CASes. Settling a node can need
+// up to four of them -- the timestamp, two header fields and the tail word --
+// and one at a time that is four round trips on the *read* path. Chained, it is
+// one. See ds_batch.hpp.
+//
+// Nothing here inspects the result: a step that failed is a step another thread
+// already performed, which is exactly as good as doing it ourselves. Chaining
+// also makes the tail word's "last" requirement structural, since same-QP RC
+// ordering delivers the chain in order.
 
 #include <cstdint>
 
+#include "ds_batch.hpp"
 #include "ds_defs.hpp"
 #include "ds_node.hpp"
 
@@ -86,6 +90,7 @@ struct HelpCounters {
   uint32_t vec_reads = 0;
   uint32_t helped_ts = 0;
   uint32_t helped_splits = 0;
+  uint32_t batches = 0;  ///< chained submissions, i.e. round trips spent helping
 };
 
 /// Complete any operation outstanding on this node, then re-read it.
@@ -104,12 +109,15 @@ bool settleNode(Ops &ops, RemoteAddr addr, NodeRecord &node, VecRecord &vec,
     bool const unstable = !node.isStable();
     if (!pending && !unstable) return true;
 
+    // One chain, in protocol order.
+    Batch b;
+
     // 1. Fix the timestamp first. A helper stamps with its own clock, which
     //    orders the write at the moment somebody first needed it -- that is
     //    the point of leaving it unfixed until visible, since it lets the
     //    write be ordered after readers that did not see it.
     if (pending) {
-      ops.casTs(node.handle.offset(), kNullTs, ops.now());
+      b.casTs(node.handle.offset(), kNullTs, ops.now());
       ++c.helped_ts;
     }
 
@@ -119,19 +127,25 @@ bool settleNode(Ops &ops, RemoteAddr addr, NodeRecord &node, VecRecord &vec,
     //    copies anyway.
     if (unstable && vec.hasSplitDescriptor()) {
       if (node.next_k_min != vec.k_min_next) {
-        ops.casNextKMin(addr, node.next_k_min, vec.k_min_next);
+        b.casNextKMin(addr, node.next_k_min, vec.k_min_next);
       }
       if (node.next_id != vec.next_id) {
-        ops.casNextId(addr, node.next_id, vec.next_id);
+        b.casNextId(addr, node.next_id, vec.next_id);
       }
     }
 
-    // 3. Close the window last. Until this lands, another writer knows the
-    //    node is unsettled and will help rather than start its own split.
+    // 3. Close the window last -- and now structurally last, because the chain
+    //    is delivered in order. Until this lands, another writer knows the node
+    //    is unsettled and will help rather than start its own split.
     if (unstable) {
-      ops.casTailWord(addr, packTailWord(node.level, node.tail_struct_ver),
-                      packTailWord(node.level, node.handle.structVer()));
+      b.casTailWord(addr, packTailWord(node.level, node.tail_struct_ver),
+                    packTailWord(node.level, node.handle.structVer()));
       ++c.helped_splits;
+    }
+
+    if (b.size() > 0) {
+      ++c.batches;
+      ops.submit(b);
     }
 
     if (!ops.readNode(addr, node)) return false;

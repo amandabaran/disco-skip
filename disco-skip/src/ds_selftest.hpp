@@ -237,6 +237,13 @@ int selftestWrites(Reader &reader, Ops &ops, uint32_t layers,
   out << "rdma writes:  " << ops.nodeWrites() << " nodes, " << ops.vecWrites()
       << " vectors, " << ops.bytesWritten() << " bytes; " << ops.casCount()
       << " CAS total" << std::endl;
+  // The number the chaining exists to reduce. Every write goes out as one
+  // chained batch, so this is round trips -- not the operation count above it,
+  // which is unchanged by batching. The ratio between them is the win.
+  uint64_t const ops_issued =
+      ops.nodeWrites() + ops.vecWrites() + ops.casCount();
+  out << "round trips:  " << ops.batches() << " chained batches carrying "
+      << ops_issued << " operations" << std::endl;
   out << "readback:     " << readback << "/" << kSelftestWriteCount
       << " keys match" << std::endl;
 

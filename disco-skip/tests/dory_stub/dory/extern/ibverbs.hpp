@@ -3,6 +3,16 @@
 #include <cstdint>
 
 enum ibv_wc_status : unsigned { IBV_WC_SUCCESS = 0, IBV_WC_GENERAL_ERR = 1 };
+// Send flags. IBV_SEND_FENCE is the one that matters to us: F3 needs the
+// staged writes visible at the remote HCA before the publishing CAS, and in a
+// chained batch nothing waits, so the fence is what supplies that. dory never
+// sets it, so we do -- which means the stub has to declare it.
+enum ibv_send_flags : unsigned {
+  IBV_SEND_FENCE = 1,
+  IBV_SEND_SIGNALED = 2,
+  IBV_SEND_INLINE = 8
+};
+
 enum ibv_wr_opcode : unsigned {
   IBV_WR_RDMA_WRITE = 0,
   IBV_WR_RDMA_READ = 4,

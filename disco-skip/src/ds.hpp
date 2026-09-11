@@ -25,6 +25,7 @@
 #include "ds_get.hpp"
 #include "ds_insert.hpp"
 #include "ds_put.hpp"
+#include "ds_quorum.hpp"
 #include "ds_selftest.hpp"
 #include "ds_verify.hpp"
 

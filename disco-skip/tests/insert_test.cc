@@ -116,7 +116,12 @@ static void checkF1IsCopyOnWriteAndChains() {
         "a plain write publishes no split descriptor");
 
   CHECK(st.vec_writes == 1, "one vector written");
-  CHECK(ops.fences() == 1, "and a fence issued before the publishing CAS");
+  // The round-trip claim: staging, publishing and stamping go out as ONE
+  // chained batch rather than three separate operations. The fence is no longer
+  // a call of its own -- it is a property the backend puts on the publishing
+  // CAS inside the chain (ds_batch.hpp).
+  CHECK(ops.batches() == 1, "issued as a single chained batch");
+  CHECK(st.batches == 1, "and counted as one");
   CHECK(verifyOk(ops), "I1-I4 hold");
 }
 
@@ -215,12 +220,14 @@ static void checkF2WritesEverythingBeforePublishing() {
   ds::Writer<FakeOps> w(ops, st);
   for (ds::Key k : {ds::Key{100}, ds::Key{200}, ds::Key{300}}) w.insertEntry(kData, k, k);
 
-  uint64_t const fences_before = ops.fences();
+  uint64_t const batches_before = ops.batches();
   uint64_t const handle_cas_before = ops.casHandleCalls();
   ds::SplitResult const s = w.splitAt(kData, 200, /*orphan=*/true, nullptr);
 
   CHECK(s.outcome == ds::WriteOutcome::Published, "split publishes");
-  CHECK(ops.fences() == fences_before + 1, "exactly one fence per split");
+  // Two chains, not eleven operations: everything staged plus the publishing
+  // CAS, then the five completion CASes. That is the round-trip count F2 costs.
+  CHECK(ops.batches() == batches_before + 2, "exactly two chained batches per split");
   CHECK(ops.casHandleCalls() == handle_cas_before + 1, "and one publishing CAS");
   // 3 writes: the created node's vector, its header, and the existing node's
   // new version. All before the CAS.

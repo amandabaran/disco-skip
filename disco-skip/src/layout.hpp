@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <vector>
+#include "ds_batch.hpp"
 #include "ds_defs.hpp"
 #include "ds_node.hpp"
 #include "register.hpp"
@@ -212,9 +213,27 @@ struct Layout {
 
     size_t nodeBufsSize() const { return static_cast<size_t>(num_servers) * sizeof(NodeRecord); }
     size_t vecBufsSize() const { return static_cast<size_t>(num_servers) * sizeof(VecRecord); }
-    size_t stageNodeSize() const { return sizeof(NodeRecord); }
-    size_t stageVecSize() const { return sizeof(VecRecord); }
-    size_t casBufsSize() const { return static_cast<size_t>(num_servers) * sizeof(uint64_t); }
+
+    // Staging is sized for the longest CHAIN, not for one write at a time.
+    // Every write in a chained batch is posted before any of them completes, so
+    // their source buffers must all be live simultaneously -- F2 stages two
+    // vectors and one node header, and sharing a slot would have the second
+    // write overwrite the first's bytes while the HCA was still reading them.
+    size_t stageNodeSize() const { return kMaxBatchNodeWrites * sizeof(NodeRecord); }
+    size_t stageVecSize() const { return kMaxBatchVecWrites * sizeof(VecRecord); }
+
+    // One swapback slot per operation per replica. A CAS reports the pre-CAS
+    // value into its own buffer, and a chain can hold several, so they cannot
+    // share either -- and the publishing CAS's result is the one that decides
+    // whether the operation committed.
+    size_t casBufsSize() const {
+        return static_cast<size_t>(num_servers) * kMaxBatchOps * sizeof(uint64_t);
+    }
+
+    /// This replica's slice of the swapback buffers, indexed by batch position.
+    uint64_t* casBufsFor(uint64_t future_id, size_t replica) const {
+        return getCasBufs(future_id) + replica * kMaxBatchOps;
+    }
 
     size_t nodePerFutureSize() const {
         return align64(2 * nodeBufsSize() + 2 * vecBufsSize() +

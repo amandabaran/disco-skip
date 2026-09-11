@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "ds_batch.hpp"
 #include "ds_bootstrap.hpp"
 #include "ds_descend.hpp"
 #include "ds_node.hpp"
@@ -125,6 +126,50 @@ class FakeOps {
     return true;
   }
 
+  /// Apply a batch in order.
+  ///
+  /// The whole point of a batch on the wire is that it is one chained doorbell;
+  /// here it is simply a loop, which is exactly right -- a fake that moves no
+  /// data has nothing to gain from chaining, and applying in order reproduces
+  /// what same-QP RC ordering guarantees. Counted so a test can assert that an
+  /// operation issued ONE batch rather than several, which is the property the
+  /// round-trip count depends on.
+  ds::BatchResult submit(ds::Batch const &b) {
+    ds::BatchResult out;
+    if (!b.wellFormed()) return out;  // submitted == false
+    ++batches_;
+    out.submitted = true;
+    out.committed = !b.hasCommit();
+    for (size_t i = 0; i < b.size(); ++i) {
+      ds::BatchOp const &o = b[i];
+      switch (o.kind) {
+        case ds::BatchKind::WriteVec:
+          if (!writeVec(o.off, *o.vec)) out.submitted = false;
+          break;
+        case ds::BatchKind::WriteNode:
+          if (!writeNode(o.addr, *o.node)) out.submitted = false;
+          break;
+        case ds::BatchKind::CasHandle:
+          out.committed = casHandle(o.addr, o.expected, o.desired);
+          break;
+        case ds::BatchKind::CasTs:
+          (void)casTs(o.off, o.expected, o.desired);
+          break;
+        case ds::BatchKind::CasNextId:
+          (void)casNextId(o.addr, o.expected, o.desired);
+          break;
+        case ds::BatchKind::CasNextKMin:
+          (void)casNextKMin(o.addr, static_cast<ds::Key>(o.expected),
+                            static_cast<ds::Key>(o.desired));
+          break;
+        case ds::BatchKind::CasTailWord:
+          (void)casTailWord(o.addr, o.expected, o.desired);
+          break;
+      }
+    }
+    return out;
+  }
+
   // Client-local bump allocation, mirroring Vec/NodeAllocator. Exposed through
   // Ops so the F1/F2 logic can allocate without knowing whether it is talking
   // to RDMA or to this.
@@ -173,6 +218,7 @@ class FakeOps {
   uint64_t nodeWrites() const { return node_writes_; }
   uint64_t vecWrites() const { return vec_writes_; }
   uint64_t fences() const { return fences_; }
+  uint64_t batches() const { return batches_; }
   uint64_t clockNow() const { return clock_; }
 
   /// Point the bump allocators somewhere a fixture is not already using.
@@ -188,7 +234,8 @@ class FakeOps {
   uint64_t next_node_ = ds::kFirstDynamicId;
   uint64_t next_vec_ = ds::kFirstDynamicVec;
   uint64_t node_reads_ = 0, vec_reads_ = 0, cas_ts_ = 0, cas_next_id_ = 0, cas_next_k_min_ = 0,
-           cas_tail_ = 0, cas_handle_ = 0, node_writes_ = 0, vec_writes_ = 0, fences_ = 0;
+           cas_tail_ = 0, cas_handle_ = 0, node_writes_ = 0, vec_writes_ = 0, fences_ = 0,
+           batches_ = 0;
 };
 
 /// Insert a key into a data node sequentially, as a settled write would leave

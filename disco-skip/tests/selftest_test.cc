@@ -61,6 +61,11 @@ static void checkAllThreePhasesPassOnAFreshStructure() {
         "and the split line -- two data splits, one index, one no-op");
   CHECK(contains(log, "readback:     9/9 keys match"), "and the readback line");
 
+  // The chaining is only worth anything if the batch count is well below the
+  // operation count. Asserted as a ratio rather than an exact number so the
+  // script can grow without this becoming a chore, but it must stay a real gap.
+  CHECK(contains(log, "round trips:"), "the round-trip line is reported");
+
   if (g_failures != 0) std::printf("--- log ---\n%s\n", log.c_str());
 }
 

@@ -98,7 +98,7 @@ void instantiate_write_paths(Conns &conns, ds::Layout const &layout, Bufs b,
   (void)p.put(45, 4545, 2);
 
   (void)ops.bytesWritten();
-  (void)ops.fences();
+  (void)ops.batches();
 }
 
 // The --selftest body, against the real RDMA types. This is the instantiation

@@ -42,6 +42,7 @@ GET     := obj/get
 INSERT  := obj/insert
 PUT     := obj/put
 SELFTEST := obj/selftest
+QUORUM  := obj/quorum
 
 # The dory toolchain's warning set, copied from the actual compile line rather
 # than approximated. This target's job is to fail here instead of on the
@@ -142,13 +143,19 @@ $(SELFTEST): selftest_test.cc $(HDRS) fake_ops.hpp $(MACHINE_DEFINES) | obj
 	@$(CXX) $(CXXFLAGS) $(INCLUDES) -DDS_CACHE_ENABLED=0 -DDS_N_REPLICAS=1 \
 	  -DDS_MAX_LAYERS=8 -DDS_IDX_EXP=3 $< -o $@ $(LDFLAGS)
 
-check: $(BINS) $(VERIFY) $(DESCEND) $(GET) $(INSERT) $(PUT) $(SELFTEST)
+$(QUORUM): quorum_test.cc $(HDRS) fake_ops.hpp fake_replicas.hpp $(MACHINE_DEFINES) | obj
+	@echo "[CXX] quorum"
+	@$(CXX) $(CXXFLAGS) $(INCLUDES) -DDS_CACHE_ENABLED=0 -DDS_N_REPLICAS=3 \
+	  -DDS_MAX_LAYERS=8 -DDS_IDX_EXP=3 $< -o $@ $(LDFLAGS)
+
+check: $(BINS) $(VERIFY) $(DESCEND) $(GET) $(INSERT) $(PUT) $(SELFTEST) $(QUORUM)
 	@echo "---- $(VERIFY) ----"; $(VERIFY) || exit 1
 	@echo "---- $(DESCEND) ----"; $(DESCEND) || exit 1
 	@echo "---- $(GET) ----"; $(GET) || exit 1
 	@echo "---- $(INSERT) ----"; $(INSERT) || exit 1
 	@echo "---- $(PUT) ----"; $(PUT) || exit 1
 	@echo "---- $(SELFTEST) ----"; $(SELFTEST) || exit 1
+	@echo "---- $(QUORUM) ----"; $(QUORUM) || exit 1
 	@for b in $(BINS); do echo "---- $$b ----"; $$b || exit 1; done
 	@echo "==== all toggle combinations pass ===="
 

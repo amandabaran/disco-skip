@@ -11,22 +11,30 @@
 //
 // Beyond the read/CAS surface ds_descend.hpp lists, Ops must provide:
 //
-//     bool writeVec(VecOffset off, VecRecord const &vec);
-//     bool writeNode(RemoteAddr a, NodeRecord const &node);
-//     void fence();
-//     bool casHandle(RemoteAddr a, uint64_t expected, uint64_t desired);
+//     BatchResult submit(Batch const &b);
 //     VecOffset allocVec();
 //     RemoteAddr allocNode();
 //
-// `casHandle` is the one CAS whose result is NOT ignored. Every other CAS in
-// this file and in the descent is a step somebody else may already have taken,
-// so failure is as good as success. The handle CAS is the operation's
-// linearization point (L1): losing it means another writer got there first and
-// our staged version describes a state that never existed, so the only correct
-// response is to re-read and start over.
+// WRITES GO OUT AS BATCHES, not as individual operations. Issued one at a time,
+// F1 costs five round trips and F2 eleven, and at three replicas a per-replica
+// loop multiplies both. A batch is a linked chain of work requests posted with
+// one doorbell, so each of the sequences below is one round trip -- see
+// ds_batch.hpp. F1 becomes two (a read, then one chain) and F2 three.
+//
+// The batch also carries the protocol's ordering requirements structurally
+// rather than by convention: same-QP RC ordering is what puts the staged writes
+// before the publishing CAS, and the tail word after everything else.
+//
+// `BatchResult::committed` reports the publishing CAS, and it is the one result
+// that is NOT ignored. Every other CAS in this file and in the descent is a step
+// somebody else may already have taken, so failure is as good as success. The
+// handle CAS is the operation's linearization point (L1): losing it means
+// another writer got there first and our staged version describes a state that
+// never existed, so the only correct response is to re-read and start over.
 
 #include <cstdint>
 
+#include "ds_batch.hpp"
 #include "ds_defs.hpp"
 #include "ds_descend.hpp"
 #include "ds_node.hpp"
@@ -49,8 +57,10 @@ struct WriteStats {
   uint64_t splits = 0;         ///< F2 completions
   uint64_t capacity_splits = 0;///< of those, driven by a full vector
   uint64_t boundary_noops = 0; ///< split_key was already the node's k_min
+  uint64_t not_covered = 0;    ///< the target node does not own the key
   uint64_t cas_lost = 0;       ///< handle CAS lost to a concurrent writer
   uint64_t retries = 0;
+  uint64_t batches = 0;      ///< chained submissions, i.e. round trips
   uint64_t nodes_read = 0;
   uint64_t vec_reads = 0;
   uint64_t node_writes = 0;
@@ -110,6 +120,22 @@ class Writer {
       // a wrong answer rather than a wasted hop.
       if (!settle(addr, node, vec)) return WriteOutcome::Failed;
 
+      // Does this node actually own k?
+      //
+      // Nothing upstream guarantees it: the caller found this address by
+      // descending, or from a cache hint, or by routing across a split it just
+      // performed, and any of those can be stale by the time we get here. Left
+      // unchecked, a write to the wrong node lands a key outside the node's
+      // range and breaks I1 -- silently, since a vector is still internally
+      // sorted afterwards and only the verifier would ever notice. splitAt
+      // already rejects an out-of-range split key; this is the same check on
+      // the same reasoning, and it keeps a bad address a detected bad address
+      // rather than a wrong answer.
+      if (!covers(node, vec, k)) {
+        ++stats_.not_covered;
+        return WriteOutcome::Retry;
+      }
+
       VecRecord staged = vec;
       int const idx = findLte(vec, k);
       bool const present = idx >= 0 && vec.e[idx].key == k;
@@ -140,16 +166,28 @@ class Writer {
       staged.k_min_next = kReservedKey;
       staged.is_orphan = vec.is_orphan;
 
-      if (!ops_.writeVec(off, staged)) return WriteOutcome::Failed;
+      // One chain: stage the vector, publish it, stamp it.
+      //
+      // The stamp rides along rather than costing its own round trip. It is
+      // safe to issue before knowing whether the publish won: it CASes `ts` on
+      // an offset this client just allocated, which nobody else can reach, so
+      // on a lost race it settles a version that is simply abandoned.
+      //
+      // F3 lives on the CasHandle: the backend fences it, so the staged bytes
+      // are visible at the remote HCA before the CAS that publishes them.
+      Batch b;
+      b.writeVec(off, staged);
+      b.casHandle(addr, node.handle.raw, node.handle.withContent(off).raw);
+      b.casTs(off, kNullTs, ops_.now());
+      BatchResult const r = ops_.submit(b);
+      if (!r.submitted) {
+        ++stats_.failures;
+        return WriteOutcome::Failed;
+      }
       ++stats_.vec_writes;
+      ++stats_.batches;
 
-      // F3. The staged bytes must be visible at the remote HCA before the CAS
-      // that publishes them, or a reader following the new handle can reach a
-      // vector that has not landed.
-      ops_.fence();
-
-      if (!ops_.casHandle(addr, node.handle.raw,
-                          node.handle.withContent(off).raw)) {
+      if (!r.committed) {
         // Somebody else published first, so `staged` describes a state that
         // never existed. Its offset is simply abandoned -- there is no
         // reclamation (invariants.md §5), so a lost race costs one vector of
@@ -159,7 +197,6 @@ class Writer {
         continue;
       }
 
-      stamp(off);
       ++stats_.published;
       if (present) ++stats_.updates; else ++stats_.creates;
       return WriteOutcome::Published;
@@ -264,37 +301,49 @@ class Writer {
       nvec.k_min_next = split_key;
       nvec.is_orphan = vec.is_orphan;
 
-      if (!ops_.writeVec(created_vec, cvec)) return fail(out);
-      ++stats_.vec_writes;
-      if (!ops_.writeNode(created, cnode)) return fail(out);
+      // 3. One chain: everything the split needs staged, then the CAS that
+      //    publishes it. struct_ver + 1 opens the propagation window -- from
+      //    here until the tail word matches, every reader can see that this
+      //    node's header link fields are not yet trustworthy, and either routes
+      //    around them via the vector or helps finish.
+      //
+      //    The created node and both vectors must be on the fabric before the
+      //    CAS makes any of them reachable, which the backend guarantees by
+      //    fencing the CasHandle.
+      Batch stage;
+      stage.writeVec(created_vec, cvec);
+      stage.writeNode(created, cnode);
+      stage.writeVec(new_vec, nvec);
+      stage.casHandle(addr, node.handle.raw,
+                      node.handle.withStruct(new_vec).raw);
+      BatchResult const r = ops_.submit(stage);
+      if (!r.submitted) return fail(out);
+      stats_.vec_writes += 2;
       ++stats_.node_writes;
-      if (!ops_.writeVec(new_vec, nvec)) return fail(out);
-      ++stats_.vec_writes;
+      ++stats_.batches;
 
-      ops_.fence();
-
-      // 3. Publish. struct_ver + 1 opens the propagation window: from here
-      //    until the tail word matches, every reader can see that this node's
-      //    header link fields are not yet trustworthy, and either routes around
-      //    them via the vector or helps finish.
-      if (!ops_.casHandle(addr, node.handle.raw,
-                          node.handle.withStruct(new_vec).raw)) {
+      if (!r.committed) {
         ++stats_.cas_lost;
         ++stats_.retries;
         continue;
       }
 
-      // 4. Finish. Any order among these three; the tail word must be last.
-      stamp(new_vec);
-      stamp(created_vec);
-      ops_.casNextKMin(addr, node.next_k_min, split_key);
-      ops_.casNextId(addr, node.next_id, created.id);
-
-      // 5. Close the window. Last, unconditionally: while it is open another
-      //    writer helps rather than starting its own split on this node, which
-      //    is how concurrent splits serialise.
-      ops_.casTailWord(addr, packTailWord(node.level, node.tail_struct_ver),
-                       packTailWord(node.level, node.handle.structVer() + 1));
+      // 4. One more chain to finish the operation. The order within it is the
+      //    protocol's: the timestamps and the two header fields in any order,
+      //    and the tail word LAST -- which same-QP RC ordering now enforces
+      //    structurally rather than leaving it to the order of these calls.
+      //
+      //    Closing the window last is what makes concurrent splits serialise:
+      //    while it is open, another writer helps rather than starting its own.
+      Batch finish;
+      finish.casTs(new_vec, kNullTs, ops_.now());
+      finish.casTs(created_vec, kNullTs, ops_.now());
+      finish.casNextKMin(addr, node.next_k_min, split_key);
+      finish.casNextId(addr, node.next_id, created.id);
+      finish.casTailWord(addr, packTailWord(node.level, node.tail_struct_ver),
+                         packTailWord(node.level, node.handle.structVer() + 1));
+      if (!ops_.submit(finish).submitted) return fail(out);
+      ++stats_.batches;
 
       ++stats_.splits;
       if (orphan) ++stats_.capacity_splits;
@@ -362,15 +411,12 @@ class Writer {
     return ok;
   }
 
-  /// Fix a version's timestamp.
-  ///
-  /// Done by the writer *before* it returns to its caller, not left for a
-  /// helper. That is what keeps the ordering honest: "the write completed"
-  /// then includes its stamp, so any reader starting afterwards sees a
-  /// timestamp at or below its own snapshot. A helper stamping on the writer's
-  /// behalf only happens while the writer is still in flight, and such a write
-  /// is genuinely concurrent with the reader, so either order is legal.
-  void stamp(VecOffset off) { ops_.casTs(off, kNullTs, ops_.now()); }
+  // The timestamp is fixed by the writer inside its own batch, not left for a
+  // helper. That is what keeps the ordering honest: "the write completed" then
+  // includes its stamp, so any reader starting afterwards sees a timestamp at
+  // or below its own snapshot. A helper stamping on the writer's behalf only
+  // happens while the writer is still in flight, and such a write is genuinely
+  // concurrent with the reader, so either order is legal.
 
   static bool insertSorted(VecRecord &v, Entry e) {
     if (v.size >= kNodeCapacity) return false;
