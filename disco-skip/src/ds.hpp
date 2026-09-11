@@ -32,3 +32,4 @@
 
 // Needs dory, so it comes last and is what makes this header cluster-only.
 #include "ds_rdma.hpp"
+#include "ds_rdma_async.hpp"
