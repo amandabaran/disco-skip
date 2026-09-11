@@ -20,6 +20,7 @@
 #include "ds_node.hpp"
 #include "layout.hpp"
 
+#include "ds_async.hpp"
 #include "ds_bootstrap.hpp"
 #include "ds_descend.hpp"
 #include "ds_get.hpp"
