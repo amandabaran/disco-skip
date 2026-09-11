@@ -50,6 +50,10 @@ through it.
 cd /users/adb321/disco-skip-artifacts/bin/disco-skip && git pull && ./build.py disco-skip
 ```
 
+This builds only the remote side, which is what you want while iterating. It does **not**
+package or deploy anything — see **Deploy** below, and note that `cloudlab_deploy.sh` runs
+its own (full, `distclean`) build, so there is no need to do both.
+
 The dory toolchain compiles with `-Werror` and a much stricter warning set than the cache
 half is written for. That is handled by marking the cache include directories `SYSTEM` in
 `src/CMakeLists.txt`, so diagnostics originating inside them are suppressed while our own
@@ -62,23 +66,30 @@ the same checks on our code, and the cache is the other author's half and not ou
 cd /users/adb321/disco-skip-artifacts && ./cloudlab_deploy.sh
 ```
 
-**`send-deployment.sh` alone is not a deploy, and it says "successful" anyway.** It ships
-whatever `deployment.zip` already sits on disk — it never builds it. `prepare-deployment.sh`
-is what builds it. Running only `send-deployment.sh` after a fresh compile shipped a
-**two-hour-old** binary to all 12 nodes and printed
-`Parallel deployment successful across all nodes!`; the failure surfaced one step later as
-`Error in command line: Unrecognized token: --ts`, i.e. as a *code* problem rather than a
-deploy problem, which is the expensive kind of misdirection. The full chain is:
+`cloudlab_deploy.sh` is the entry point and it does **all** the steps, from
+`/users/adb321/disco-skip-artifacts`:
 
-```sh
-cd /users/adb321/disco-skip-artifacts/bin/disco-skip && ./build.py disco-skip
-cd /users/adb321/disco-skip-artifacts
-./bin/zip-binaries.sh        # build/bin/disco-skip  -> bin/bin.zip
-./prepare-deployment.sh      # bin/bin.zip + scripts -> deployment.zip
-./send-deployment.sh         # deployment.zip        -> all 12 nodes
+```
+build.py distclean buildclean clean && build.py all   # conan stack
+bin/dlsm/build.sh clean && build                      # independent CMake
+bin/zip-binaries.sh      # build/bin/disco-skip  -> bin/bin.zip
+prepare-deployment.sh    # bin/bin.zip + scripts -> deployment.zip
+send-deployment.sh       # deployment.zip        -> all 12 nodes
 ```
 
-Verify rather than trust, with a string the new build must contain:
+**Use it rather than the individual scripts.** `send-deployment.sh` never builds
+`deployment.zip` — it ships whatever copy is already on disk, and prints
+`Parallel deployment successful across all nodes!` either way. Calling it directly after a
+fresh compile shipped a **two-hour-old** binary to all 12 nodes and reported success; the
+failure surfaced one step later as `Error in command line: Unrecognized token: --ts`, i.e.
+wearing a *code* costume rather than a deploy costume, which is the expensive kind of
+misdirection. `prepare-deployment.sh` is the step that rebuilds the payload and the one
+that is easy to leave out.
+
+If a full `cloudlab_deploy.sh` is too slow to iterate on — it `distclean`s and rebuilds the
+whole conan stack plus dLSM, none of which the remote side touches — the minimum honest
+chain is the last four lines above with `build.py disco-skip` in place of the first. Then
+verify rather than trust, using a string only the new build contains:
 
 ```sh
 ssh w5 'strings ~/disco-skip-artifacts/bin/disco-skip-exe | grep -c "^--ts$"'
