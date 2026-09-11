@@ -1,11 +1,11 @@
-// The remote descent, and the helping that makes reads non-blocking.
+// The remote traversal, and the helping that makes reads non-blocking.
 //
 // Helping only fires on states a concurrent writer produces. Those are trivial
 // to build by hand here and nearly impossible to provoke deliberately on a
 // cluster, which is why this is the part most worth testing off-cluster.
 //
 // The arena below supports the same CAS operations the RDMA path does, so the
-// Descender under test is the same code that will run there.
+// Traversal under test is the same code that will run there.
 
 #include <cstdio>
 #include <cstdlib>
@@ -40,16 +40,16 @@ static SplitFixture stageMidSplit(FakeOps &ops, bool pending_ts) {
   return stageMidSplitOn(ops, ds::RemoteAddr{ds::kInitialDataId}, pending_ts);
 }
 
-static void checkDescendOnSettledStructure() {
+static void checkTraversalOnSettledStructure() {
   FakeOps ops = buildInitial();
   for (ds::Key k : {ds::Key{10}, ds::Key{20}, ds::Key{30}}) seedDataKey(ops, k, k * 7);
 
-  ds::Descender<FakeOps> d(ops);
+  ds::Traversal<FakeOps> d(ops);
   ds::PathStep path[ds::kMaxLayers];
 
   // A key that is present.
-  ds::DescentResult r = d.descend(20, kLayers, path);
-  CHECK(r.ok(), "descent succeeds on a settled structure");
+  ds::TraversalResult r = d.traverse(20, kLayers, path);
+  CHECK(r.ok(), "traversal succeeds on a settled structure");
   CHECK(r.found, "an existing key is found");
   CHECK(r.value == 140, "with its payload");
   CHECK(r.data_addr.id == ds::kInitialDataId, "and names the data node");
@@ -72,18 +72,18 @@ static void checkDescendOnSettledStructure() {
   }
 
   // A key that is absent but in range.
-  r = d.descend(25, kLayers, path);
-  CHECK(r.ok() && !r.found, "an absent key is a successful descent, not found");
+  r = d.traverse(25, kLayers, path);
+  CHECK(r.ok() && !r.found, "an absent key is a successful traversal, not found");
 
   // A key below everything: the data node's k_min is 0 and it holds 10/20/30,
   // so 5 is in range and simply absent.
-  r = d.descend(5, kLayers, path);
+  r = d.traverse(5, kLayers, path);
   CHECK(r.ok() && !r.found, "a key below all entries is absent, not a miss");
-  std::printf("  descent on a settled structure: %u nodes read per lookup\n",
+  std::printf("  traversal on a settled structure: %u nodes read per lookup\n",
               r.nodes_read);
 }
 
-static void checkDescendThroughMidSplit() {
+static void checkTraversalThroughMidSplit() {
   // A key that moved into the new node. The header's stale range bound would
   // claim it -- which is the wrong answer, not a wasted hop, because too large
   // a bound turns "I need another hop" into "definitively absent".
@@ -92,10 +92,10 @@ static void checkDescendThroughMidSplit() {
     SplitFixture const f = stageMidSplit(ops, /*pending_ts=*/false);
     CHECK(!ops.node(f.existing).isStable(), "the fixture really is mid-split");
 
-    ds::Descender<FakeOps> d(ops);
+    ds::Traversal<FakeOps> d(ops);
     ds::PathStep path[ds::kMaxLayers];
-    ds::DescentResult const r = d.descend(400, kLayers, path);
-    CHECK(r.ok(), "descent succeeds through a mid-split node");
+    ds::TraversalResult const r = d.traverse(400, kLayers, path);
+    CHECK(r.ok(), "traversal succeeds through a mid-split node");
     CHECK(r.found && r.value == 2800, "and finds the key that moved");
     CHECK(r.data_addr == f.created, "in the node the split created");
     CHECK(r.data_k_min == f.split_key, "reporting that node's k_min");
@@ -106,9 +106,9 @@ static void checkDescendThroughMidSplit() {
   {
     FakeOps ops = buildInitial();
     SplitFixture const f = stageMidSplit(ops, /*pending_ts=*/false);
-    ds::Descender<FakeOps> d(ops);
+    ds::Traversal<FakeOps> d(ops);
     ds::PathStep path[ds::kMaxLayers];
-    ds::DescentResult const r = d.descend(100, kLayers, path);
+    ds::TraversalResult const r = d.traverse(100, kLayers, path);
     CHECK(r.ok() && r.found && r.value == 700, "a key that stayed is found");
     CHECK(r.data_addr == f.existing, "in the existing node");
   }
@@ -118,9 +118,9 @@ static void checkDescendThroughMidSplit() {
   {
     FakeOps ops = buildInitial();
     SplitFixture const f = stageMidSplit(ops, /*pending_ts=*/false);
-    ds::Descender<FakeOps> d(ops);
+    ds::Traversal<FakeOps> d(ops);
     ds::PathStep path[ds::kMaxLayers];
-    ds::DescentResult const r = d.descend(100, kLayers, path);
+    ds::TraversalResult const r = d.traverse(100, kLayers, path);
     CHECK(r.helped_splits >= 1, "the reader helped complete the split");
 
     ds::NodeRecord const &e = ops.node(f.existing);
@@ -137,10 +137,10 @@ static void checkDescendThroughMidSplit() {
     SplitFixture const f = stageMidSplit(ops, /*pending_ts=*/true);
     CHECK(ops.vecOf(f.existing).isPending(), "the fixture really is pending");
 
-    ds::Descender<FakeOps> d(ops);
+    ds::Traversal<FakeOps> d(ops);
     ds::PathStep path[ds::kMaxLayers];
-    ds::DescentResult const r = d.descend(100, kLayers, path);
-    CHECK(r.ok() && r.found, "descent succeeds through a pending version");
+    ds::TraversalResult const r = d.traverse(100, kLayers, path);
+    CHECK(r.ok() && r.found, "traversal succeeds through a pending version");
     CHECK(r.helped_ts >= 1, "the reader fixed the timestamp");
     uint64_t const ts = ops.vecOf(f.existing).ts;
     CHECK(ts != ds::kNullTs, "which is no longer null");
@@ -153,12 +153,12 @@ static void checkDescendThroughMidSplit() {
   {
     FakeOps ops = buildInitial();
     SplitFixture const f = stageMidSplit(ops, /*pending_ts=*/true);
-    ds::Descender<FakeOps> d(ops);
+    ds::Traversal<FakeOps> d(ops);
     ds::PathStep path[ds::kMaxLayers];
-    // Descending for 400 uses the *created* node's entries, not E's, so E's
+    // Traversing for 400 uses the *created* node's entries, not E's, so E's
     // pending timestamp should be left alone.
-    ds::DescentResult const r = d.descend(400, kLayers, path);
-    CHECK(r.ok() && r.found, "descent past a pending node succeeds");
+    ds::TraversalResult const r = d.traverse(400, kLayers, path);
+    CHECK(r.ok() && r.found, "traversal past a pending node succeeds");
     CHECK(ops.vecOf(f.existing).isPending(),
           "a node merely hopped past is not helped");
     (void)f;
@@ -169,18 +169,18 @@ static void checkDescendThroughMidSplit() {
   {
     FakeOps ops = buildInitial();
     SplitFixture const f = stageMidSplit(ops, /*pending_ts=*/true);
-    ds::Descender<FakeOps> d(ops);
+    ds::Traversal<FakeOps> d(ops);
     ds::PathStep path[ds::kMaxLayers];
-    (void)d.descend(100, kLayers, path);
-    (void)d.descend(400, kLayers, path);
+    (void)d.traverse(100, kLayers, path);
+    (void)d.traverse(400, kLayers, path);
     ds::NodeRecord const &e = ops.node(f.existing);
     CHECK(e.isStable() && !ops.vecOf(f.existing).isPending(),
-          "both descents together settle the node completely");
+          "both traversals together settle the node completely");
   }
-  std::printf("  descent helps mid-split nodes, and skips ones it only hops past\n");
+  std::printf("  traversal helps mid-split nodes, and skips ones it only hops past\n");
 }
 
-static void checkDescentIsIdempotentUnderRepeatedHelp() {
+static void checkTraversalIsIdempotentUnderRepeatedHelp() {
   // Many readers arriving at the same in-flight split must converge, and the
   // losers of each CAS must not undo the winner's work.
   FakeOps ops = buildInitial();
@@ -189,8 +189,8 @@ static void checkDescentIsIdempotentUnderRepeatedHelp() {
   ds::PathStep path[ds::kMaxLayers];
   uint64_t first_ts = 0;
   for (int i = 0; i < 20; ++i) {
-    ds::Descender<FakeOps> d(ops);
-    ds::DescentResult const r = d.descend(100, kLayers, path);
+    ds::Traversal<FakeOps> d(ops);
+    ds::TraversalResult const r = d.traverse(100, kLayers, path);
     CHECK(r.ok() && r.found && r.value == 700, "every reader gets the same answer");
     uint64_t const ts = ops.vecOf(f.existing).ts;
     if (first_ts == 0) first_ts = ts;
@@ -207,16 +207,16 @@ static void checkMissIsDistinguishedFromAbsent() {
   FakeOps ops = buildInitial();
   ops.vecOf(ds::headAddr(0)).size = 0;
 
-  ds::Descender<FakeOps> d(ops);
+  ds::Traversal<FakeOps> d(ops);
   ds::PathStep path[ds::kMaxLayers];
-  ds::DescentResult const r = d.descend(50, kLayers, path);
-  CHECK(r.status == ds::DescentStatus::Miss,
+  ds::TraversalResult const r = d.traverse(50, kLayers, path);
+  CHECK(r.status == ds::TraversalStatus::Miss,
         "a level with no entry <= k is a Miss, not a not-found");
   CHECK(!r.found, "and reports nothing found");
   std::printf("  a routing gap reports Miss rather than absent\n");
 }
 
-static void checkDescentAgainstAnOracle() {
+static void checkTraversalAgainstAnOracle() {
   // A wider structure, with the data level split into a chain, checked against
   // a std::map. This is what catches an off-by-one in the right-walk or the
   // range check that a hand-built case would not.
@@ -251,12 +251,12 @@ static void checkDescentAgainstAnOracle() {
     prev = cur;
   }
 
-  ds::Descender<FakeOps> d(ops);
+  ds::Traversal<FakeOps> d(ops);
   ds::PathStep path[ds::kMaxLayers];
   size_t checked = 0, hops_total = 0;
   for (ds::Key probe = 0; probe < 1300; ++probe) {
-    ds::DescentResult const r = d.descend(probe, kLayers, path);
-    CHECK(r.ok(), "descent succeeds over a data chain");
+    ds::TraversalResult const r = d.traverse(probe, kLayers, path);
+    CHECK(r.ok(), "traversal succeeds over a data chain");
     if (!r.ok()) break;
     auto const it = oracle.find(probe);
     bool const want = it != oracle.end();
@@ -272,12 +272,12 @@ static void checkDescentAgainstAnOracle() {
 }
 
 int main() {
-  std::printf("descend_test: layers=%u capacity=%zu\n", kLayers, ds::kNodeCapacity);
-  checkDescendOnSettledStructure();
-  checkDescendThroughMidSplit();
-  checkDescentIsIdempotentUnderRepeatedHelp();
+  std::printf("traverse_test: layers=%u capacity=%zu\n", kLayers, ds::kNodeCapacity);
+  checkTraversalOnSettledStructure();
+  checkTraversalThroughMidSplit();
+  checkTraversalIsIdempotentUnderRepeatedHelp();
   checkMissIsDistinguishedFromAbsent();
-  checkDescentAgainstAnOracle();
+  checkTraversalAgainstAnOracle();
   std::printf("%s\n", g_failures == 0 ? "ALL PASS" : "FAILURES");
   return g_failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

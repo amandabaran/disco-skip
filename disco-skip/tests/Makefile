@@ -37,7 +37,7 @@ BINS    := $(addprefix obj/smoke-,$(CONFIGS))
 # The structure verifier and the bootstrap builder, against a fake arena. Needs
 # no cache and no toggle sweep -- it is pure remote-side logic.
 VERIFY  := obj/verify
-DESCEND := obj/descend
+TRAVERSE := obj/traverse
 GET     := obj/get
 INSERT  := obj/insert
 PUT     := obj/put
@@ -119,8 +119,8 @@ $(VERIFY): verify_test.cc $(HDRS) $(MACHINE_DEFINES) | obj
 	@$(CXX) $(CXXFLAGS) $(INCLUDES) -DDS_CACHE_ENABLED=0 -DDS_N_REPLICAS=1 \
 	  -DDS_MAX_LAYERS=8 -DDS_IDX_EXP=3 $< -o $@ $(LDFLAGS)
 
-$(DESCEND): descend_test.cc $(HDRS) $(MACHINE_DEFINES) | obj
-	@echo "[CXX] descend"
+$(TRAVERSE): traverse_test.cc $(HDRS) $(MACHINE_DEFINES) | obj
+	@echo "[CXX] traverse"
 	@$(CXX) $(CXXFLAGS) $(INCLUDES) -DDS_CACHE_ENABLED=0 -DDS_N_REPLICAS=1 \
 	  -DDS_MAX_LAYERS=8 -DDS_IDX_EXP=3 $< -o $@ $(LDFLAGS)
 
@@ -154,9 +154,9 @@ $(ASYNC): async_test.cc $(HDRS) fake_ops.hpp fake_replicas.hpp fake_async.hpp $(
 	@$(CXX) $(CXXFLAGS) $(INCLUDES) -DDS_CACHE_ENABLED=0 -DDS_N_REPLICAS=3 \
 	  -DDS_MAX_LAYERS=8 -DDS_IDX_EXP=3 $< -o $@ $(LDFLAGS)
 
-check: $(BINS) $(VERIFY) $(DESCEND) $(GET) $(INSERT) $(PUT) $(SELFTEST) $(QUORUM) $(ASYNC)
+check: $(BINS) $(VERIFY) $(TRAVERSE) $(GET) $(INSERT) $(PUT) $(SELFTEST) $(QUORUM) $(ASYNC)
 	@echo "---- $(VERIFY) ----"; $(VERIFY) || exit 1
-	@echo "---- $(DESCEND) ----"; $(DESCEND) || exit 1
+	@echo "---- $(TRAVERSE) ----"; $(TRAVERSE) || exit 1
 	@echo "---- $(GET) ----"; $(GET) || exit 1
 	@echo "---- $(INSERT) ----"; $(INSERT) || exit 1
 	@echo "---- $(PUT) ----"; $(PUT) || exit 1

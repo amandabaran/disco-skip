@@ -1,4 +1,4 @@
-// The resumable descent, checked against the blocking one.
+// The resumable traversal, checked against the blocking one.
 //
 // The decisions here are shared with the blocking path -- rangeEnd, covers,
 // findLte, the settle batch -- so what is new and untested is the SEQUENCING:
@@ -6,9 +6,9 @@
 // properties of the async path alone would not catch a sequencing bug that
 // happens to produce a plausible answer.
 //
-// So the main tool is differential: descend the same arena with both, and
-// require identical results. The blocking Descender is already validated by
-// descend_test and get_test, which makes it a usable oracle -- and any
+// So the main tool is differential: traverse the same arena with both, and
+// require identical results. The blocking Traversal is already validated by
+// traverse_test and get_test, which makes it a usable oracle -- and any
 // disagreement is a real bug in one of them rather than an argument about what
 // the right answer is.
 
@@ -34,18 +34,18 @@ static int g_failures = 0;
 static uint32_t const kLayers = 4;
 static ds::RemoteAddr const kData{ds::kInitialDataId};
 
-/// Compare an async descent against a blocking one over the same arena.
+/// Compare an async traversal against a blocking one over the same arena.
 static bool agrees(FakeReplicaSet &set, ds::QuorumStats &qs,
                    ds::VecOffsetHint *hint, ds::Key k, char const *what) {
   ds::PathStep pa[ds::kMaxLayers], pb[ds::kMaxLayers];
 
   FakeAsyncOps aops(set, qs, hint);
-  ds::DescentResult const a = runAsyncDescent(aops, k, kLayers, pa);
+  ds::TraversalResult const a = runAsyncTraversal(aops, k, kLayers, pa);
 
   ds::QuorumStats qs2;
   ds::QuorumOps<FakeReplicaSet> bops(set, qs2, nullptr);
-  ds::Descender<ds::QuorumOps<FakeReplicaSet>> d(bops);
-  ds::DescentResult const b = d.descend(k, kLayers, pb);
+  ds::Traversal<ds::QuorumOps<FakeReplicaSet>> d(bops);
+  ds::TraversalResult const b = d.traverse(k, kLayers, pb);
 
   bool ok = a.status == b.status && a.found == b.found && a.value == b.value &&
             a.data_addr == b.data_addr && a.data_k_min == b.data_k_min;
@@ -76,12 +76,12 @@ static void checkEmptyStructure() {
   ds::QuorumStats qs;
   for (ds::Key k : {ds::Key{0}, ds::Key{1}, ds::Key{42}, ds::Key{1u << 20}}) {
     CHECK(agrees(set, qs, nullptr, k, "empty"),
-          "the async descent agrees on an empty structure");
+          "the async traversal agrees on an empty structure");
   }
   // And it must reach the data node and report absent, not fail or miss.
   FakeAsyncOps aops(set, qs, nullptr);
   ds::PathStep path[ds::kMaxLayers];
-  ds::DescentResult const r = runAsyncDescent(aops, 42, kLayers, path);
+  ds::TraversalResult const r = runAsyncTraversal(aops, 42, kLayers, path);
   CHECK(r.ok() && !r.found, "reaching the data node and reporting absent");
   CHECK(r.data_addr == kData, "which is the initial data node");
 }
@@ -104,14 +104,14 @@ static void checkAgreementAcrossAPopulatedStructure() {
     if (p.put(k, v, h).resolved) oracle[k] = v;
   }
   ds::VerifyReport const rep = ds::verifyStructure(ops, kLayers);
-  CHECK(rep.ok(), "the structure is valid before comparing descents");
+  CHECK(rep.ok(), "the structure is valid before comparing traversals");
 
   size_t compared = 0;
   for (auto const &kv : oracle) {
     if (!agrees(set, qs, nullptr, kv.first, "present")) break;
     ++compared;
   }
-  CHECK(compared == oracle.size(), "both descents agree on every present key");
+  CHECK(compared == oracle.size(), "both traversals agree on every present key");
 
   size_t absent = 0;
   for (ds::Key k = 401; k <= 460; ++k) {
@@ -125,7 +125,7 @@ static void checkAgreementAcrossAPopulatedStructure() {
   size_t found = 0;
   for (auto const &kv : oracle) {
     ds::PathStep path[ds::kMaxLayers];
-    ds::DescentResult const r = runAsyncDescent(aops, kv.first, kLayers, path);
+    ds::TraversalResult const r = runAsyncTraversal(aops, kv.first, kLayers, path);
     if (r.ok() && r.found && r.value == kv.second) ++found;
   }
   CHECK(found == oracle.size(), "and every key reads back its written value");
@@ -136,7 +136,7 @@ static void checkAgreementAcrossAPopulatedStructure() {
 }
 
 static void checkAgreementMidSplit() {
-  // The states the helping path exists for. Both descents must settle the node
+  // The states the helping path exists for. Both traversals must settle the node
   // and return the same answer, and the async one must do it across a
   // suspension rather than in a straight line.
   for (bool pending_ts : {false, true}) {
@@ -151,9 +151,9 @@ static void checkAgreementMidSplit() {
     FakeAsyncOps aops(set, qs, nullptr);
     ds::PathStep path[ds::kMaxLayers];
     for (ds::Key k : {f.stay_key, f.split_key, f.moved_key}) {
-      ds::DescentResult const r = runAsyncDescent(aops, k, kLayers, path);
+      ds::TraversalResult const r = runAsyncTraversal(aops, k, kLayers, path);
       CHECK(r.ok() && r.found && r.value == k * 7,
-            "the async descent resolves keys across an unpropagated split");
+            "the async traversal resolves keys across an unpropagated split");
     }
     CHECK(set.arena(0).node(f.existing).isStable(),
           "having closed the propagation window");
@@ -186,24 +186,24 @@ static void checkSpeculationCollapsesANodeToOneRoundTrip() {
   FakeAsyncOps cold(set, qs, &hint);
   ds::PathStep path[ds::kMaxLayers];
   cold.resetPosts();
-  (void)runAsyncDescent(cold, 42, kLayers, path);
+  (void)runAsyncTraversal(cold, 42, kLayers, path);
   uint64_t const cold_posts = cold.posts();
 
   FakeAsyncOps warm(set, qs, &hint);
   warm.resetPosts();
-  ds::DescentResult const r = runAsyncDescent(warm, 42, kLayers, path);
+  ds::TraversalResult const r = runAsyncTraversal(warm, 42, kLayers, path);
   uint64_t const warm_posts = warm.posts();
 
-  CHECK(r.ok(), "the warm descent still resolves");
+  CHECK(r.ok(), "the warm traversal still resolves");
   CHECK(warm_posts < cold_posts,
-        "a warm hint makes the descent issue strictly fewer posts");
+        "a warm hint makes the traversal issue strictly fewer posts");
   CHECK(qs.spec_hits > 0, "because the speculations hit");
 
   // Five nodes on the path (4 index levels + the data node). Cold: header and
   // vector per node. Warm: one post per node.
   CHECK(warm_posts == kLayers + 1,
         "one post per node on the path when every guess hits");
-  std::printf("  posts per descent: %llu cold -> %llu warm (%u nodes)\n",
+  std::printf("  posts per traversal: %llu cold -> %llu warm (%u nodes)\n",
               (unsigned long long)cold_posts, (unsigned long long)warm_posts,
               kLayers + 1);
 }
@@ -222,15 +222,15 @@ static void checkAgreementUnderAStaleHint() {
 
   ds::PathStep path[ds::kMaxLayers];
   for (int i = 0; i < 12; ++i) {
-    // Warm the hint, then move the vector under it, then descend again.
+    // Warm the hint, then move the vector under it, then traverse again.
     FakeAsyncOps aops(set, qs, &hint);
-    (void)runAsyncDescent(aops, 100, kLayers, path);
+    (void)runAsyncTraversal(aops, 100, kLayers, path);
     CHECK(w.insertEntry(kData, 100, static_cast<ds::Value>(700 + i)) == ds::WriteOutcome::Published,
           "a write publishes a new version");
     FakeAsyncOps aops2(set, qs, &hint);
-    ds::DescentResult const r = runAsyncDescent(aops2, 100, kLayers, path);
+    ds::TraversalResult const r = runAsyncTraversal(aops2, 100, kLayers, path);
     CHECK(r.ok() && r.found && r.value == static_cast<ds::Value>(700 + i),
-          "and the descent returns the new value, never the stale speculation");
+          "and the traversal returns the new value, never the stale speculation");
   }
   CHECK(qs.spec_misses > 0, "the stale guesses were scored as misses");
 }

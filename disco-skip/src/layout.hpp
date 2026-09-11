@@ -202,11 +202,11 @@ struct Layout {
     // ─── Per-future scratchpad for the skip-vector path ────────────────
     //
     // Only buffers RDMA reads into or writes out of need to live in the
-    // registered MR. The descent path itself (PathStep[]) is ordinary client
+    // registered MR. The traversal path itself (PathStep[]) is ordinary client
     // memory and lives in the future object.
     //
-    // The descent reuses one node/vector buffer pair per replica across levels:
-    // it is strictly sequential -- read a header, maybe its vector, descend --
+    // The traversal reuses one node/vector buffer pair per replica across levels:
+    // it is strictly sequential -- read a header, maybe its vector, traverse --
     // so per-level buffers would be dead space. The data node gets its own pair
     // because a Get holds both at once. Staging buffers are not per-replica,
     // since the same bytes go to every replica.

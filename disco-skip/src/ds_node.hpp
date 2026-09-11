@@ -232,7 +232,7 @@ struct NodeRecord {
   Key next_k_min;
 
   /// 0 being the directory level, kDataLevel the payload level. No operation
-  /// needs it -- a descent always knows its own level -- but it makes a walk
+  /// needs it -- a traversal always knows its own level -- but it makes a walk
   /// over the arena self-describing, which is what the I1-I4 selftest needs.
   uint32_t level;
 
@@ -388,7 +388,7 @@ inline constexpr RemoteAddr headAddr(uint32_t level) {
 ///
 /// Binary search: entries are kept sorted, so this is the remote-side twin of
 /// the cache's vector_sfra::find_lte, and it is what turns one vector read into
-/// one step of the descent.
+/// one step of the traversal.
 /// The search runs over a half-open unsigned range. A closed signed range needs
 /// `mid - 1`, and at `-Wstrict-overflow=5` the dory toolchain rejects the
 /// `lo <= hi` comparison that follows it -- the optimiser wants to rewrite

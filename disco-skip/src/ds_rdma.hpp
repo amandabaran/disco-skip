@@ -313,7 +313,7 @@ class RdmaNodeReader {
         hint_(hint),
         replica_(replica) {}
 
-  /// A 64-byte header read, raw: no stability retry, because a descent needs
+  /// A 64-byte header read, raw: no stability retry, because a traversal needs
   /// to *see* that a node is mid-propagation in order to route around it or
   /// help finish it. The combined read() below is the settled variant, for the
   /// verifier.
@@ -416,10 +416,10 @@ class RdmaNodeReader {
   uint64_t stale_ = 0;
 };
 
-/// The full Ops surface ds_descend.hpp expects, over real RDMA.
+/// The full Ops surface ds_traverse.hpp expects, over real RDMA.
 ///
 /// Extends the reader with the four compare-and-swaps the helping path needs.
-/// Each returns whether it succeeded; every caller in the descent ignores that,
+/// Each returns whether it succeeded; every caller in the traversal ignores that,
 /// because a failure means another thread already performed the step.
 ///
 /// Blocking, like everything else in this header, so it belongs to bootstrap,

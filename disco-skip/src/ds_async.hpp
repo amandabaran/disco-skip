@@ -1,24 +1,24 @@
 #pragma once
 
-// The non-blocking descent: the same decisions, resumable.
+// The non-blocking traversal: the same decisions, resumable.
 //
-// WHY A STATE MACHINE AT ALL. The blocking Descender is one function that reads,
+// WHY A STATE MACHINE AT ALL. The blocking Traversal is one function that reads,
 // decides and reads again. That shape cannot have more than one operation in
-// flight, so a client's throughput is bounded by a single descent's latency --
-// about L round trips. The point of the future path is not to make one descent
-// faster (level L+1 genuinely depends on level L) but to have many descents in
+// flight, so a client's throughput is bounded by a single traversal's latency --
+// about L round trips. The point of the future path is not to make one traversal
+// faster (level L+1 genuinely depends on level L) but to have many traversals in
 // flight at once, which is what turns ~2 us per round trip into a throughput
 // number rather than a latency ceiling.
 //
 // WHAT IS AND IS NOT DUPLICATED. Only the *sequencing* lives here. Every
 // decision -- rangeEnd, nextNode, covers, findLte, isStable, isPending, and
 // what a settle batch should contain -- is the same pure function the blocking
-// path calls, in ds_node.hpp and ds_descend.hpp. That matters because those
+// path calls, in ds_node.hpp and ds_traverse.hpp. That matters because those
 // decisions are what the existing tests establish, and a second copy of them
 // would be a second thing to keep correct.
 //
-// The sequencing itself IS new code, so it is tested differentially: descend the
-// same arena with both this and the blocking Descender and require identical
+// The sequencing itself IS new code, so it is tested differentially: traverse the
+// same arena with both this and the blocking Traversal and require identical
 // results, over randomised structures including mid-split ones. That is a
 // stronger check than asserting properties of either alone.
 //
@@ -42,13 +42,13 @@
 
 #include "ds_batch.hpp"
 #include "ds_defs.hpp"
-#include "ds_descend.hpp"
+#include "ds_traverse.hpp"
 #include "ds_node.hpp"
 
 namespace ds {
 
-/// Where a resumable descent is up to.
-enum class DescentStep : uint8_t {
+/// Where a resumable traversal is up to.
+enum class TraversalStep : uint8_t {
   Idle,           ///< not started, or finished
   AwaitHeaders,   ///< a quorum header read is outstanding
   AwaitVec,       ///< a vector read is outstanding
@@ -56,17 +56,17 @@ enum class DescentStep : uint8_t {
   Done,
 };
 
-/// A descent that yields instead of blocking.
+/// A traversal that yields instead of blocking.
 ///
 /// One instance per in-flight operation. The caller posts by calling start(),
-/// then step() each time all of this descent's outstanding completions have
+/// then step() each time all of this traversal's outstanding completions have
 /// landed, until finished().
 template <class AsyncOps>
-class DescentFuture {
+class TraversalFuture {
  public:
-  explicit DescentFuture(AsyncOps &ops) : ops_(ops) {}
+  explicit TraversalFuture(AsyncOps &ops) : ops_(ops) {}
 
-  /// Begin descending to the data node covering /k/.
+  /// Begin traversing to the data node covering /k/.
   ///
   /// @param path receives one PathStep per level; must hold /layers/ entries
   /// @return completions to await before the first step()
@@ -76,7 +76,7 @@ class DescentFuture {
     path_ = path;
     for (uint32_t i = 0; i < layers; ++i) path[i] = PathStep{};
 
-    res_ = DescentResult{};
+    res_ = TraversalResult{};
     level_ = static_cast<int>(layers) - 1;
     cur_ = headAddr(static_cast<uint32_t>(level_));
     have_vec_ = false;
@@ -89,24 +89,24 @@ class DescentFuture {
   /// finished or nothing further to wait for, so check finished().
   size_t step() {
     switch (step_) {
-      case DescentStep::AwaitHeaders: return onHeaders();
-      case DescentStep::AwaitVec:     return onVec();
-      case DescentStep::AwaitHelp:    return onHelp();
-      case DescentStep::Idle:
-      case DescentStep::Done:
+      case TraversalStep::AwaitHeaders: return onHeaders();
+      case TraversalStep::AwaitVec:     return onVec();
+      case TraversalStep::AwaitHelp:    return onHelp();
+      case TraversalStep::Idle:
+      case TraversalStep::Done:
         break;
     }
     return 0;
   }
 
-  [[nodiscard]] bool finished() const { return step_ == DescentStep::Done; }
-  [[nodiscard]] DescentResult const &result() const { return res_; }
+  [[nodiscard]] bool finished() const { return step_ == TraversalStep::Done; }
+  [[nodiscard]] TraversalResult const &result() const { return res_; }
 
  private:
   // ── Posting ───────────────────────────────────────────────────────────────
 
   size_t postHeaders() {
-    step_ = DescentStep::AwaitHeaders;
+    step_ = TraversalStep::AwaitHeaders;
     // Speculate the vector alongside the headers. On a hit the vector arrives
     // with the header and this node costs one round trip instead of two, which
     // is where the offset hint actually pays.
@@ -116,14 +116,14 @@ class DescentFuture {
   }
 
   size_t postVec(VecOffset off) {
-    step_ = DescentStep::AwaitVec;
+    step_ = TraversalStep::AwaitVec;
     ++res_.vec_reads;
     return ops_.postVec(off);
   }
 
-  size_t fail(DescentStatus s) {
+  size_t fail(TraversalStatus s) {
     res_.status = s;
-    step_ = DescentStep::Done;
+    step_ = TraversalStep::Done;
     return 0;
   }
 
@@ -134,7 +134,7 @@ class DescentFuture {
       // No majority-supported handle yet: a commit is in flight. Re-poll
       // rather than guess, exactly as the blocking quorum read does.
       if (++settle_tries_ > detail::kMaxSettleAttempts) {
-        return fail(DescentStatus::ReadFailed);
+        return fail(TraversalStatus::ReadFailed);
       }
       return postHeaders();
     }
@@ -144,7 +144,7 @@ class DescentFuture {
   }
 
   size_t onVec() {
-    if (!ops_.resolveVec(vec_)) return fail(DescentStatus::ReadFailed);
+    if (!ops_.resolveVec(vec_)) return fail(TraversalStatus::ReadFailed);
     have_vec_ = true;
     return decide();
   }
@@ -158,7 +158,7 @@ class DescentFuture {
 
   // ── The decisions, all borrowed from the blocking path ────────────────────
 
-  /// Right-walk or descend, given whatever we currently hold for `cur_`.
+  /// Right-walk or traverse, given whatever we currently hold for `cur_`.
   size_t decide() {
     // A node mid-propagation cannot be judged from its header: the link fields
     // may not have landed. The vector's descriptor is authoritative, so fetch
@@ -178,7 +178,7 @@ class DescentFuture {
     }
 
     if (++hops_ > detail::kMaxHopsPerLevel) {
-      return fail(DescentStatus::Exhausted);
+      return fail(TraversalStatus::Exhausted);
     }
     cur_ = next;
     ++res_.right_hops;
@@ -192,7 +192,7 @@ class DescentFuture {
     bool const unstable = !node_.isStable();
     if (pending || unstable) {
       if (++settle_tries_ > detail::kMaxSettleAttempts) {
-        return fail(DescentStatus::ReadFailed);
+        return fail(TraversalStatus::ReadFailed);
       }
       // The same batch settleNode() would build, in the same order -- the tail
       // word last, which the chain then delivers last.
@@ -214,7 +214,7 @@ class DescentFuture {
                       packTailWord(node_.level, node_.handle.structVer()));
         ++res_.helped_splits;
       }
-      step_ = DescentStep::AwaitHelp;
+      step_ = TraversalStep::AwaitHelp;
       return ops_.postBatch(b);
     }
     settle_tries_ = 0;
@@ -228,8 +228,8 @@ class DescentFuture {
         res_.found = true;
         res_.value = vec_.e[idx].val;
       }
-      res_.status = DescentStatus::Ok;
-      step_ = DescentStep::Done;
+      res_.status = TraversalStatus::Ok;
+      step_ = TraversalStep::Done;
       return 0;
     }
 
@@ -242,7 +242,7 @@ class DescentFuture {
     res_.levels = layers_;
 
     int const idx = findLte(vec_, k_);
-    if (idx < 0) return fail(DescentStatus::Miss);
+    if (idx < 0) return fail(TraversalStatus::Miss);
 
     cur_ = RemoteAddr{vec_.e[idx].val};
     --level_;
@@ -256,7 +256,7 @@ class DescentFuture {
   uint32_t layers_ = 0;
   PathStep *path_ = nullptr;
 
-  DescentStep step_ = DescentStep::Idle;
+  TraversalStep step_ = TraversalStep::Idle;
   int level_ = 0;            ///< >= 0 is an index level; -1 is the data node
   RemoteAddr cur_{};
   NodeRecord node_{};
@@ -264,7 +264,7 @@ class DescentFuture {
   bool have_vec_ = false;
   uint32_t hops_ = 0;
   int settle_tries_ = 0;
-  DescentResult res_{};
+  TraversalResult res_{};
 };
 
 }  // namespace ds

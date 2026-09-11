@@ -54,9 +54,9 @@ struct Rig {
   }
 
   bool readsBack(ds::Key k, ds::Value want) {
-    ds::Descender<FakeOps> d(ops);
+    ds::Traversal<FakeOps> d(ops);
     ds::PathStep path[ds::kMaxLayers];
-    ds::DescentResult const r = d.descend(k, kLayers, path);
+    ds::TraversalResult const r = d.traverse(k, kLayers, path);
     return r.ok() && r.found && r.value == want;
   }
 
@@ -211,20 +211,20 @@ static void checkPutOntoAMidSplitNodeHelpsFirst() {
 
   CHECK(p.put(150, 1050, /*height=*/1).resolved,
         "a structural put resolves over a mid-split node");
-  // The descent settles a node before it reads its entries, so on this path
+  // The traversal settles a node before it reads its entries, so on this path
   // the helping is charged to PutStats, not to the writer. Either is a pass;
   // what matters is that somebody finished the outstanding operation.
   CHECK(ps.helped >= 1 || ws.helped_ts >= 1 || ws.helped_splits >= 1,
         "having helped the outstanding operation");
   CHECK(ops.node(f.existing).isStable(), "which leaves the node settled");
 
-  ds::Descender<FakeOps> d(ops);
+  ds::Traversal<FakeOps> d(ops);
   ds::PathStep path[ds::kMaxLayers];
   for (ds::Key k : {f.stay_key, f.split_key, f.moved_key}) {
-    ds::DescentResult const r = d.descend(k, kLayers, path);
+    ds::TraversalResult const r = d.traverse(k, kLayers, path);
     CHECK(r.ok() && r.found, "and every pre-existing key survives");
   }
-  ds::DescentResult const r = d.descend(150, kLayers, path);
+  ds::TraversalResult const r = d.traverse(150, kLayers, path);
   CHECK(r.ok() && r.found && r.value == 1050, "along with the newly written one");
   CHECK(verifyOk(ops, "after a put over a mid-split node"), "I1-I4 hold");
 }
@@ -266,9 +266,9 @@ static void checkMixedHeightWorkloadAgainstAnOracle() {
   CHECK(found == oracle.size(), "all of them");
 
   for (ds::Key k = 901; k <= 950; ++k) {
-    ds::Descender<FakeOps> d(r.ops);
+    ds::Traversal<FakeOps> d(r.ops);
     ds::PathStep path[ds::kMaxLayers];
-    ds::DescentResult const res = d.descend(k, kLayers, path);
+    ds::TraversalResult const res = d.traverse(k, kLayers, path);
     CHECK(res.ok() && !res.found, "keys never written read as absent");
   }
 

@@ -369,10 +369,10 @@ static size_t countInventedBoundaries(ds::SkipVec const &sv, uint32_t layers,
   return invented;
 }
 
-// A stand-in for a remote descent, in the shape the real one will hand back.
+// A stand-in for a remote traversal, in the shape the real one will hand back.
 // Boundaries get sparser by kLevelRatio per level, which is the geometry the
 // interface doc's §8 analysis and the cache's TARGET_IDX_RATIO both assume.
-static uint32_t fakeDescent(ds::Key k, uint32_t layers, ds::PathStep *out) {
+static uint32_t fakeTraversal(ds::Key k, uint32_t layers, ds::PathStep *out) {
   ds::Key stride = ds::kLevelRatio;
   for (uint32_t L = 0; L < layers; ++L) {
     ds::Key const k_min = (k / stride) * stride;
@@ -400,7 +400,7 @@ static void checkReconcilePath() {
   ds::bootstrapHeads(sv, heads);
   CHECK(ds::headsBootstrapped(sv), "heads report as bootstrapped");
 
-  // Drive the miss -> descend -> reconcile loop the orchestrator will run, and
+  // Drive the miss -> traverse -> reconcile loop the orchestrator will run, and
   // keep an oracle of what locate_data must return for each key.
   std::map<ds::Key, ds::RemoteAddr> oracle;
   std::set<ds::Key> known_boundaries;
@@ -411,7 +411,7 @@ static void checkReconcilePath() {
     ds::Key const k = key_dist(rng);
     if (sv.locate_data(k).isNull() || oracle.find(k) == oracle.end()) {
       ds::PathStep path[ds::kMaxLayers];
-      uint32_t const n = fakeDescent(k, layers, path);
+      uint32_t const n = fakeTraversal(k, layers, path);
       for (uint32_t L = 0; L < n; ++L) known_boundaries.insert(path[L].k_min);
 
       ds::RemoteAddr const data_addr{900000000 + k};
@@ -429,7 +429,7 @@ static void checkReconcilePath() {
         oracle[path[0].k_min] = path[0].first_down;
       }
 
-      // The data entry the descent installed is a boundary the cache may split
+      // The data entry the traversal installed is a boundary the cache may split
       // at, so it counts as known.
       known_boundaries.insert(k);
     }
@@ -460,7 +460,7 @@ static void checkReconcilePath() {
 
   // gather_prevs must now find real addresses rather than nulls, since
   // reconcile has been installing them. Not every level can be non-null (a
-  // level whose covering node the descent never reached stays null), but the
+  // level whose covering node the traversal never reached stays null), but the
   // directory level always has one after a reconcile in range.
   ds::Key const probe = oracle.begin()->first;
   ds::RemoteAddr prevs[ds::kMaxLayers]{};

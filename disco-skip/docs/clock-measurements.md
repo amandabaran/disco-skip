@@ -269,7 +269,7 @@ servers while the data path does. `workloads/oops-workloade*` is `scanproportion
 every scan needs one snapshot, so on that workload the FAA rate is essentially the operation
 rate.
 
-Rough sizing: a YCSB-E scan costs a 4-level descent plus the data nodes in range, call it
+Rough sizing: a YCSB-E scan costs a 4-level traversal plus the data nodes in range, call it
 ~6 round trips. Four memory servers at ~7 Mops/s of reads support on the order of 4.7 M
 scans/s, each wanting one FAA — against a 2.7 Mops/s counter. So the counter would cap
 scan-heavy throughput at roughly **1.7× below what the data path can sustain**.

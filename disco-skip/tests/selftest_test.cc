@@ -45,14 +45,14 @@ static void checkAllThreePhasesPassOnAFreshStructure() {
 
   CHECK(rc == 0, "the selftest passes on a freshly bootstrapped structure");
   CHECK(contains(log, "SELFTEST PASS: I1-I4 hold"), "structure phase passes");
-  CHECK(contains(log, "DESCENT PASS"), "descent phase passes");
+  CHECK(contains(log, "TRAVERSAL PASS"), "traversal phase passes");
   CHECK(contains(log, "WRITE PASS"), "write phase passes");
   CHECK(!contains(log, "FAIL"), "and nothing reports a failure");
 
   // The exact lines the runbook documents as expected output. If the script or
   // the reporting changes, this is what says the runbook needs updating.
   CHECK(contains(log, "probes:       5 resolved, 5 absent"),
-        "the descent probe line matches what the runbook publishes");
+        "the traversal probe line matches what the runbook publishes");
   CHECK(contains(log, "puts:         9 resolved, 0 failed (6 data-only, "
                       "3 structural)"),
         "and so does the put line");
@@ -76,20 +76,20 @@ static void checkEveryScriptedKeyIsReadableAfterwards() {
         "the selftest passes");
 
   // Independently of the selftest's own read-back, walk to every scripted key.
-  ds::Descender<FakeOps> d(ops);
+  ds::Traversal<FakeOps> d(ops);
   ds::PathStep path[ds::kMaxLayers];
   for (ds::SelftestWrite const &w : ds::kSelftestWrites) {
     ds::Value want = w.v;
     for (ds::SelftestWrite const &later : ds::kSelftestWrites) {
       if (later.k == w.k) want = later.v;
     }
-    ds::DescentResult const r = d.descend(w.k, kLayers, path);
+    ds::TraversalResult const r = d.traverse(w.k, kLayers, path);
     CHECK(r.ok() && r.found && r.value == want,
           "every scripted key reads back with its final value");
   }
 
-  ds::DescentResult const never =
-      d.descend(ds::kSelftestAbsentKey, kLayers, path);
+  ds::TraversalResult const never =
+      d.traverse(ds::kSelftestAbsentKey, kLayers, path);
   CHECK(never.ok() && !never.found,
         "and the never-written key still reads as absent");
 }
@@ -112,9 +112,9 @@ static void checkStructurePhaseRejectsABrokenStructure() {
 static void checkSelftestIsRerunnable() {
   // Re-running the whole selftest over an already-populated structure passes.
   //
-  // I expected this to fail, on the grounds that the descent phase asserts the
+  // I expected this to fail, on the grounds that the traversal phase asserts the
   // structure is empty. It does not, and the reason is worth recording: the
-  // descent probes are {0, 1, 42, 1000, 2^20} and the write script touches
+  // traversal probes are {0, 1, 42, 1000, 2^20} and the write script touches
   // {50 .. 600}, so the two sets are disjoint by construction, and every put in
   // the script is idempotent -- an update or a boundary no-op the second time.
   //
@@ -131,7 +131,7 @@ static void checkSelftestIsRerunnable() {
         "and so does a second run over the structure the first one built");
   CHECK(contains(second.str(), "WRITE PASS"), "including the write phase");
   CHECK(contains(second.str(), "probes:       5 resolved, 5 absent"),
-        "the descent probes are still absent, being disjoint from the script");
+        "the traversal probes are still absent, being disjoint from the script");
 
   // The second run should be almost entirely no-ops and updates: the
   // boundaries already exist, so nothing structural is created.

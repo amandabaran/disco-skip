@@ -46,7 +46,7 @@ void instantiate_rdma_paths(Conns &conns, ds::Layout const &layout, Bufs b,
   (void)rep.ok();
 }
 
-// The descent and Get, over the full RDMA Ops surface. Compile-only: this is
+// The traversal and Get, over the full RDMA Ops surface. Compile-only: this is
 // the combination that runs on the cluster, so it must at least type-check
 // here.
 void instantiate_ops(Conns &conns, ds::Layout const &layout, Bufs b,
@@ -58,8 +58,8 @@ void instantiate_ops(Conns &conns, ds::Layout const &layout, Bufs b,
   ds::RdmaOps<Conns> ops(conns, layout, b.node, b.vec, cas_buf, hint);
 
   ds::PathStep path[ds::kMaxLayers];
-  ds::Descender<ds::RdmaOps<Conns>> d(ops);
-  ds::DescentResult const r = d.descend(42, layers, path);
+  ds::Traversal<ds::RdmaOps<Conns>> d(ops);
+  ds::TraversalResult const r = d.traverse(42, layers, path);
   (void)r.ok();
   (void)ops.casCount();
 

@@ -107,17 +107,17 @@ inline bool headsBootstrapped(SkipVec const &sv) {
   return sv.heads_bootstrapped();
 }
 
-/// Feed back what a remote descent saw, after locate_data() missed or a read
+/// Feed back what a remote traversal saw, after locate_data() missed or a read
 /// showed a k_min mismatch (C4).
 ///
 /// Installs the level-0 routing entry, then splits the local structure at the
-/// remote boundaries the descent actually observed, which is what repairs the
+/// remote boundaries the traversal actually observed, which is what repairs the
 /// *coarse* case: a local node that recorded a boundary as an ordinary entry
 /// because some other client created it. Idempotent.
 ///
 /// @param data_k_min  k_min of the remote data node covering the sought key
 /// @param data_addr   that node's remote address
-/// @param path        what the descent saw, path[L] describing level L
+/// @param path        what the traversal saw, path[L] describing level L
 /// @param levels      valid entries in /path/; 0 (or a null path) repairs the
 ///                    entry only, and leaves promoted nodes null-addressed
 inline void reconcile(SkipVec &sv, Key data_k_min, RemoteAddr data_addr,

@@ -5,7 +5,7 @@
 // this file is where the correctness actually gets established -- the cluster
 // can only confirm that three connections work.
 //
-// The last two tests are the ones that matter most: the full Descender/Writer/
+// The last two tests are the ones that matter most: the full Traversal/Writer/
 // Putter stack running unchanged on top of QuorumOps, because the entire design
 // claim is that replication sits behind the Ops surface and the algorithms above
 // it neither know nor care.
@@ -285,14 +285,14 @@ static void checkTheWritePathRunsUnchangedOverThreeReplicas() {
 
   // Read back through the quorum, and independently confirm each replica
   // reached the same state -- convergence is the property replication owes us.
-  ds::Descender<ds::QuorumOps<FakeReplicaSet>> d(r.ops);
+  ds::Traversal<ds::QuorumOps<FakeReplicaSet>> d(r.ops);
   ds::PathStep path[ds::kMaxLayers];
   for (W const &w : writes) {
     ds::Value want = w.v;
     for (W const &later : writes) {
       if (later.k == w.k) want = later.v;
     }
-    ds::DescentResult const res = d.descend(w.k, kLayers, path);
+    ds::TraversalResult const res = d.traverse(w.k, kLayers, path);
     CHECK(res.ok() && res.found && res.value == want,
           "every key reads back through the quorum");
   }
@@ -324,14 +324,14 @@ static void checkConvergenceWithAPersistentlyLaggingReplica() {
   for (int i = 0; i < 120; ++i) {
     ds::Key const k = 1 + (rng() % 200);
     ds::Value const v = 1 + (rng() % 100000);
-    // Descend first. Writing into a node that does not cover k is exactly what
+    // Traverse first. Writing into a node that does not cover k is exactly what
     // insertEntry now rejects, and relying on it being accepted is how the
     // first version of this test corrupted I1.
-    ds::Descender<ds::QuorumOps<FakeReplicaSet>> d(r.ops);
+    ds::Traversal<ds::QuorumOps<FakeReplicaSet>> d(r.ops);
     ds::PathStep path[ds::kMaxLayers];
-    ds::DescentResult const res = d.descend(k, kLayers, path);
+    ds::TraversalResult const res = d.traverse(k, kLayers, path);
     if (!res.ok()) {
-      CHECK(false, "the descent before an insert should resolve");
+      CHECK(false, "the traversal before an insert should resolve");
       continue;
     }
     ds::RemoteAddr orphan{};
@@ -361,10 +361,10 @@ static void checkConvergenceWithAPersistentlyLaggingReplica() {
   CHECK(r.verifyOk("with a lagging replica"), "I1-I4 still hold");
 
   size_t found = 0;
-  ds::Descender<ds::QuorumOps<FakeReplicaSet>> d(r.ops);
+  ds::Traversal<ds::QuorumOps<FakeReplicaSet>> d(r.ops);
   ds::PathStep path[ds::kMaxLayers];
   for (auto const &kv : oracle) {
-    ds::DescentResult const res = d.descend(kv.first, kLayers, path);
+    ds::TraversalResult const res = d.traverse(kv.first, kLayers, path);
     if (res.ok() && res.found && res.value == kv.second) ++found;
   }
   CHECK(found == oracle.size(),
@@ -546,8 +546,8 @@ static void checkSpeculationIsRejectedWhenReplicaZeroDissents() {
         "from a replica that voted with the winner, not from the speculation");
 }
 
-static void checkHintHelpsADescentAndCostsNothingWrong() {
-  // End to end: a descent with a warm hint must return the same answers as one
+static void checkHintHelpsATraversalAndCostsNothingWrong() {
+  // End to end: a traversal with a warm hint must return the same answers as one
   // without, and serve some of its vector reads from speculation.
   HintRig warm;
   Rig cold;
@@ -562,12 +562,12 @@ static void checkHintHelpsADescentAndCostsNothingWrong() {
   ds::PathStep path[ds::kMaxLayers];
   for (int pass = 0; pass < 3; ++pass) {
     for (ds::Key k : {ds::Key{100}, ds::Key{200}, ds::Key{300}, ds::Key{999}}) {
-      ds::Descender<ds::QuorumOps<FakeReplicaSet>> dw(warm.ops);
-      ds::Descender<ds::QuorumOps<FakeReplicaSet>> dc(cold.ops);
-      ds::DescentResult const rw = dw.descend(k, kLayers, path);
-      ds::DescentResult const rc = dc.descend(k, kLayers, path);
+      ds::Traversal<ds::QuorumOps<FakeReplicaSet>> dw(warm.ops);
+      ds::Traversal<ds::QuorumOps<FakeReplicaSet>> dc(cold.ops);
+      ds::TraversalResult const rw = dw.traverse(k, kLayers, path);
+      ds::TraversalResult const rc = dc.traverse(k, kLayers, path);
       CHECK(rw.ok() == rc.ok() && rw.found == rc.found && rw.value == rc.value,
-            "a warm hint changes no answer a descent gives");
+            "a warm hint changes no answer a traversal gives");
     }
   }
 
@@ -600,7 +600,7 @@ int main() {
   checkSpeculationSavesTheSerialisedVectorRead();
   checkAStaleGuessNeverServesOldBytes();
   checkSpeculationIsRejectedWhenReplicaZeroDissents();
-  checkHintHelpsADescentAndCostsNothingWrong();
+  checkHintHelpsATraversalAndCostsNothingWrong();
 
   if (g_failures != 0) {
     std::printf("%d FAILURE(S)\n", g_failures);

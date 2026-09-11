@@ -3,8 +3,8 @@
 // A local stand-in for the memory servers, plus the fixtures that stage the
 // concurrent states the helping paths exist for.
 //
-// Shared by descend_test and get_test: both need an arena that supports the
-// same reads and CAS operations the RDMA path does, so that the Descender and
+// Shared by traverse_test and get_test: both need an arena that supports the
+// same reads and CAS operations the RDMA path does, so that the Traversal and
 // Getter under test are the same code that runs on the cluster.
 
 #include <cstdint>
@@ -12,7 +12,7 @@
 
 #include "ds_batch.hpp"
 #include "ds_bootstrap.hpp"
-#include "ds_descend.hpp"
+#include "ds_traverse.hpp"
 #include "ds_node.hpp"
 #include "layout.hpp"
 
@@ -239,7 +239,7 @@ class FakeOps {
 };
 
 /// Insert a key into a data node sequentially, as a settled write would leave
-/// it. Not the real F1 path -- just enough structure for a descent to find.
+/// it. Not the real F1 path -- just enough structure for a traversal to find.
 inline void seedDataKey(FakeOps &ops, ds::Key k, ds::Value v) {
   ds::VecRecord &dv = ops.vecOf(ds::RemoteAddr{ds::kInitialDataId});
   uint32_t i = dv.size;

@@ -289,11 +289,11 @@ static void checkCapacityOverflowProducesAnOrphan() {
         "which is flagged I4-orphan, since nothing parents it");
 
   // The key must be findable afterwards, in whichever half it landed.
-  ds::Descender<FakeOps> d(ops);
+  ds::Traversal<FakeOps> d(ops);
   ds::PathStep path[ds::kMaxLayers];
-  ds::DescentResult const r = d.descend(175, kLayers, path);
+  ds::TraversalResult const r = d.traverse(175, kLayers, path);
   CHECK(r.ok() && r.found && r.value == 4242,
-        "and the inserted key is readable through a normal descent");
+        "and the inserted key is readable through a normal traversal");
   CHECK(verifyOk(ops), "I1-I4 hold after an overflow split");
 
   std::printf("  overflow: %llu capacity split(s), orphan id %llu\n",
@@ -374,11 +374,11 @@ static void checkReaderMidSplitSeesEveryKey() {
       seedDataKey(ops, k, k * 7);
     SplitFixture const f = stageMidSplitOn(ops, kData, pending_ts);
 
-    ds::Descender<FakeOps> d(ops);
+    ds::Traversal<FakeOps> d(ops);
     ds::PathStep path[ds::kMaxLayers];
     for (ds::Key k : {f.stay_key, f.split_key, f.moved_key}) {
-      ds::DescentResult const r = d.descend(k, kLayers, path);
-      CHECK(r.ok(), "a mid-split descent resolves");
+      ds::TraversalResult const r = d.traverse(k, kLayers, path);
+      CHECK(r.ok(), "a mid-split traversal resolves");
       CHECK(r.found && r.value == k * 7,
             "and finds keys on both sides of an unpropagated split");
     }
@@ -399,11 +399,11 @@ static void checkManyWritesAgainstAnOracle() {
     ds::Key const k = 1 + (rng() % 600);
     ds::Value const v = rng() % 1000000;
 
-    ds::Descender<FakeOps> d(ops);
+    ds::Traversal<FakeOps> d(ops);
     ds::PathStep path[ds::kMaxLayers];
-    ds::DescentResult const r = d.descend(k, kLayers, path);
+    ds::TraversalResult const r = d.traverse(k, kLayers, path);
     if (!r.ok()) {
-      CHECK(false, "descent before an insert should resolve");
+      CHECK(false, "traversal before an insert should resolve");
       continue;
     }
     ds::WriteOutcome const o = w.insertWithOverflow(r.data_addr, k, v, nullptr);
@@ -418,9 +418,9 @@ static void checkManyWritesAgainstAnOracle() {
 
   size_t checked = 0;
   for (auto const &kv : oracle) {
-    ds::Descender<FakeOps> d(ops);
+    ds::Traversal<FakeOps> d(ops);
     ds::PathStep path[ds::kMaxLayers];
-    ds::DescentResult const r = d.descend(kv.first, kLayers, path);
+    ds::TraversalResult const r = d.traverse(kv.first, kLayers, path);
     CHECK(r.ok(), "every written key resolves");
     CHECK(r.found, "and is found");
     if (r.found) CHECK(r.value == kv.second, "with the value last written");
@@ -430,9 +430,9 @@ static void checkManyWritesAgainstAnOracle() {
   // Absent keys must read as absent, not as a failure or a stale neighbour.
   size_t absent = 0;
   for (ds::Key k = 601; k <= 640; ++k) {
-    ds::Descender<FakeOps> d(ops);
+    ds::Traversal<FakeOps> d(ops);
     ds::PathStep path[ds::kMaxLayers];
-    ds::DescentResult const r = d.descend(k, kLayers, path);
+    ds::TraversalResult const r = d.traverse(k, kLayers, path);
     CHECK(r.ok() && !r.found, "keys never written read as absent");
     ++absent;
   }

@@ -35,9 +35,9 @@ namespace ds {
 ///
 /// Every head carries exactly one entry, keyed 0, pointing one level down. That
 /// single entry is what makes the structure navigable from the first operation:
-/// a descent does find_lte(k) at each level, and with an entry at key 0 it
+/// a traversal does find_lte(k) at each level, and with an entry at key 0 it
 /// always has somewhere to go, for any key. An empty directory head would leave
-/// a descent with no down pointer to follow and nothing to report.
+/// a traversal with no down pointer to follow and nothing to report.
 ///
 /// The entry is also *faithful* rather than a special case: a head's entries are
 /// the boundaries of the level below, and the level below really does have a

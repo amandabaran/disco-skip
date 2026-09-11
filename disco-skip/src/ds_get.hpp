@@ -15,8 +15,8 @@
 //        - k is in the vector                         -> hit
 //        - k absent and k < the node's range end      -> definitively absent
 //        - k at or past the range end                 -> wrong node (C4)
-//   3. On a miss or a C4 mismatch, descend remotely and feed the path back so
-//      the cache splits at the boundaries the descent saw.
+//   3. On a miss or a C4 mismatch, traverse remotely and feed the path back so
+//      the cache splits at the boundaries the traversal saw.
 //
 // Step 3 is the whole reason a stale cache costs round trips rather than wrong
 // answers: the range check is what turns a bad hint into a detected one.
@@ -24,7 +24,7 @@
 #include <cstdint>
 
 #include "ds_defs.hpp"
-#include "ds_descend.hpp"
+#include "ds_traverse.hpp"
 #include "ds_node.hpp"
 
 namespace ds {
@@ -35,7 +35,7 @@ struct GetStats {
   uint64_t cache_hits = 0;      ///< cache named a node that answered
   uint64_t cache_misses = 0;    ///< cache had no entry for k
   uint64_t kmin_mismatch = 0;   ///< C4: named node no longer covers k
-  uint64_t descents = 0;        ///< full remote traversals
+  uint64_t traversals = 0;        ///< full remote traversals
   uint64_t reconciles = 0;      ///< paths fed back to the cache
   uint64_t nodes_read = 0;   ///< 64-byte header reads
   uint64_t vec_reads = 0;    ///< 320-byte vector reads
@@ -51,7 +51,7 @@ struct GetResult {
   Value value = 0;
 };
 
-/// @param Ops    the RDMA (or fake) operation surface, as ds_descend.hpp defines
+/// @param Ops    the RDMA (or fake) operation surface, as ds_traverse.hpp defines
 /// @param Cache  a null-cache stand-in, or the CacheAdapter over SkipVec
 template <class Ops, class Cache>
 class Getter {
@@ -116,9 +116,9 @@ class Getter {
 
     // ── 3. Resolve remotely, and teach the cache what we saw ───────────────
     PathStep path[kMaxLayers];
-    ++stats_.descents;
-    Descender<Ops> d(ops_);
-    DescentResult const r = d.descend(k, layers_, path);
+    ++stats_.traversals;
+    Traversal<Ops> d(ops_);
+    TraversalResult const r = d.traverse(k, layers_, path);
 
     stats_.nodes_read += r.nodes_read;
     stats_.vec_reads += r.vec_reads;
@@ -128,7 +128,7 @@ class Getter {
     if (!r.ok()) {
       // A Miss here means nothing routes to k yet, which for a read is simply
       // "not present": there is no node to install, so no reconcile either.
-      if (r.status == DescentStatus::Miss) {
+      if (r.status == TraversalStatus::Miss) {
         out.resolved = true;
         ++stats_.not_found;
         return out;
@@ -137,8 +137,8 @@ class Getter {
       return out;  // resolved == false: the caller retries
     }
 
-    // The descent cost nothing extra to record, so hand the whole path back.
-    // A5: this is what lets the cache split at the boundaries the descent
+    // The traversal cost nothing extra to record, so hand the whole path back.
+    // A5: this is what lets the cache split at the boundaries the traversal
     // actually saw, which is what stops a read-mostly client degenerating the
     // directory into a linked list.
     cache_.reconcile(r.data_k_min, r.data_addr, path, r.levels);
@@ -159,7 +159,7 @@ class Getter {
 };
 
 /// A cache that never hints and never learns, for the DS_CACHE_ENABLED=0
-/// baseline. Every Get then costs a full descent, which is the number the
+/// baseline. Every Get then costs a full traversal, which is the number the
 /// cache has to beat.
 struct NullCache {
   [[nodiscard]] RemoteAddr locateData(Key) const { return RemoteAddr{}; }

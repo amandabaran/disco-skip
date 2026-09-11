@@ -31,7 +31,7 @@ static uint32_t const kLayers = 4;
 /// Build a data-level chain of /nodes/ nodes, each holding /per_node/ keys,
 /// with the directory pointing only at the first. That is deliberately the
 /// coarse case: the cache and the remote structure start maximally out of step,
-/// so every early Get has to descend and reconcile, and we can watch the cost
+/// so every early Get has to traverse and reconcile, and we can watch the cost
 /// come down.
 static std::map<ds::Key, ds::Value> seedChain(FakeOps &ops, int nodes,
                                               int per_node) {
@@ -171,13 +171,13 @@ static void checkCacheActuallyReducesWork() {
   CHECK(uncached.cache_hits == 0, "the baseline never hits");
   // Note reconciles is a count of paths handed back, not of cache work done:
   // NullCache receives and ignores them, so the baseline's count matches its
-  // descent count rather than being zero. What distinguishes the baseline is
-  // that it descends on *every* operation.
-  CHECK(uncached.descents == ops_uncached, "the baseline descends on every Get");
-  CHECK(cached.descents < ops_cached, "the cache avoids descending on most Gets");
+  // traversal count rather than being zero. What distinguishes the baseline is
+  // that it traverses on *every* operation.
+  CHECK(uncached.traversals == ops_uncached, "the baseline traverses on every Get");
+  CHECK(cached.traversals < ops_cached, "the cache avoids traversing on most Gets");
   CHECK(cached.cache_hits > 0, "the cache does hit once warm");
   CHECK(per_op_cached < per_op_uncached, "the cache reduces reads per Get");
-  // The header/vector split must actually be exploited: a descent that hops
+  // The header/vector split must actually be exploited: a traversal that hops
   // over N nodes should read far fewer vectors than headers, or seek() is
   // fetching vectors it does not need.
   CHECK(uncached.vec_reads < uncached.nodes_read,

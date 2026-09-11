@@ -292,7 +292,7 @@ Recorded so they are not re-proposed.
 | Arenas, allocators, offset hint | `src/layout.hpp` | done, tested |
 | Bootstrap of the initial structure | `src/ds_bootstrap.hpp` | done, tested |
 | I1–I4 structural verifier | `src/ds_verify.hpp` | done, tested (rejects 18 hand-broken structures) |
-| Remote descent + helping | `src/ds_descend.hpp` | done, tested |
+| Remote traversal + helping | `src/ds_traverse.hpp` | done, tested |
 | Point-read orchestration | `src/ds_get.hpp` | done, tested against the real cache |
 | Cache glue | `src/ds_cache.hpp` | done |
 | Blocking RDMA + `RdmaOps` | `src/ds_rdma.hpp` | written, compiles, validated only via `--selftest` |
@@ -318,8 +318,8 @@ cache and the wire without either calling the other.
 
 Two properties worth knowing before changing either:
 
-- **The helping protocol lives in one place.** `settleNode()` in `ds_descend.hpp` is shared
-  by the descent and by both write primitives rather than copied into each. A write must
+- **The helping protocol lives in one place.** `settleNode()` in `ds_traverse.hpp` is shared
+  by the traversal and by both write primitives rather than copied into each. A write must
   settle a node *and find it stable* before CASing its handle, because a stable node has had
   any split descriptor propagated into its header — which is what makes it safe for the new
   version to carry no descriptor of its own.

@@ -25,7 +25,7 @@
 #include <ostream>
 
 #include "ds_defs.hpp"
-#include "ds_descend.hpp"
+#include "ds_traverse.hpp"
 #include "ds_insert.hpp"
 #include "ds_node.hpp"
 #include "ds_put.hpp"
@@ -43,7 +43,7 @@ struct SelftestWrite {
   uint32_t height;
 };
 
-/// The fixed script: ascending, descending and interleaved keys, one repeat to
+/// The fixed script: ascending, traversing and interleaved keys, one repeat to
 /// exercise the update path, and one repeated boundary to exercise the split
 /// no-op. Heights are fixed rather than drawn for the same reason.
 inline constexpr SelftestWrite kSelftestWrites[] = {
@@ -101,24 +101,34 @@ int selftestStructure(Reader &reader, uint32_t layers, VecOffsetHint const *hint
   return 0;
 }
 
-/// Exercise the descent over the fabric.
+/// Exercise the traversal over the fabric.
 ///
 /// The structure is empty at this point, so every key resolves to the single
 /// data node and finds nothing -- which is exactly the interesting assertion: a
-/// descent over an empty structure must reach the data node and report absent,
+/// traversal over an empty structure must reach the data node and report absent,
 /// never fail and never miss.
 template <class Ops>
-int selftestDescent(Ops &ops, uint32_t layers, std::ostream &out) {
-  out << "\n################ Descent:" << std::endl;
-  Descender<Ops> descender(ops);
+int selftestTraversal(Ops &ops, uint32_t layers, std::ostream &out) {
+  out << "\n################ Traversal:" << std::endl;
+
+  // Counters are per-phase, not cumulative. The structure phase runs over the
+  // same Ops object -- it is the same quorum surface, which is the point -- so
+  // reporting raw totals here would charge this phase with the verifier's
+  // reads. "35 headers for 5 probes" is what that looks like, and it reads as a
+  // traversal costing 40% more than it does.
+  uint64_t const headers0 = ops.nodeReads();
+  uint64_t const vecs0 = ops.vecReads();
+  uint64_t const cas0 = ops.casCount();
+
+  Traversal<Ops> traversal(ops);
 
   PathStep path[kMaxLayers];
   uint32_t ok = 0, absent = 0, bad = 0;
   Key const probes[] = {0, 1, 42, 1000, 1u << 20};
   for (Key k : probes) {
-    DescentResult const r = descender.descend(k, layers, path);
+    TraversalResult const r = traversal.traverse(k, layers, path);
     if (!r.ok()) {
-      out << "  key " << k << ": descent failed, status "
+      out << "  key " << k << ": traversal failed, status "
           << static_cast<int>(r.status) << std::endl;
       ++bad;
       continue;
@@ -142,19 +152,20 @@ int selftestDescent(Ops &ops, uint32_t layers, std::ostream &out) {
   }
   out << "probes:       " << ok << " resolved, " << absent
       << " absent (expected: all, the structure is empty)" << std::endl;
-  out << "rdma:         " << ops.nodeReads() << " headers, " << ops.vecReads()
-      << " vectors, " << ops.casCount() << " CAS" << std::endl;
+  out << "rdma:         " << (ops.nodeReads() - headers0) << " headers, "
+      << (ops.vecReads() - vecs0) << " vectors, "
+      << (ops.casCount() - cas0) << " CAS" << std::endl;
 
   if (bad != 0) {
-    out << "DESCENT FAIL: " << bad << " problem(s)" << std::endl;
+    out << "TRAVERSAL FAIL: " << bad << " problem(s)" << std::endl;
     return 1;
   }
   if (ok != sizeof(probes) / sizeof(probes[0]) || absent != ok) {
-    out << "DESCENT FAIL: expected every probe to resolve and be absent"
+    out << "TRAVERSAL FAIL: expected every probe to resolve and be absent"
         << std::endl;
     return 1;
   }
-  out << "DESCENT PASS: every probe reached the data node and reported absent"
+  out << "TRAVERSAL PASS: every probe reached the data node and reported absent"
       << std::endl;
   return 0;
 }
@@ -170,6 +181,15 @@ template <class Reader, class Ops>
 int selftestWrites(Reader &reader, Ops &ops, uint32_t layers,
                    std::ostream &out) {
   out << "\n################ Write path:" << std::endl;
+
+  // Per-phase, for the same reason as above: the traversal phase may have
+  // helped an in-flight operation, and those CASes and batches are not this
+  // phase's cost.
+  uint64_t const nodes0 = ops.nodeWrites();
+  uint64_t const vecs0 = ops.vecWrites();
+  uint64_t const bytes0 = ops.bytesWritten();
+  uint64_t const cas0 = ops.casCount();
+  uint64_t const batches0 = ops.batches();
 
   PutStats pstats;
   WriteStats wstats;
@@ -188,10 +208,10 @@ int selftestWrites(Reader &reader, Ops &ops, uint32_t layers,
     ++wrote;
   }
 
-  // Read every key back through an ordinary descent. This is the end-to-end
+  // Read every key back through an ordinary traversal. This is the end-to-end
   // assertion: the bytes a write put on the memory server are the bytes a
   // reader that knows nothing about that write finds.
-  Descender<Ops> descender(ops);
+  Traversal<Ops> traversal(ops);
   PathStep path[kMaxLayers];
   uint32_t readback = 0, mismatch = 0;
   for (SelftestWrite const &w : kSelftestWrites) {
@@ -202,11 +222,11 @@ int selftestWrites(Reader &reader, Ops &ops, uint32_t layers,
     for (SelftestWrite const &later : kSelftestWrites) {
       if (later.k == w.k) want = later.v;
     }
-    DescentResult const r = descender.descend(w.k, layers, path);
+    TraversalResult const r = traversal.traverse(w.k, layers, path);
     if (!r.ok() || !r.found || r.value != want) {
       out << "  key " << w.k << ": expected " << want << ", got ";
       if (!r.ok()) {
-        out << "descent failure";
+        out << "traversal failure";
       } else if (!r.found) {
         out << "absent";
       } else {
@@ -219,8 +239,8 @@ int selftestWrites(Reader &reader, Ops &ops, uint32_t layers,
     ++readback;
   }
 
-  DescentResult const never =
-      descender.descend(kSelftestAbsentKey, layers, path);
+  TraversalResult const never =
+      traversal.traverse(kSelftestAbsentKey, layers, path);
   bool const absent_ok = never.ok() && !never.found;
   if (!absent_ok) {
     out << "  key " << kSelftestAbsentKey
@@ -234,16 +254,18 @@ int selftestWrites(Reader &reader, Ops &ops, uint32_t layers,
       << pstats.index_splits << " index, " << wstats.capacity_splits
       << " capacity; " << wstats.boundary_noops << " boundary no-op(s)"
       << std::endl;
-  out << "rdma writes:  " << ops.nodeWrites() << " nodes, " << ops.vecWrites()
-      << " vectors, " << ops.bytesWritten() << " bytes; " << ops.casCount()
-      << " CAS total" << std::endl;
+  uint64_t const nodes = ops.nodeWrites() - nodes0;
+  uint64_t const vecs = ops.vecWrites() - vecs0;
+  uint64_t const cas = ops.casCount() - cas0;
+  out << "rdma writes:  " << nodes << " nodes, " << vecs << " vectors, "
+      << (ops.bytesWritten() - bytes0) << " bytes; " << cas << " CAS total"
+      << std::endl;
   // The number the chaining exists to reduce. Every write goes out as one
   // chained batch, so this is round trips -- not the operation count above it,
   // which is unchanged by batching. The ratio between them is the win.
-  uint64_t const ops_issued =
-      ops.nodeWrites() + ops.vecWrites() + ops.casCount();
-  out << "round trips:  " << ops.batches() << " chained batches carrying "
-      << ops_issued << " operations" << std::endl;
+  out << "round trips:  " << (ops.batches() - batches0)
+      << " chained batches carrying " << (nodes + vecs + cas) << " operations"
+      << std::endl;
   out << "readback:     " << readback << "/" << kSelftestWriteCount
       << " keys match" << std::endl;
 
@@ -278,7 +300,7 @@ int runSelftest(Reader &reader, Ops &ops, uint32_t layers,
   if (int const rc = selftestStructure(reader, layers, hint, out); rc != 0) {
     return rc;
   }
-  if (int const rc = selftestDescent(ops, layers, out); rc != 0) return rc;
+  if (int const rc = selftestTraversal(ops, layers, out); rc != 0) return rc;
   return selftestWrites(reader, ops, layers, out);
 }
 

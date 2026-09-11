@@ -1,6 +1,6 @@
 #pragma once
 
-// Remote descent, and the helping that makes reads non-blocking.
+// Remote traversal, and the helping that makes reads non-blocking.
 //
 // Templated over an Ops type so the same logic runs against real RDMA on the
 // cluster and against a fake arena in disco-skip/tests. That matters more here
@@ -33,24 +33,24 @@
 
 namespace ds {
 
-/// Why a descent stopped.
-enum class DescentStatus {
+/// Why a traversal stopped.
+enum class TraversalStatus {
   Ok,          ///< reached the data node covering k
   Miss,        ///< a level had no entry <= k, so nothing routes to k yet
   ReadFailed,  ///< a node could not be read after retries
   Exhausted,   ///< too many hops; treated as a live-lock guard, not a result
 };
 
-struct DescentResult {
-  DescentStatus status = DescentStatus::ReadFailed;
+struct TraversalResult {
+  TraversalStatus status = TraversalStatus::ReadFailed;
 
   /// The data node covering k, and where its range starts. These are exactly
   /// mirror_reconcile()'s first two arguments.
   RemoteAddr data_addr{};
   Key data_k_min = 0;
 
-  /// Was k actually present, and its payload if so. A descent that reaches the
-  /// right node and finds no key is a successful descent with found == false --
+  /// Was k actually present, and its payload if so. A traversal that reaches the
+  /// right node and finds no key is a successful traversal with found == false --
   /// the distinction between "absent" and "we could not tell" is the whole
   /// point of the range check.
   bool found = false;
@@ -59,14 +59,14 @@ struct DescentResult {
   /// Valid PathStep entries, filled from index 0 (the directory) upward.
   uint32_t levels = 0;
 
-  /// Counters, so the cost of a descent is measurable rather than inferred.
+  /// Counters, so the cost of a traversal is measurable rather than inferred.
   uint32_t nodes_read = 0;   ///< 64-byte header reads
   uint32_t vec_reads = 0;    ///< 320-byte vector reads -- the expensive kind
   uint32_t right_hops = 0;
   uint32_t helped_ts = 0;
   uint32_t helped_splits = 0;
 
-  [[nodiscard]] bool ok() const { return status == DescentStatus::Ok; }
+  [[nodiscard]] bool ok() const { return status == TraversalStatus::Ok; }
 };
 
 namespace detail {
@@ -97,7 +97,7 @@ struct HelpCounters {
 ///
 /// Returns with /node/ and /vec/ settled, or false if it could not get there.
 ///
-/// Shared by the descent and by the write path rather than duplicated: this is
+/// Shared by the traversal and by the write path rather than duplicated: this is
 /// the helping protocol of remote-design.md §2, and two copies of it would be
 /// two things to keep in step. Every CAS here ignores its result, because a
 /// failure means another thread already performed that step.
@@ -157,16 +157,16 @@ bool settleNode(Ops &ops, RemoteAddr addr, NodeRecord &node, VecRecord &vec,
 }
 
 template <class Ops>
-class Descender {
+class Traversal {
  public:
-  explicit Descender(Ops &ops) : ops_(ops) {}
+  explicit Traversal(Ops &ops) : ops_(ops) {}
 
-  /// Descend to the data node covering /k/, recording what each level saw.
+  /// Traverse to the data node covering /k/, recording what each level saw.
   ///
   /// @param path  receives one PathStep per level, indexed by level; must have
   ///              room for /layers/ entries
-  DescentResult descend(Key k, uint32_t layers, PathStep *path) {
-    DescentResult res;
+  TraversalResult traverse(Key k, uint32_t layers, PathStep *path) {
+    TraversalResult res;
     for (uint32_t i = 0; i < layers; ++i) path[i] = PathStep{};
 
     RemoteAddr cur = headAddr(layers - 1);
@@ -194,7 +194,7 @@ class Descender {
       // write unordered with respect to this read. Merely hopping past a node
       // needs no such thing, which is why seek() does not settle.
       if (!settle(cur, node, vec, res)) {
-        res.status = DescentStatus::ReadFailed;
+        res.status = TraversalStatus::ReadFailed;
         return res;
       }
 
@@ -202,7 +202,7 @@ class Descender {
       if (idx < 0) {
         // No entry at or below k. Nothing routes to k from here yet -- the
         // structure simply does not cover it. A real miss, not a failure.
-        res.status = DescentStatus::Miss;
+        res.status = TraversalStatus::Miss;
         return res;
       }
       cur = RemoteAddr{vec.e[idx].val};
@@ -214,7 +214,7 @@ class Descender {
     bool have_vec = false;
     if (!seek(cur, k, node, vec, have_vec, res)) return res;
     if (!settle(cur, node, vec, res)) {
-      res.status = DescentStatus::ReadFailed;
+      res.status = TraversalStatus::ReadFailed;
       return res;
     }
 
@@ -226,7 +226,7 @@ class Descender {
       res.found = true;
       res.value = vec.e[idx].val;
     }
-    res.status = DescentStatus::Ok;
+    res.status = TraversalStatus::Ok;
     return res;
   }
 
@@ -249,15 +249,15 @@ class Descender {
   /// On return, /have_vec/ says whether /vec/ was already fetched, so the
   /// caller does not re-read it.
   bool seek(RemoteAddr &cur, Key k, NodeRecord &node, VecRecord &vec,
-            bool &have_vec, DescentResult &res) {
+            bool &have_vec, TraversalResult &res) {
     have_vec = false;
     for (uint32_t hop = 0;; ++hop) {
       if (hop > detail::kMaxHopsPerLevel) {
-        res.status = DescentStatus::Exhausted;
+        res.status = TraversalStatus::Exhausted;
         return false;
       }
       if (!ops_.readNode(cur, node)) {
-        res.status = DescentStatus::ReadFailed;
+        res.status = TraversalStatus::ReadFailed;
         return false;
       }
       ++res.nodes_read;
@@ -273,7 +273,7 @@ class Descender {
         // Mid-propagation. The header's link fields may not have landed yet,
         // so fall back to the descriptor the writer left in the new vector.
         if (!ops_.readVec(node.handle.offset(), vec)) {
-          res.status = DescentStatus::ReadFailed;
+          res.status = TraversalStatus::ReadFailed;
           return false;
         }
         ++res.vec_reads;
@@ -287,7 +287,7 @@ class Descender {
         // the unstable path has not already done so.
         if (!have_vec) {
           if (!ops_.readVec(node.handle.offset(), vec)) {
-            res.status = DescentStatus::ReadFailed;
+            res.status = TraversalStatus::ReadFailed;
             return false;
           }
           ++res.vec_reads;
@@ -302,7 +302,7 @@ class Descender {
         // the verifier would reject in a quiescent structure.
         if (!have_vec) {
           if (!ops_.readVec(node.handle.offset(), vec)) {
-            res.status = DescentStatus::ReadFailed;
+            res.status = TraversalStatus::ReadFailed;
             return false;
           }
           ++res.vec_reads;
@@ -320,7 +320,7 @@ class Descender {
   ///
   /// Thin wrapper over settleNode(), which the write path shares.
   bool settle(RemoteAddr addr, NodeRecord &node, VecRecord &vec,
-              DescentResult &res) {
+              TraversalResult &res) {
     HelpCounters c;
     bool const ok = settleNode(ops_, addr, node, vec, c);
     res.nodes_read += c.nodes_read;

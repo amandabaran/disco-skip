@@ -16,7 +16,7 @@ common mistake. Note also that `~` on toad is `/home/amanda` while the checkout 
 ## Local gate: run this before every cluster build
 
 ```sh
-make -C disco-skip/tests        # toggle combinations, verifier, descent, get, strict, stub
+make -C disco-skip/tests        # toggle combinations, verifier, traversal, get, strict, stub
 make -C disco-skip/include check   # the cache author's own suite; must keep passing
 ```
 
@@ -226,7 +226,7 @@ offset hint:  hit rate 1 (5 hit / 0 miss)
 SELFTEST PASS: I1-I4 hold
 probes:       5 resolved, 5 absent (expected: all, the structure is empty)
 rdma:         25 headers, 25 vectors, 0 CAS
-DESCENT PASS: every probe reached the data node and reported absent
+TRAVERSAL PASS: every probe reached the data node and reported absent
 
 ################ Write path:
 puts:         9 resolved, 0 failed (6 data-only, 3 structural)
@@ -248,7 +248,7 @@ is already 400 and so takes the boundary no-op path. Sixteen vectors for nine wr
 copy-on-write working as intended, and `old versions: 13` is the `old_ver` chain those
 superseded versions form.
 
-**`0 CAS` is expected on the descent line and emphatically not on the write line.** A write
+**`0 CAS` is expected on the traversal line and emphatically not on the write line.** A write
 is CASes by construction — one handle CAS per published version, plus the timestamp and, for
 a split, the two header fields and the tail word.
 
@@ -256,13 +256,13 @@ Verified on the cluster at `736cfcb` + the `findLte` fix, run as `selftest/v2`. 
 block that follows reports 1 orphan per level against the verifier's 0, which is the
 expected disagreement noted below.
 
-`0 CAS` on the descent line is meaningful: nothing is in flight, so nothing should need
+`0 CAS` on the traversal line is meaningful: nothing is in flight, so nothing should need
 helping.
 
 **Do not expect vector reads below header reads here.** An earlier version of this document
 said to, as the check that the header-only hop (`15623ee`) is working. That is wrong, and
 the selftest cannot show it either way. The bootstrap structure has exactly **one node per
-level**, so a descent passes over nothing: it reads header *and* vector at each of the four
+level**, so a traversal passes over nothing: it reads header *and* vector at each of the four
 index levels plus the data node, and there are zero right-hops to save. The measured
 `25 headers, 25 vectors` for 5 probes is 1:1 **by construction** — 5 nodes × 5 probes — and
 is neither evidence for the optimisation nor against it.

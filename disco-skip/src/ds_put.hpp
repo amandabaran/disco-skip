@@ -6,7 +6,7 @@
 //
 // Shape of a Put of key k with height h:
 //
-//   1. Descend to the data node covering k, keeping the path. It costs no extra
+//   1. Traverse to the data node covering k, keeping the path. It costs no extra
 //      RDMA and is exactly what Update_Index needs at every level.
 //   2. h == 0: insert into that data node and stop. A data-layer-only change
 //      alters no index structure, so there is no cache call at all.
@@ -32,7 +32,7 @@
 #include <cstdint>
 
 #include "ds_defs.hpp"
-#include "ds_descend.hpp"
+#include "ds_traverse.hpp"
 #include "ds_insert.hpp"
 #include "ds_node.hpp"
 
@@ -45,10 +45,10 @@ struct PutStats {
   uint64_t index_splits = 0;  ///< height-driven splits at index levels
   uint64_t data_splits = 0;   ///< height-driven splits at the data level
   uint64_t top_orphans = 0;   ///< top-level inserts that overflowed into an orphan
-  uint64_t descents = 0;
+  uint64_t traversals = 0;
   uint64_t restarts = 0;      ///< a step lost its race, so the whole put redid
   uint64_t mirror_calls = 0;
-  uint64_t not_covered = 0;   ///< descent reported Miss: nothing routes to k
+  uint64_t not_covered = 0;   ///< traversal reported Miss: nothing routes to k
   uint64_t failures = 0;
   uint64_t nodes_read = 0;
   uint64_t vec_reads = 0;
@@ -106,9 +106,9 @@ class Putter {
 
     for (int attempt = 0; attempt < detail::kMaxPutAttempts; ++attempt) {
       PathStep path[kMaxLayers];
-      Descender<Ops> d(ops_);
-      ++stats_.descents;
-      DescentResult const r = d.descend(k, layers_, path);
+      Traversal<Ops> d(ops_);
+      ++stats_.traversals;
+      TraversalResult const r = d.traverse(k, layers_, path);
       stats_.nodes_read += r.nodes_read;
       stats_.vec_reads += r.vec_reads;
       stats_.right_hops += r.right_hops;
@@ -118,7 +118,7 @@ class Putter {
         // Miss means no level had an entry at or below k. Every head covers
         // from key 0, so on a well-formed structure this cannot happen -- it is
         // reported rather than retried so a real structural fault is visible.
-        if (r.status == DescentStatus::Miss) ++stats_.not_covered;
+        if (r.status == TraversalStatus::Miss) ++stats_.not_covered;
         ++stats_.failures;
         return out;
       }

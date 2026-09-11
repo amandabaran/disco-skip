@@ -19,7 +19,7 @@
 // strict set; their *bodies* are only checked once instantiated, which happens
 // under the same flags in rdma_compile.cc over the real RdmaOps -- the
 // combination the cluster actually runs.
-#include "ds_descend.hpp"
+#include "ds_traverse.hpp"
 #include "ds_get.hpp"
 #include "ds_insert.hpp"
 #include "ds_put.hpp"

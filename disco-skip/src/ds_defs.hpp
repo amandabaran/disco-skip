@@ -73,12 +73,12 @@ using Value = uint64_t;
 /// (vector_sfra.h uses static_cast<K>(-1)), so it must never be a live key.
 inline constexpr Key kReservedKey = static_cast<Key>(-1);
 
-/// What one level of a remote descent saw. Handed back to the cache after a
+/// What one level of a remote traversal saw. Handed back to the cache after a
 /// miss or a k_min mismatch so it can split its own nodes at the boundaries the
-/// descent actually observed (interface doc §5, A5).
+/// traversal actually observed (interface doc §5, A5).
 ///
 /// Collecting this costs zero extra RDMA: with passive memory servers the
-/// client performs the descent itself, so it already holds every node on the
+/// client performs the traversal itself, so it already holds every node on the
 /// path. The only question was ever whether we keep them.
 struct PathStep {
   /// k_min of the remote node covering the sought key at this level.

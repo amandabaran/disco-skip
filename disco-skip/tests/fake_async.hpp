@@ -1,7 +1,7 @@
 #pragma once
 
 // A fake AsyncOps: posts are applied immediately and the results buffered, so a
-// test can drive the resumable descent to completion in a loop.
+// test can drive the resumable traversal to completion in a loop.
 //
 // The point is that the state machine under test is EXACTLY the one that runs on
 // the cluster -- only the transport differs. What this cannot model is
@@ -146,12 +146,12 @@ class FakeAsyncOps {
   uint64_t posts_ = 0;
 };
 
-/// Drive a resumable descent to completion, as the real driver would.
+/// Drive a resumable traversal to completion, as the real driver would.
 template <class Ops>
-inline ds::DescentResult runAsyncDescent(Ops &ops, ds::Key k, uint32_t layers,
+inline ds::TraversalResult runAsyncTraversal(Ops &ops, ds::Key k, uint32_t layers,
                                          ds::PathStep *path,
                                          uint64_t *steps_out = nullptr) {
-  ds::DescentFuture<Ops> f(ops);
+  ds::TraversalFuture<Ops> f(ops);
   uint64_t steps = 0;
   size_t await = f.start(k, layers, path);
   // A real driver waits for `await` completions before each step; here they are

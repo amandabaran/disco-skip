@@ -4,8 +4,8 @@
 // (L1) and the async writeback (L5) of invariants.md §4.
 //
 // This sits BEHIND the Ops surface, which is the point. `QuorumOps` provides
-// exactly the surface ds_descend.hpp and ds_insert.hpp already expect, so the
-// descent, the Writer and the Putter are unchanged and unaware: replication is
+// exactly the surface ds_traverse.hpp and ds_insert.hpp already expect, so the
+// traversal, the Writer and the Putter are unchanged and unaware: replication is
 // not a parameter of the algorithms, it is a property of the storage under them.
 //
 // It is templated over a ReplicaSet of per-replica primitives so the whole thing
@@ -255,7 +255,7 @@ class QuorumOps {
   /// Vector read, from a replica that voted with the winning handle (L4).
   ///
   /// The replica is remembered from the preceding readNode. That coupling is
-  /// safe because every caller pairs the two -- the descent reads a header and
+  /// safe because every caller pairs the two -- the traversal reads a header and
   /// then, only if it needs the entries, that node's vector -- but it is a
   /// coupling, so it falls back to replica 0 rather than misbehaving if the
   /// pairing is ever broken.

@@ -198,7 +198,7 @@ class StructureVerifier {
           " exceeds first key " + std::to_string(s.e[0].key));
     }
 
-    // Every key must fall inside the range the node advertises, or a descent
+    // Every key must fall inside the range the node advertises, or a traversal
     // that trusts next_k_min would skip it.
     Key const end = rangeEnd(n, s);
     if (s.size > 0 && s.e[s.size - 1].key >= end) {

@@ -3,13 +3,13 @@
 // F1 (plain write) and F2 (split), and the Update_Index climb a height-driven
 // insert performs.
 //
-// Templated over Ops for the same reason the descent is: the interesting states
+// Templated over Ops for the same reason the traversal is: the interesting states
 // here are the ones a *concurrent* writer produces, and those are constructible
 // by hand in disco-skip/tests and nearly impossible to provoke deliberately on
 // a cluster. This is the code remote-design.md §2 specifies, so that document is
 // the reference for every ordering decision below.
 //
-// Beyond the read/CAS surface ds_descend.hpp lists, Ops must provide:
+// Beyond the read/CAS surface ds_traverse.hpp lists, Ops must provide:
 //
 //     BatchResult submit(Batch const &b);
 //     VecOffset allocVec();
@@ -26,7 +26,7 @@
 // before the publishing CAS, and the tail word after everything else.
 //
 // `BatchResult::committed` reports the publishing CAS, and it is the one result
-// that is NOT ignored. Every other CAS in this file and in the descent is a step
+// that is NOT ignored. Every other CAS in this file and in the traversal is a step
 // somebody else may already have taken, so failure is as good as success. The
 // handle CAS is the operation's linearization point (L1): losing it means
 // another writer got there first and our staged version describes a state that
@@ -36,7 +36,7 @@
 
 #include "ds_batch.hpp"
 #include "ds_defs.hpp"
-#include "ds_descend.hpp"
+#include "ds_traverse.hpp"
 #include "ds_node.hpp"
 
 namespace ds {
@@ -44,7 +44,7 @@ namespace ds {
 /// Why a write attempt ended.
 enum class WriteOutcome {
   Published,  ///< the handle CAS landed; the operation has linearized
-  Retry,      ///< lost a race, or the node no longer covers the key; re-descend
+  Retry,      ///< lost a race, or the node no longer covers the key; re-traverse
   Full,       ///< the key is absent and the vector has no room (capacity split)
   Exhausted,  ///< the arena is spent -- a hard error, not a retry
   Failed,     ///< a read could not be completed
@@ -81,7 +81,7 @@ struct SplitResult {
 namespace detail {
 
 /// Bound on how many times one logical write re-reads and retries before giving
-/// up and letting the caller re-descend. A lost handle CAS means real progress
+/// up and letting the caller re-traverse. A lost handle CAS means real progress
 /// by somebody, so this bounds our own starvation rather than guarding a
 /// livelock.
 inline constexpr int kMaxWriteAttempts = 8;
@@ -123,7 +123,7 @@ class Writer {
       // Does this node actually own k?
       //
       // Nothing upstream guarantees it: the caller found this address by
-      // descending, or from a cache hint, or by routing across a split it just
+      // traversing, or from a cache hint, or by routing across a split it just
       // performed, and any of those can be stale by the time we get here. Left
       // unchecked, a write to the wrong node lands a key outside the node's
       // range and breaks I1 -- silently, since a vector is still internally
@@ -251,7 +251,7 @@ class Writer {
         return out;
       }
       // Past this node's range: it split under us, so the node covering
-      // split_key is further along. Re-descending is the caller's job.
+      // split_key is further along. Re-traversing is the caller's job.
       if (split_key >= rangeEnd(node, vec)) {
         ++stats_.retries;
         out.outcome = WriteOutcome::Retry;
@@ -382,7 +382,7 @@ class Writer {
       if (orphan_out != nullptr) *orphan_out = s.created;
 
       // k may belong to either half now. Route by the split key rather than
-      // re-descending, since we know exactly where the boundary fell.
+      // re-traversing, since we know exactly where the boundary fell.
       if (k >= median) addr = s.created;
       ++stats_.retries;
     }
