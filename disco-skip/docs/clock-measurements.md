@@ -369,9 +369,10 @@ quality, which is worth having before F1 runs multi-client.
 
 ## 7. What still needs measuring
 
-- **ε itself.** The 14.31 ppm figure bounds what reset-once loses; it is *not* ε for a
-  disciplined clock. With `ptp4l` running, ε comes from its offset statistics and should be
-  measured on this testbed, not quoted from a datasheet.
+- ~~**ε itself.**~~ **Measured — see §8.** The 14.31 ppm figure bounds what reset-once
+  loses; it is *not* ε for a disciplined clock. §8 configures `ptp4l` + `phc2sys` with
+  hardware timestamping and reports the distribution. The headline is that the median is
+  excellent and the tail is not, and the tail is what linearizability depends on.
 - **Drift stability.** One 90 s sample. Crystal frequency moves with temperature, so the
   spread should be re-measured over a full run length and under load before the number is
   final. Nodes w3, w4, w6 and w11 showed ~0.4 ppm of window-to-window variation against
@@ -380,3 +381,152 @@ quality, which is worth having before F1 runs multi-client.
   `cache-remote-interface.md` §9 the right quantity is the rate of conflicting,
   non-overlapping operation pairs separated by less than ε — not ε against operation
   duration. That needs the measured arrival process.
+
+---
+
+## 8. ε measured: PTP on this testbed
+
+§6 recommended option 1 — discipline the system clock, read it through the vDSO, and
+*measure* ε rather than argue for it. That is option (c) of the three that were on the
+table, and it is what is built. This section is the measurement.
+
+Tooling: [`experiments/clock/ptp.sh`](../../../experiments/clock/ptp.sh)
+(`status|start|measure|roles|skew|stop`), deliberately revertible — `stop` restores chrony
+everywhere, because leaving a cluster with no clock discipline is worse than leaving it on
+NTP.
+
+### 8.1 The baseline: chrony is two orders of magnitude too coarse
+
+Before PTP, against the same NTP reference (`ops.apt.emulab.net`, 0.6 ms away), the nodes
+sat **172 / 261 / 328 / 342 µs** from it — roughly **170 µs pairwise**. Against ~2 µs
+operations that is hopeless, and it is the number that justifies doing anything at all.
+It is *bounded*, unlike a one-shot TSC reset, which is the one thing it has going for it.
+
+### 8.2 Configuration, and three things that had to be got right
+
+`ptp4l` + `phc2sys` with **hardware timestamping** on `enp8s0d1` — the 10.10.1.x experiment
+LAN, PHC `ptp2`. Explicitly *not* `eno1`, CloudLab's shared control network, where the path
+is neither ours nor quiet. linuxptp 4.0, w1 as master.
+
+**One master, chosen rather than elected.** The first configuration ran the same command on
+all 12 nodes and let BMCA decide. The `-s` (client-only) flag was computed into a shell
+variable and never interpolated, so every node was a master candidate with identical
+priorities; the election flapped, and at the end w10 and w11 both believed they were
+grandmaster while w1, the nominal master, was a slave. The symptom elsewhere was an offset
+alternating `+15500 / −15519` ns — which reads like a servo failing to converge but is
+actually a node being told the time by two masters ~15 µs apart. Now every slave runs
+`-s`, so only w1 *can* be grandmaster.
+
+**The domain is seeded from UTC once, then free-runs.** With no node anchored, the domain
+tracks whichever NIC wins, and that PHC free-runs: the cluster ended up **62 seconds** off
+real time, and on w5 `phc2sys` was slewing at `freq -100000000` — the saturated −100,000 ppm
+limit — because its step threshold is **disabled by default**. The fix is not to keep chrony
+running on the master either: that pushes the NTP servo's corrections into the reference the
+whole domain follows. So w1 steps to UTC with chrony once, chrony is stopped, `phc_ctl` seeds
+the PHC from the corrected clock, and nothing steers the reference again. The domain drifts
+against true UTC at w1's natural frequency error (order 20 ppm, ~70 ms/hour), which matters
+to nothing here; `stop` steps it away. **A common-mode shift cancels in a pairwise ε**, which
+is why trading accuracy for stability is free.
+
+**Convergence is not ε.** `ptp4l` needs 60–90 s to pull in, and `ptp.sh start` itself spends
+minutes in the chrony wait loop *before* the daemons launch — so "a few minutes after start"
+can still be 70 s of daemon uptime. Measuring there reads the servo's pull-in as a bad clock.
+This invalidated a whole 1 Hz-vs-8 Hz and pi-vs-linreg comparison before `measure` learned to
+print `n` and refuse to be trusted below 240 samples.
+
+### 8.3 Results
+
+772 `ptp4l` samples (1 Hz) and 900 `phc2sys` samples (8 Hz) per node, after convergence.
+All figures are nanoseconds, `|signed|`. `ptp_*` is the slave's PHC against the master's;
+`phc_*` is that node's `CLOCK_REALTIME` against its own PHC — **the hop the application
+actually reads**.
+
+| node | ptp p50 | ptp p90 | ptp p99 | ptp max | ptp >1µs | phc p50 | phc p90 | phc p99 | phc max | phc >1µs |
+|---|---|---|---|---|---|---|---|---|---|---|
+| w1 *(master)* | — | — | — | — | — | 12 | 37 | 65 | 87 | 0.0% |
+| w2  | 34 | 1007 | 15928 | 16793 | 10.2% | 45 | 3450 | 10781 | 12921 | 19.8% |
+| w3  | 36 | 1404 | 16190 | 18825 | 13.2% | 32 | 386 | 7362 | 11858 | 6.6% |
+| w4  | 35 | 1379 | 16347 | 17073 | 13.2% | 147 | 5366 | 11228 | 12642 | 26.4% |
+| w5  | 35 | 1335 | 16612 | 17315 | 12.2% | 28 | 366 | 3971 | 6480 | 5.0% |
+| w6  | 34 | 1229 | 16220 | 21960 | 11.1% | 40 | 3084 | 10354 | 12640 | 15.6% |
+| w7  | 35 | 1273 | 15208 | 17081 | 10.4% | 45 | 458 | 3660 | 6017 | 5.0% |
+| w8  | 40 | 1441 | 16624 | 19039 | 14.2% | 49 | 4221 | 11196 | 13484 | 22.2% |
+| w9  | 39 | 1467 | 16047 | 17395 | 13.7% | 62 | 4104 | 10771 | 12305 | 24.6% |
+| **w10** | **27** | **89** | **782** | **2153** | **0.4%** | **28** | **175** | **513** | **596** | **0.0%** |
+| w11 | 37 | 1395 | 16347 | 19170 | 12.4% | 42 | 1971 | 10345 | 12796 | 13.3% |
+| w12 | 36 | 1452 | 16727 | 18105 | 13.5% | 38 | 1090 | 7439 | 12030 | 10.6% |
+
+A thread reads `CLOCK_REALTIME`, so its offset from the master is at most its `phc2sys`
+error plus its `ptp4l` error, and two threads on different nodes differ by at most twice the
+worst per-node sum:
+
+| statistic | pairwise ε | vs a ~2 µs operation |
+|---|---|---|
+| p50 | **≈ 0.4 µs** | comfortably inside one operation |
+| p99 | **≈ 56 µs** | ~28× an operation |
+| max | **69.2 µs** | ~35× an operation |
+
+### 8.4 Reading this honestly
+
+**The median is excellent and the tail is not, and it is the tail that linearizability
+depends on.** A median of tens of nanoseconds is a nice number and it is the wrong one to
+quote: on 11 of 12 nodes **10–14% of samples exceed 1 µs**, so the clock is outside one
+operation's duration a tenth of the time. Quoting "ε ≈ 40 ns, comfortably under a 2 µs
+operation" would be flattering and false.
+
+**This is the strongest argument for `faa` that exists.** The clock-free counter costs one
+extra round trip per write (~2 µs, measured) and the fault tolerance of the timestamp
+(§6a, and `remote-design.md` §2). Against an ε whose tail is 35× an operation, that trade
+looks considerably better than it did on the round-trip count alone. The honest position is
+that `clock` is the default because it keeps fault tolerance, not because ε is small.
+
+**The recurring excursion is ~15 µs, periodic every 32 Sync exchanges, and unexplained.**
+Ruled out with evidence rather than argument: not chrony (the pairs continue with chrony
+stopped and the master free-running, at different times per node — one coincidence where
+two nodes spiked in the same second was over-read as a common cause); not congestion (path
+delay holds flat at ~1150 ns straight through, spread ≤ 600 ns); not load (all nodes idle,
+load ≤ 0.15); not firmware or driver differences (`mlx4_en`, fw 2.42.5000 everywhere); and
+not tx-timestamp timeouts (zero warnings in any log). The pair is equal and opposite because
+the PI servo acts on one bad sample and the next reading sees what it did — and the phase
+error is **real**, not merely a bad measurement: the `freq` column moves +14.6 ppm for one
+second, which is exactly 14.6 µs of phase.
+
+**w10 is the reason to believe this is fixable rather than fundamental.** Same NIC, same
+firmware, same driver, same switch, same configuration — and a p99 of 782 ns against
+~16 µs everywhere else, with 0.4% of samples over 1 µs against 10–14%. One node on this
+hardware achieves sub-microsecond p99, so the hardware can do it. What is different about
+w10 is **not known**, and is the single highest-value thing left to chase: if whatever it is
+generalises, ε drops by more than an order of magnitude and the `clock`-vs-`faa` argument
+changes.
+
+Raising the Sync rate to 8 Hz and switching to the `linreg` servo were both tried and
+neither helped; the 8 Hz arm measured *worse* (medians ~800 ns against ~30 ns) because
+`phc2sys` then chases a PHC the faster servo jerks more often. Both of those comparisons
+were initially run against unconverged clocks and had to be redone — see §8.2.
+
+### 8.5 What ε does and does not currently endanger
+
+Not symmetric, and worth separating:
+
+- **Point reads, F1, F2 — no effect.** Nothing on those paths compares timestamps.
+- **A writer's own `old_ver` chain — no effect.** `stampFor` floors a writer's stamp at
+  `predecessor + 1`, so the chain is monotonic *by construction* at any skew. ε cannot
+  break it.
+- **A helper's stamp — exposed.** A helper has not read the predecessor, so it gets no
+  floor. Its stamp depends on ε being smaller than the gap between two successive versions
+  of one node, which is at least a write's latency (~2 µs). At a p99 ε of ~56 µs that
+  assumption does not hold, and the verifier's chain check is what would catch it.
+- **A10 range snapshots — exposed, and deferred.** This is where ε becomes a silent wrong
+  answer rather than a detectable one. Skip-vector ranges are not built.
+
+So ε is not currently blocking, and the reason is `stampFor`'s floor plus A10's absence —
+not a good clock.
+
+### 8.6 Cluster state
+
+PTP is **not** left running. `./experiments/clock/ptp.sh stop` restores chrony on all 12
+nodes and pins the emulab NTP server by IP, which is necessary because **DNS is broken on
+every node but w5**: chrony's stock config lists only hostnames, so after a `chronyd`
+restart it has zero usable sources and cannot step at all. That is how the 62-second
+excursion survived a naive "restart chrony" recovery. `./ptp.sh skew` is the check that
+the wall clocks agree to within ssh jitter afterwards.

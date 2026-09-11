@@ -29,6 +29,7 @@
 
 #include "ds_batch.hpp"
 #include "ds_defs.hpp"
+#include "ds_ts.hpp"
 #include "ds_node.hpp"
 
 namespace ds {
@@ -112,12 +113,27 @@ bool settleNode(Ops &ops, RemoteAddr addr, NodeRecord &node, VecRecord &vec,
     // One chain, in protocol order.
     Batch b;
 
-    // 1. Fix the timestamp first. A helper stamps with its own clock, which
-    //    orders the write at the moment somebody first needed it -- that is
-    //    the point of leaving it unfixed until visible, since it lets the
+    // 1. Fix the timestamp first. A helper stamps from the run's own source,
+    //    which orders the write at the moment somebody first needed it -- that
+    //    is the point of leaving it unfixed until visible, since it lets the
     //    write be ordered after readers that did not see it.
+    //
+    //    In Faa mode the value is not available locally, so the batch claims
+    //    one and a SECOND submission writes it. That makes helping two round
+    //    trips instead of one in that mode -- the same +1 the write path pays,
+    //    and for the same reason: a timestamp may not be allocated before the
+    //    version it stamps is visible.
+    //
+    //    A helper cannot apply stampOver()'s guard: it has not read the version
+    //    this one supersedes. So a helper's stamp depends on epsilon being
+    //    below the gap between successive versions of one node -- see ds_ts.hpp.
+    bool const faa = ops.tsMode() == TsMode::Faa;
     if (pending) {
-      b.casTs(node.handle.offset(), kNullTs, ops.now());
+      if (faa) {
+        b.faaTs();
+      } else {
+        b.casTs(node.handle.offset(), kNullTs, ops.now());
+      }
       ++c.helped_ts;
     }
 
@@ -145,7 +161,13 @@ bool settleNode(Ops &ops, RemoteAddr addr, NodeRecord &node, VecRecord &vec,
 
     if (b.size() > 0) {
       ++c.batches;
-      ops.submit(b);
+      BatchResult const r = ops.submit(b);
+      if (faa && pending && r.submitted && r.ts != kNullTs) {
+        Batch stamp;
+        stamp.casTs(node.handle.offset(), kNullTs, r.ts);
+        ++c.batches;
+        ops.submit(stamp);
+      }
     }
 
     if (!ops.readNode(addr, node)) return false;

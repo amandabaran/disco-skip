@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "ds_batch.hpp"
+#include "ds_ts.hpp"
 #include "ds_bootstrap.hpp"
 #include "ds_traverse.hpp"
 #include "ds_node.hpp"
@@ -22,7 +23,7 @@ class FakeOps {
  public:
   FakeOps(size_t nodes, size_t vecs) : nodes_(nodes), vecs_(vecs) {
     for (auto &n : nodes_) ds::initNode(n, 0, 0, ds::kNullVec);
-    for (auto &v : vecs_) ds::initVec(v, false, /*ts=*/1);
+    for (auto &v : vecs_) ds::initVec(v, false, ds::kBootstrapTs);
   }
 
   // ── The Ops concept ──────────────────────────────────────────────────────
@@ -85,7 +86,29 @@ class FakeOps {
     return true;
   }
 
-  uint64_t now() { return clock_ += 10; }
+  /// The local-clock source (Clock and Tsc modes both read it). A counter, not
+  /// a real clock: tests need monotonicity and reproducibility, and neither
+  /// rdtscp nor CLOCK_REALTIME gives either.
+  ///
+  /// The step is settable, and may be NEGATIVE, so a test can make this clock
+  /// run backwards faster than writes arrive. That is the adversarial case
+  /// stampOver() exists for -- a harsher version of two machines disagreeing by
+  /// more than the gap between successive versions of one node -- and it cannot
+  /// be produced by waiting. See ts_test.cc.
+  uint64_t now() {
+    clock_ = static_cast<uint64_t>(static_cast<int64_t>(clock_) + clock_step_);
+    return clock_ == ds::kNullTs ? 1 : clock_;
+  }
+  void setClockStep(int64_t step) { clock_step_ = step; }
+
+  [[nodiscard]] ds::TsMode tsMode() const { return ts_mode_; }
+  void setTsMode(ds::TsMode m) { ts_mode_ = m; }
+
+  /// The global timestamp counter this arena holds, fetched-and-added by
+  /// FaaTs. Starts at 0, so the first claimed timestamp is 1 -- which is what
+  /// keeps it clear of kNullTs.
+  uint64_t faaTs() { return ts_counter_++; }
+  [[nodiscard]] uint64_t tsCounter() const { return ts_counter_; }
 
   // ── The write half of the Ops concept (F1/F2) ────────────────────────────
   //
@@ -165,6 +188,11 @@ class FakeOps {
         case ds::BatchKind::CasTailWord:
           (void)casTailWord(o.addr, o.expected, o.desired);
           break;
+        case ds::BatchKind::FaaTs:
+          // Claimed here, in chain order -- so it lands after the publishing
+          // CAS, which is the property the ordering depends on.
+          out.ts = ds::tsFromFaa(faaTs());
+          break;
       }
     }
     return out;
@@ -187,6 +215,7 @@ class FakeOps {
   ds::NodeRecord &node(ds::RemoteAddr a) { return nodes_[a.id]; }
   ds::NodeRecord &node(uint64_t id) { return nodes_[id]; }
   ds::VecRecord &vecAt(ds::VecOffset off) { return vecs_[off]; }
+  [[nodiscard]] uint64_t vecCount() const { return vecs_.size(); }
   ds::VecRecord &vecOf(ds::RemoteAddr a) { return vecs_[nodes_[a.id].handle.offset()]; }
 
   uint64_t nodeReads() const { return node_reads_; }
@@ -231,6 +260,9 @@ class FakeOps {
   std::vector<ds::NodeRecord> nodes_;
   std::vector<ds::VecRecord> vecs_;
   uint64_t clock_ = 1000;
+  int64_t clock_step_ = 10;
+  uint64_t ts_counter_ = 0;
+  ds::TsMode ts_mode_ = ds::TsMode::Tsc;
   uint64_t next_node_ = ds::kFirstDynamicId;
   uint64_t next_vec_ = ds::kFirstDynamicVec;
   uint64_t node_reads_ = 0, vec_reads_ = 0, cas_ts_ = 0, cas_next_id_ = 0, cas_next_k_min_ = 0,
@@ -263,7 +295,8 @@ inline void seedDataKey(FakeOps &ops, ds::Key k, ds::Value v) {
 inline FakeOps buildInitialArena(uint32_t layers, size_t slots = 512) {
   FakeOps ops(ds::kFirstDynamicId + slots, ds::kFirstDynamicVec + slots);
   ds::InitialNode built[ds::kMaxLayers + 1];
-  uint32_t const n = ds::buildInitialStructure(layers, /*ts=*/1000, built);
+  uint32_t const n =
+      ds::buildInitialStructure(layers, ds::kBootstrapTs, built);
   for (uint32_t i = 0; i < n; ++i) {
     ops.node(built[i].addr) = built[i].node;
     ops.vecAt(built[i].vec_offset) = built[i].vec;

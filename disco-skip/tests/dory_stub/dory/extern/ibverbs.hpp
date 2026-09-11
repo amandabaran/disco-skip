@@ -16,7 +16,12 @@ enum ibv_send_flags : unsigned {
 enum ibv_wr_opcode : unsigned {
   IBV_WR_RDMA_WRITE = 0,
   IBV_WR_RDMA_READ = 4,
-  IBV_WR_ATOMIC_CMP_AND_SWP = 5
+  IBV_WR_ATOMIC_CMP_AND_SWP = 5,
+  // Needed because ds_rdma.hpp repurposes a prepared CAS into a fetch-and-add:
+  // dory exposes no atomic-add helper, so the opcode and compare_add field are
+  // overwritten after preparing. That rewrite is only type-checkable if the
+  // stub carries the same shape.
+  IBV_WR_ATOMIC_FETCH_AND_ADD = 6
 };
 
 struct ibv_wc {
@@ -37,4 +42,18 @@ struct ibv_send_wr {
   int num_sge;
   ibv_wr_opcode opcode;
   unsigned send_flags;
+  // The real struct has a union of per-opcode descriptors. Only the atomic arm
+  // is reached from our code, and only to turn a CAS into a fetch-and-add.
+  struct {
+    struct {
+      uint64_t remote_addr;
+      uint64_t compare_add;
+      uint64_t swap;
+      uint32_t rkey;
+    } atomic;
+    struct {
+      uint64_t remote_addr;
+      uint32_t rkey;
+    } rdma;
+  } wr;
 };

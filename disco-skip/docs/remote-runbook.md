@@ -62,6 +62,32 @@ the same checks on our code, and the cache is the other author's half and not ou
 cd /users/adb321/disco-skip-artifacts && ./cloudlab_deploy.sh
 ```
 
+**`send-deployment.sh` alone is not a deploy, and it says "successful" anyway.** It ships
+whatever `deployment.zip` already sits on disk — it never builds it. `prepare-deployment.sh`
+is what builds it. Running only `send-deployment.sh` after a fresh compile shipped a
+**two-hour-old** binary to all 12 nodes and printed
+`Parallel deployment successful across all nodes!`; the failure surfaced one step later as
+`Error in command line: Unrecognized token: --ts`, i.e. as a *code* problem rather than a
+deploy problem, which is the expensive kind of misdirection. The full chain is:
+
+```sh
+cd /users/adb321/disco-skip-artifacts/bin/disco-skip && ./build.py disco-skip
+cd /users/adb321/disco-skip-artifacts
+./bin/zip-binaries.sh        # build/bin/disco-skip  -> bin/bin.zip
+./prepare-deployment.sh      # bin/bin.zip + scripts -> deployment.zip
+./send-deployment.sh         # deployment.zip        -> all 12 nodes
+```
+
+Verify rather than trust, with a string the new build must contain:
+
+```sh
+ssh w5 'strings ~/disco-skip-artifacts/bin/disco-skip-exe | grep -c "^--ts$"'
+```
+
+Same reasoning as the freshness check under **Cluster build**: conan prints
+`Already installed!` and `Copied 1 file` for a no-op, so neither its output nor a deploy
+script's exit status is evidence that the bytes on the workers are the bytes you compiled.
+
 `bin/zip-binaries.sh` **discovers** the built binary rather than hardcoding a path, and fails
 loudly if it cannot find one. That matters because `send-deployment.sh` renames
 `staging/disco-skip` with `|| true`, so a binary missing from `bin.zip` fails *silently*: the

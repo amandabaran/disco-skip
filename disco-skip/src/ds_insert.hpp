@@ -36,6 +36,7 @@
 
 #include "ds_batch.hpp"
 #include "ds_defs.hpp"
+#include "ds_ts.hpp"
 #include "ds_traverse.hpp"
 #include "ds_node.hpp"
 
@@ -61,6 +62,7 @@ struct WriteStats {
   uint64_t cas_lost = 0;       ///< handle CAS lost to a concurrent writer
   uint64_t retries = 0;
   uint64_t batches = 0;      ///< chained submissions, i.e. round trips
+  uint64_t faa_stamps = 0;   ///< extra round trips spent stamping in Faa mode
   uint64_t nodes_read = 0;
   uint64_t vec_reads = 0;
   uint64_t node_writes = 0;
@@ -166,19 +168,36 @@ class Writer {
       staged.k_min_next = kReservedKey;
       staged.is_orphan = vec.is_orphan;
 
-      // One chain: stage the vector, publish it, stamp it.
-      //
-      // The stamp rides along rather than costing its own round trip. It is
-      // safe to issue before knowing whether the publish won: it CASes `ts` on
-      // an offset this client just allocated, which nobody else can reach, so
-      // on a lost race it settles a version that is simply abandoned.
+      // One chain: stage the vector, publish it, and claim a timestamp.
       //
       // F3 lives on the CasHandle: the backend fences it, so the staged bytes
       // are visible at the remote HCA before the CAS that publishes them.
+      //
+      // How the stamp is obtained depends on the mode, and the difference is
+      // the whole cost of correctness across machines (ds_ts.hpp):
+      //
+      //   Tsc -- the value is known locally, so the CAS that writes `ts` rides
+      //   in the same chain. Safe to issue before knowing whether the publish
+      //   won, because it CASes an offset this client just allocated and nobody
+      //   else can reach: on a lost race it settles a version that is simply
+      //   abandoned.
+      //
+      //   Faa -- the value comes from the counter, and the counter must not be
+      //   touched until the version is visible, or a reader with a larger
+      //   snapshot can miss a write whose stamp is already below it. So the FAA
+      //   is appended after the CAS and the `ts` write becomes a second round
+      //   trip, below.
       Batch b;
       b.writeVec(off, staged);
       b.casHandle(addr, node.handle.raw, node.handle.withContent(off).raw);
-      b.casTs(off, kNullTs, ops_.now());
+      if (ops_.tsMode() == TsMode::Faa) {
+        b.faaTs();
+      } else {
+        // max(clock, predecessor + 1): the chain is strictly decreasing by
+        // construction rather than by the clock being good enough, and it is
+        // free because `vec` IS the version being superseded. See ds_ts.hpp.
+        b.casTs(off, kNullTs, stampFor(ops_.tsMode(), ops_.now(), vec.ts));
+      }
       BatchResult const r = ops_.submit(b);
       if (!r.submitted) {
         ++stats_.failures;
@@ -195,6 +214,23 @@ class Writer {
         ++stats_.cas_lost;
         ++stats_.retries;
         continue;
+      }
+
+      // Faa mode: the version is visible but unstamped. Fix it before
+      // returning, so that "the write completed" includes its timestamp and a
+      // reader starting afterwards cannot be ordered before it. A helper
+      // stamping instead only happens while this writer is still in flight,
+      // and such a write is genuinely concurrent with the reader.
+      if (ops_.tsMode() == TsMode::Faa) {
+        Batch stamp;
+        // stampFor, not stampOver: in Faa mode the counter value is used RAW.
+        // Flooring it at the predecessor can invert the counter's own global
+        // order, which is the one thing this mode exists to provide -- see
+        // stampFor() in ds_ts.hpp for the worked counterexample.
+        stamp.casTs(off, kNullTs, stampFor(ops_.tsMode(), r.ts, vec.ts));
+        if (!ops_.submit(stamp).submitted) return WriteOutcome::Failed;
+        ++stats_.batches;
+        ++stats_.faa_stamps;
       }
 
       ++stats_.published;
@@ -316,6 +352,7 @@ class Writer {
       stage.writeVec(new_vec, nvec);
       stage.casHandle(addr, node.handle.raw,
                       node.handle.withStruct(new_vec).raw);
+      if (ops_.tsMode() == TsMode::Faa) stage.faaTs();
       BatchResult const r = ops_.submit(stage);
       if (!r.submitted) return fail(out);
       stats_.vec_writes += 2;
@@ -335,9 +372,15 @@ class Writer {
       //
       //    Closing the window last is what makes concurrent splits serialise:
       //    while it is open, another writer helps rather than starting its own.
+      // Both vectors get the SAME timestamp. They are one operation -- the
+      // split published them together -- so giving them different stamps would
+      // claim an order between two versions that became visible at once.
+      uint64_t const ts = stampFor(
+          ops_.tsMode(), ops_.tsMode() == TsMode::Faa ? r.ts : ops_.now(),
+          vec.ts);
       Batch finish;
-      finish.casTs(new_vec, kNullTs, ops_.now());
-      finish.casTs(created_vec, kNullTs, ops_.now());
+      finish.casTs(new_vec, kNullTs, ts);
+      finish.casTs(created_vec, kNullTs, ts);
       finish.casNextKMin(addr, node.next_k_min, split_key);
       finish.casNextId(addr, node.next_id, created.id);
       finish.casTailWord(addr, packTailWord(node.level, node.tail_struct_ver),

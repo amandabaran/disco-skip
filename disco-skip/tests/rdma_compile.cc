@@ -125,7 +125,8 @@ void instantiate_bootstrap(Conns &conns, ds::Layout const &layout, Bufs b,
 void instantiate_bootstrap(Conns &conns, ds::Layout const &layout, Bufs b,
                            uint32_t layers) {
   ds::InitialNode built[ds::kMaxLayers + 1];
-  uint32_t const count = ds::buildInitialStructure(layers, /*ts=*/1, built);
+  uint32_t const count =
+      ds::buildInitialStructure(layers, ds::kBootstrapTs, built);
   for (uint32_t i = 0; i < count; ++i) {
     *b.stage_vec = built[i].vec;
     ds::writeVecAllReplicas(conns, layout, b.stage_vec, built[i].vec_offset);

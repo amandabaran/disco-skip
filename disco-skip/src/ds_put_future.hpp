@@ -34,6 +34,7 @@
 #include "ds_node.hpp"
 #include "ds_put.hpp"
 #include "ds_traverse.hpp"
+#include "ds_ts.hpp"
 
 namespace ds {
 
@@ -47,6 +48,7 @@ enum class PutStep : uint8_t {
   AwaitInsert,       ///< F1's single chained batch
   AwaitSplitStage,   ///< F2's stage-and-publish chain
   AwaitSplitFinish,  ///< F2's completion chain
+  AwaitStamp,        ///< Faa mode only: writing the timestamp it claimed
   Done,
 };
 
@@ -80,6 +82,41 @@ class PutOperation {
     out_.height = height_;
     index_ = {};
     attempts_ = 0;
+
+    // ── Ask the cache where to write ──────────────────────────────────────
+    //
+    // A height-0 put needs exactly one thing: the data node covering k. That
+    // is precisely what locateData returns, so a hit skips the whole traversal
+    // and the put costs one node fetch plus one chained batch.
+    //
+    // This was missing, and measurably so. The parallelism sweep put the
+    // cache's benefit at 4.7-6.3x on a read-only workload and only 1.3-1.5x on
+    // 50/50 -- because the write half never asked. Roughly seven puts in eight
+    // are height 0, so this is most of that gap.
+    //
+    // A BAD HINT IS DETECTED, NOT TRUSTED. actInsert checks covers() before
+    // touching anything and returns to a traversal when the node does not own
+    // k, which is the same C4 contract the read path uses: a stale hint costs a
+    // round trip, never a wrong write.
+    //
+    // Height >= 1 still traverses, deliberately. Its climb needs the covering
+    // node at every level, and while the cache can supply those (gather_prevs,
+    // interface doc §5) that is the path which BUILDS the index -- a hint that
+    // is merely coarse there would be rejected by the split's range check and
+    // cost a retry, so the saving is small and the surface to get wrong is the
+    // structural one. Worth measuring separately before adopting.
+    if (height_ == 0) {
+      RemoteAddr const hinted = cache_.locateData(k);
+      if (!hinted.isNull()) {
+        ++stats_.hinted_writes;
+        phase_ = PutPhase::DataInsert;
+        target_ = hinted;
+        data_addr_ = hinted;
+        from_hint_ = true;
+        return fetch();
+      }
+      ++stats_.hint_misses;
+    }
     return beginTraversal();
   }
 
@@ -92,6 +129,7 @@ class PutOperation {
       case PutStep::AwaitInsert:      return onInsert();
       case PutStep::AwaitSplitStage:  return onSplitStage();
       case PutStep::AwaitSplitFinish: return onSplitFinish();
+      case PutStep::AwaitStamp:       return onStamp();
       case PutStep::Idle:
       case PutStep::Done:
         break;
@@ -111,6 +149,7 @@ class PutOperation {
   }
 
   size_t beginTraversal() {
+    from_hint_ = false;
     if (++attempts_ > static_cast<uint32_t>(detail::kMaxPutAttempts)) {
       return done(false);
     }
@@ -234,9 +273,12 @@ class PutOperation {
     Value const val = insertVal();
 
     if (!covers(node_, vec_, key)) {
-      // The target no longer owns this key -- it split under us, or the address
-      // was stale. A detected bad address, not a wrong write.
+      // The target no longer owns this key -- it split under us, or the cache's
+      // hint was stale. A detected bad address, not a wrong write. Counted
+      // separately from a hint that was simply absent, because the two say
+      // different things: misses mean a cold cache, rejections mean a stale one.
       ++wstats_.not_covered;
+      if (from_hint_) ++stats_.hint_rejected;
       return beginTraversal();
     }
 
@@ -283,7 +325,17 @@ class PutOperation {
     batch_.writeVec(off, staged_);
     batch_.casHandle(target_, node_.handle.raw,
                      node_.handle.withContent(off).raw);
-    batch_.casTs(off, kNullTs, ops_.now());
+    // See ds_ts.hpp: Faa claims its value after the publish and writes it in a
+    // second round trip; the local modes fold it into this chain, guarded
+    // against the version being superseded so the chain cannot invert.
+    if (ops_.tsMode() == TsMode::Faa) {
+      batch_.faaTs();
+    } else {
+      batch_.casTs(off, kNullTs,
+                   stampFor(ops_.tsMode(), ops_.now(), vec_.ts));
+    }
+    pred_ts_ = vec_.ts;
+    staged_off_ = off;
     was_present_ = present;
     step_ = PutStep::AwaitInsert;
     return ops_.postBatch(batch_);
@@ -300,6 +352,20 @@ class PutOperation {
       ++wstats_.cas_lost;
       ++wstats_.retries;
       return fetch();
+    }
+    if (ops_.tsMode() == TsMode::Faa) {
+      // Visible but unstamped. Fix it before the operation is called complete,
+      // so "the write finished" includes its timestamp and a reader starting
+      // afterwards cannot be ordered before it.
+      Batch stamp;
+      // Raw counter value in Faa mode -- see stampFor() in ds_ts.hpp.
+      stamp.casTs(staged_off_, kNullTs,
+                  stampFor(ops_.tsMode(), r.ts, pred_ts_));
+      if (!ops_.postBatch(stamp)) return done(false);
+      ++wstats_.faa_stamps;
+      ++wstats_.batches;
+      step_ = PutStep::AwaitStamp;
+      return 1;  // the stamp batch's completions
     }
     ++wstats_.published;
     if (was_present_) ++wstats_.updates; else ++wstats_.creates;
@@ -366,6 +432,8 @@ class PutOperation {
     batch_.writeVec(nvec_off, nvec_);
     batch_.casHandle(target_, node_.handle.raw,
                      node_.handle.withStruct(nvec_off).raw);
+    if (ops_.tsMode() == TsMode::Faa) batch_.faaTs();
+    pred_ts_ = vec_.ts;
     pre_split_ = node_;
     split_orphan_ = orphan;
     step_ = PutStep::AwaitSplitStage;
@@ -387,9 +455,16 @@ class PutOperation {
     // The completion chain. Order is the protocol's: timestamps and the two
     // header fields in any order, the tail word LAST -- which same-QP ordering
     // now enforces rather than leaving it to the order of these calls.
+    // Both vectors get the SAME timestamp: the split published them together,
+    // so distinct stamps would claim an order between two versions that became
+    // visible at once. Guarded against the version being superseded, so the
+    // chain cannot invert whatever the clock does.
+    uint64_t const ts = stampFor(
+        ops_.tsMode(), ops_.tsMode() == TsMode::Faa ? r.ts : ops_.now(),
+        pred_ts_);
     finish_ = Batch{};
-    finish_.casTs(new_vec_, kNullTs, ops_.now());
-    finish_.casTs(created_vec_, kNullTs, ops_.now());
+    finish_.casTs(new_vec_, kNullTs, ts);
+    finish_.casTs(created_vec_, kNullTs, ts);
     finish_.casNextKMin(target_, pre_split_.next_k_min, split_key_);
     finish_.casNextId(target_, pre_split_.next_id, created_.id);
     finish_.casTailWord(
@@ -417,6 +492,13 @@ class PutOperation {
       // The seed went into the created node, so the entry is already in place.
       return advance();
     }
+    return advance();
+  }
+
+  /// Faa mode only: the claimed timestamp has been written, so F1 is complete.
+  size_t onStamp() {
+    ++wstats_.published;
+    if (was_present_) ++wstats_.updates; else ++wstats_.creates;
     return advance();
   }
 
@@ -529,6 +611,9 @@ class PutOperation {
   bool have_seed_ = false;
   bool split_orphan_ = false;
   bool was_present_ = false;
+  bool from_hint_ = false;  ///< this attempt's target came from the cache
+  uint64_t pred_ts_ = kNullTs;      ///< ts of the version being superseded
+  VecOffset staged_off_ = kNullVec; ///< the offset awaiting its stamp
 
   NodeRecord node_{}, cnode_{}, pre_split_{};
   VecRecord vec_{}, staged_{}, cvec_{}, nvec_{};

@@ -48,6 +48,13 @@ enum class BatchKind : uint8_t {
   CasNextId,
   CasNextKMin,
   CasTailWord,
+  /// Fetch-and-add the global timestamp counter.
+  ///
+  /// Appended AFTER the publishing CAS, never before -- see ds_ts.hpp. Its
+  /// returned value becomes the version's timestamp, which is why it cannot be
+  /// chained with the CAS that writes `ts`: that CAS's value is this one's
+  /// result, and is not known until the chain completes.
+  FaaTs,
 };
 
 /// One operation in a batch.
@@ -133,6 +140,11 @@ class Batch {
       o->desired = desired;
     }
   }
+  /// Claim a timestamp. At most one per batch: two would make "which value is
+  /// this operation's timestamp" ambiguous.
+  void faaTs() {
+    if (push(BatchKind::FaaTs) != nullptr) ++faas_;
+  }
 
   [[nodiscard]] size_t size() const { return n_; }
   [[nodiscard]] BatchOp const &operator[](size_t i) const { return ops_[i]; }
@@ -146,6 +158,7 @@ class Batch {
   [[nodiscard]] bool hasCommit() const { return commits_ > 0; }
   [[nodiscard]] size_t vecWrites() const { return vec_writes_; }
   [[nodiscard]] size_t nodeWrites() const { return node_writes_; }
+  [[nodiscard]] bool hasFaa() const { return faas_ > 0; }
 
   /// Is this batch issuable as written?
   ///
@@ -155,7 +168,8 @@ class Batch {
   /// conditions, so they are caught here rather than surfacing as a corrupt
   /// write.
   [[nodiscard]] bool wellFormed() const {
-    return !overflow_ && commits_ <= 1 && vec_writes_ <= kMaxBatchVecWrites &&
+    return !overflow_ && commits_ <= 1 && faas_ <= 1 &&
+           vec_writes_ <= kMaxBatchVecWrites &&
            node_writes_ <= kMaxBatchNodeWrites;
   }
 
@@ -173,12 +187,15 @@ class Batch {
   BatchOp ops_[kMaxBatchOps];
   size_t n_ = 0;
   size_t commits_ = 0;
+  size_t faas_ = 0;
   size_t vec_writes_ = 0;
   size_t node_writes_ = 0;
   bool overflow_ = false;
 };
 
 struct BatchResult {
+  /// The timestamp the batch's FaaTs claimed, or kNullTs if it carried none.
+  uint64_t ts = kNullTs;
   /// Did the batch reach the fabric at all? False means a malformed batch or a
   /// write that missed its quorum -- the caller cannot assume anything landed.
   bool submitted = false;

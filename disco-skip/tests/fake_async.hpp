@@ -123,6 +123,7 @@ class FakeAsyncOps {
   ds::BatchResult resolveBatch(ds::Batch const &) { return last_batch_; }
 
   uint64_t now() { return set_.now(); }
+  [[nodiscard]] ds::TsMode tsMode() const { return set_.tsMode(); }
 
   // Allocation is client-local, so it comes from the replica set's single
   // allocator pair rather than per replica -- a RemoteAddr and a VecOffset mean

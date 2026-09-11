@@ -88,7 +88,8 @@ void bootstrap_structure(ds::DsState& state) {
     // ts would make every early reader try to resolve a version nobody is
     // writing.
     ds::InitialNode built[ds::kMaxLayers + 1];
-    uint32_t const count = ds::buildInitialStructure(layers, /*ts=*/1, built);
+    uint32_t const count =
+        ds::buildInitialStructure(layers, ds::kBootstrapTs, built);
 
     // The HCA reads directly out of the source buffer, so it has to be MR
     // resident -- a stack array would not be addressable. Future 0's staging
@@ -152,6 +153,7 @@ int run_structure_selftest(ds::DsState& state) {
         state.layout.getVecBufs(0), state.layout.getCasBufs(0),
         state.layout.getStageNode(0), state.layout.getStageVec(0),
         &state.node_alloc, &state.vec_alloc, &state.vec_hint);
+    replicas.setTsMode(state.layout.ts_mode);
     ds::QuorumStats qstats;
     // The hint makes a node read speculate its vector read alongside the
     // headers rather than serialising after them -- see ds_quorum.hpp.
@@ -160,6 +162,8 @@ int run_structure_selftest(ds::DsState& state) {
     std::cout << "replication:  " << replicas.replicas()
               << " server(s), majority " << ops.majority() << " (DS_N_REPLICAS="
               << ds::kNumReplicas << " declared)" << std::endl;
+    std::cout << "timestamps:   " << ds::tsModeName(state.layout.ts_mode)
+              << std::endl;
 
     int const rc = ds::runSelftest(ops, ops, layers, &state.vec_hint, std::cout);
 
@@ -327,6 +331,7 @@ int main(int argc, char** argv) {
     layout.offset_hint       = true;
     layout.consult_cache     = DS_CACHE_ENABLED ? true : false;
     layout.writeback         = DS_REG_WRITEBACK_ENABLED ? true : false;
+    layout.ts_mode           = ds::TsMode::Clock;
 
     // Set by client at runtime after MR is allocated.
     // (Same pattern as swarm-kv: see Layout::client_local_region)
@@ -339,6 +344,9 @@ int main(int argc, char** argv) {
     bool run_ml_workload = false;
     bool run_selftest = false;
     uint64_t think_time = 0;
+
+    // Parsed into layout.ts_mode below: lyra binds strings, not enums.
+    std::string ts_mode_name = "clock";
 
     std::string ycsb_path = "./YCSB/bin/ycsb.sh";
     std::string workload = "./YCSB/workloads/swarm-workloada";
@@ -398,6 +406,14 @@ int main(int argc, char** argv) {
             "Bootstrap the structure, verify invariants I1-I4 over RDMA, and "
             "exit (1 or 0). Needs no YCSB and runs on a single server/client "
             "pair. Takes a value, like --cache and --ml: pass --selftest 1.") |
+        lyra::opt(ts_mode_name, "ts_mode").optional()["--ts"](
+            "Timestamp source: clock|tsc|faa (default clock). clock is a "
+            "disciplined CLOCK_REALTIME and is the only mode correct at more "
+            "than one client that also keeps the fault tolerance replication "
+            "provides. tsc is raw rdtscp -- cheapest, single-client only. faa "
+            "is an RDMA fetch-and-add on a global counter: no timing "
+            "assumption, at one extra round trip per write and one point of "
+            "failure. See ds_ts.hpp.") |
         lyra::opt(run_ml_workload, "ml").optional()["--ml"] |
         lyra::opt(think_time, "think").optional()["--think"];
 
@@ -428,6 +444,30 @@ int main(int argc, char** argv) {
         std::cerr << "--layers must be in (1, " << DS_MAX_LAYERS
                   << "], got " << layout.cache_layers << std::endl;
         return 1;
+    }
+
+    if (!ds::parseTsMode(ts_mode_name, layout.ts_mode)) {
+        std::cerr << "--ts must be clock, tsc or faa; got '" << ts_mode_name
+                  << "'" << std::endl;
+        return 1;
+    }
+    // Both of these are legal and useful, and both are easy to select by
+    // accident and then read the numbers as if they meant something else. Say
+    // so on the way past rather than leaving it to the log reader.
+    if (layout.ts_mode == ds::TsMode::Tsc && layout.num_clients > 1) {
+        std::cerr << "WARNING: --ts tsc with " << layout.num_clients
+                  << " clients. Raw rdtscp is not comparable across machines "
+                     "(14.31 ppm measured between these nodes, i.e. 143 us of "
+                     "skew over a 10 s run), so the old_ver chains this run "
+                     "writes may be non-monotonic and ds_verify will say so."
+                  << std::endl;
+    }
+    if (layout.ts_mode == ds::TsMode::Faa && layout.num_servers > 1) {
+        std::cerr << "WARNING: --ts faa holds the counter on replica 0 only, so "
+                     "this run tolerates one memory node failing UNLESS it is "
+                     "server 0. That is a weaker failure model than the 2-of-"
+                  << layout.num_servers << " commit otherwise gives."
+                  << std::endl;
     }
 
     // Allocation never reclaims, so a stripe that is too small stops the run

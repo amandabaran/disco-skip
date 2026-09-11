@@ -25,6 +25,7 @@
 
 #include "ds_batch.hpp"
 #include "ds_defs.hpp"
+#include "ds_ts.hpp"
 #include "ds_node.hpp"
 #include "layout.hpp"  // Layout::nodeAddrOf
 
@@ -232,6 +233,19 @@ size_t postBatchChain(Conn &rc, Layout const &layout, Batch const &b,
                             Layout::tailWordAddrOf(rc.remoteBuf(), o.addr),
                             o.expected, o.desired, signaled);
         break;
+      case BatchKind::FaaTs:
+        // Fetch-and-add of 1 on the global counter. dory exposes no atomic-add
+        // helper, so this is a CAS-shaped request repurposed: prepareSingleCas
+        // sets IBV_WR_ATOMIC_CMP_AND_SWP, and the opcode and the `compare_add`
+        // field are overwritten here to make it IBV_WR_ATOMIC_FETCH_AND_ADD --
+        // where that field is the ADDEND rather than an expected value. The
+        // returned pre-value lands in cas_bufs[i] exactly as a CAS's would.
+        rc.prepareSingleCas(wr[i], sg[i], wr_id, &cas_bufs[i],
+                            layout.tsCounterAddrOf(rc.remoteBuf()),
+                            /*expected=*/0, /*swap=*/0, signaled);
+        wr[i].opcode = IBV_WR_ATOMIC_FETCH_AND_ADD;
+        wr[i].wr.atomic.compare_add = 1;
+        break;
     }
   }
 
@@ -274,6 +288,14 @@ inline void stageBatchPayloads(Batch const &b, NodeRecord *stage_nodes,
       stage_nodes[node_slot++] = *o.node;
     }
   }
+}
+
+/// The timestamp a batch's FaaTs claimed, or kNullTs if it carried none.
+inline uint64_t batchTs(Batch const &b, uint64_t const *cas_bufs) {
+  for (size_t i = 0; i < b.size(); ++i) {
+    if (b[i].kind == BatchKind::FaaTs) return tsFromFaa(cas_bufs[i]);
+  }
+  return kNullTs;
 }
 
 /// Did the publishing CAS in /b/ take, given the swapbacks it wrote?
@@ -576,8 +598,12 @@ class RdmaOps : public RdmaNodeReader<Conns> {
     cas_ += b.size() - b.vecWrites() - b.nodeWrites();
     out.submitted = true;
     out.committed = batchCommitted(b, cas);
+    out.ts = batchTs(b, cas);
     return out;
   }
+
+  [[nodiscard]] TsMode tsMode() const { return ts_mode_; }
+  void setTsMode(TsMode m) { ts_mode_ = m; }
 
   /// A fresh vector offset from this client's stripe, or kNullVec when spent.
   ///
@@ -609,6 +635,10 @@ class RdmaOps : public RdmaNodeReader<Conns> {
   NodeAllocator *nodes_ = nullptr;
   VecAllocator *vecs_ = nullptr;
   bool doorbell_ = true;
+  // Clock, matching the documented default in ds_ts.hpp. This used to be Tsc
+  // in ds_rdma.hpp and Clock in ds_rdma_async.hpp, so a blocking path and an
+  // async path on the same run stamped from two different clocks.
+  TsMode ts_mode_ = TsMode::Clock;
   uint64_t node_writes_ = 0;
   uint64_t vec_writes_ = 0;
   uint64_t batches_ = 0;
@@ -808,13 +838,17 @@ class RdmaReplicaSet {
       submitted[r] = true;
       // Only now are the swapbacks meaningful.
       committed[r] = batchCommitted(b, &cas_bufs_[r * kMaxBatchOps]);
+      // Replica 0's counter is the authoritative one (see Layout), so its
+      // pre-value is the timestamp. The others' FAAs advance their own copies
+      // and are discarded -- which is why the counter is a single point of
+      // failure and said to be one.
+      if (r == 0) last_ts_ = batchTs(b, &cas_bufs_[0]);
     }
   }
 
-  uint64_t now() {
-    return static_cast<uint64_t>(
-        std::chrono::steady_clock::now().time_since_epoch().count());
-  }
+  uint64_t now() { return localNow(ts_mode_); }
+  [[nodiscard]] TsMode tsMode() const { return ts_mode_; }
+  void setTsMode(TsMode m) { ts_mode_ = m; }
 
   // Client-local, so one of each however many replicas there are: a RemoteAddr
   // and a VecOffset mean the same thing on every replica, which is what lets
@@ -824,6 +858,7 @@ class RdmaReplicaSet {
     return nodes_ == nullptr ? RemoteAddr{} : nodes_->allocate();
   }
 
+  [[nodiscard]] uint64_t lastTs() const { return last_ts_; }
   [[nodiscard]] uint64_t replicaReads() const { return reads_; }
   [[nodiscard]] uint64_t replicaWrites() const { return writes_; }
   [[nodiscard]] uint64_t replicaCas() const { return cas_; }
@@ -851,6 +886,11 @@ class RdmaReplicaSet {
   VecAllocator *vecs_;
   VecOffsetHint *hint_;
   bool doorbell_ = true;
+  // Clock, matching the documented default in ds_ts.hpp. This used to be Tsc
+  // in ds_rdma.hpp and Clock in ds_rdma_async.hpp, so a blocking path and an
+  // async path on the same run stamped from two different clocks.
+  TsMode ts_mode_ = TsMode::Clock;
+  uint64_t last_ts_ = kNullTs;
   uint64_t reads_ = 0, writes_ = 0, cas_ = 0, batches_ = 0;
 };
 

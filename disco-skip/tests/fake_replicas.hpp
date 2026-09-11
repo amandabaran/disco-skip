@@ -87,11 +87,19 @@ class FakeReplicaSet {
       ds::BatchResult const res = arenas_[r].submit(b);
       submitted[r] = res.submitted;
       committed[r] = res.committed;
+      if (r == 0) last_ts_ = res.ts;
     }
   }
 
   // Client-local, so one of each rather than one per replica.
   uint64_t now() { return clock_ += 10; }
+
+  [[nodiscard]] ds::TsMode tsMode() const { return arenas_[0].tsMode(); }
+  void setTsMode(ds::TsMode m) {
+    for (auto &a : arenas_) a.setTsMode(m);
+  }
+  /// Replica 0 holds the authoritative counter, matching Layout.
+  [[nodiscard]] uint64_t lastTs() const { return last_ts_; }
   ds::VecOffset allocVec() {
     // Offsets must mean the same thing on every replica, so allocation is a
     // client-side decision handed to all of them -- which is exactly why a
@@ -153,5 +161,6 @@ class FakeReplicaSet {
   std::vector<FakeOps> arenas_;
   std::vector<bool> down_;
   uint64_t clock_ = 1000;
+  uint64_t last_ts_ = ds::kNullTs;
   uint64_t batches_ = 0;
 };

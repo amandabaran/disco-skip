@@ -6,6 +6,7 @@
 #include "ds_batch.hpp"
 #include "ds_defs.hpp"
 #include "ds_node.hpp"
+#include "ds_ts.hpp"
 #include "register.hpp"
 
 namespace ds {
@@ -57,6 +58,14 @@ struct Layout {
     // a silent no-op; main.cpp rejects it.
     bool consult_cache;
     bool writeback;
+
+    // Where a version's timestamp comes from. Clock is the default and the only
+    // mode that is correct at more than one client while keeping the fault
+    // tolerance replication exists to provide; Tsc and Faa are here so that the
+    // cost and the correctness of that choice are each priced against an
+    // alternative rather than argued for. See ds_ts.hpp for the full reasoning,
+    // and docs/clock-measurements.md for the measured epsilon Clock relies on.
+    TsMode ts_mode;
 
     // Set by client at runtime after MR is allocated.
     // (Same pattern as swarm-kv: see Layout::client_local_region)
@@ -166,7 +175,32 @@ struct Layout {
     }
 
     size_t vecArenaOffset() const { return align64(nodeArenaSize()); }
-    size_t serverSize() const { return vecArenaOffset() + vecArenaSize(); }
+
+    // ─── The global timestamp counter ──────────────────────────────────
+    //
+    // One 8-byte word, in its own 64-byte line so nothing shares a cache line
+    // with it: writers fetch-and-add it and (once A10 exists) readers RDMA-READ
+    // it for a snapshot. False sharing here would slow every write on the
+    // system, and the line costs 64 bytes once per server.
+    //
+    // ONE server holds the authoritative counter -- replica 0 -- because a
+    // total order needs a single point of serialisation. That makes it a single
+    // point of failure, which is a real limitation and not one this design
+    // addresses: replicating a counter needs consensus. Recorded rather than
+    // hidden, since the rest of the structure tolerates one replica failing.
+    //
+    // Placed after the vector arena so adding it does not move either arena's
+    // offsets, and so an older binary reading this region sees whatever it
+    // expects to see.
+    static constexpr size_t kTsCounterBytes = 64;
+    size_t tsCounterOffset() const {
+        return align64(vecArenaOffset() + vecArenaSize());
+    }
+    uintptr_t tsCounterAddrOf(uintptr_t remote_base) const {
+        return remote_base + tsCounterOffset();
+    }
+
+    size_t serverSize() const { return tsCounterOffset() + kTsCounterBytes; }
 
     /// Address of a node on one replica. Also its handle's address, since the
     /// handle sits at offset 0 -- so this doubles as the CAS target.

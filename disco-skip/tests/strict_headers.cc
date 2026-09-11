@@ -56,7 +56,7 @@ int main() {
   ds::VecOffsetHint hint(16, true);
 
   ds::InitialNode built[ds::kMaxLayers + 1];
-  uint32_t const built_n = ds::buildInitialStructure(2, /*ts=*/1, built);
+  uint32_t const built_n = ds::buildInitialStructure(2, ds::kBootstrapTs, built);
   auto const heads = ds::headAddrs(2);
 
   // Instantiate the verifier against a trivial reader so its body is compiled

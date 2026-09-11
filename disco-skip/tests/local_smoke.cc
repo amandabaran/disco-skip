@@ -229,8 +229,18 @@ static void checkArenaLayout() {
   CHECK(l.nodeArenaNodes() == ds::kFirstDynamicId + 8 * 1000, "node arena covers all stripes");
   CHECK(l.vecArenaVecs() == ds::kFirstDynamicVec + 8 * 4000, "vector arena covers all stripes");
   CHECK(l.vecArenaOffset() >= l.nodeArenaSize(), "the vector arena starts after the node arena");
-  CHECK(l.serverSize() == l.vecArenaOffset() + l.vecArenaSize(),
-        "the server region is exactly the two arenas");
+  // The server region is the two arenas plus the timestamp counter's own cache
+  // line. The counter must sit PAST the vector arena, so that adding it moved
+  // neither arena's offsets, and must be 64-byte aligned and alone on its line
+  // -- every write fetch-and-adds it in Faa mode, so anything sharing the line
+  // would slow every write on the system.
+  CHECK(l.tsCounterOffset() >= l.vecArenaOffset() + l.vecArenaSize(),
+        "the timestamp counter sits past both arenas");
+  CHECK(l.tsCounterOffset() % 64 == 0, "on a 64-byte boundary");
+  CHECK(ds::Layout::kTsCounterBytes == 64,
+        "and alone on its cache line, so no write shares it");
+  CHECK(l.serverSize() == l.tsCounterOffset() + ds::Layout::kTsCounterBytes,
+        "the server region is the two arenas plus the counter line");
   CHECK(l.vecArenaSize() > l.nodeArenaSize(),
         "the vector arena is larger, since every write consumes one");
 

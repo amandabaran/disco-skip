@@ -83,7 +83,12 @@ class SvFuture : public BasicFuture {
              qstats, &s.vec_hint, &s.node_alloc, &s.vec_alloc),
         get_(ops_, cache, static_cast<uint32_t>(s.layout.cache_layers), gstats),
         put_(ops_, cache, static_cast<uint32_t>(s.layout.cache_layers), pstats,
-             wstats) {}
+             wstats) {
+    // The timestamp source is a per-run decision carried on Layout, not a
+    // per-future one -- every future on a client must agree, or the old_ver
+    // chains they write interleave two incomparable clocks.
+    ops_.setTsMode(s.layout.ts_mode);
+  }
 
   void doGet(Key k, bool measuring = false) {
     begin(Kind::Get, measuring);

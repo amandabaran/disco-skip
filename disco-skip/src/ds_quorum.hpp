@@ -101,6 +101,7 @@
 
 #include "ds_batch.hpp"
 #include "ds_defs.hpp"
+#include "ds_ts.hpp"
 #include "ds_node.hpp"
 #include "layout.hpp"  // VecOffsetHint
 
@@ -336,6 +337,7 @@ class QuorumOps {
 
     if (!b.hasCommit()) {
       out.committed = true;
+      out.ts = set_.lastTs();
       return out;
     }
 
@@ -351,6 +353,7 @@ class QuorumOps {
 
     ++stats_.commits;
     out.committed = true;
+    out.ts = set_.lastTs();
     writeBack(b, submitted, committed);
     last_max_valid_ = false;  // the winning replica is no longer meaningful
     return out;
@@ -388,6 +391,7 @@ class QuorumOps {
   [[nodiscard]] uint64_t batches() const { return stats_.batches; }
 
   uint64_t now() { return set_.now(); }
+  [[nodiscard]] TsMode tsMode() const { return set_.tsMode(); }
   VecOffset allocVec() { return set_.allocVec(); }
   RemoteAddr allocNode() { return set_.allocNode(); }
 

@@ -91,6 +91,17 @@ inline constexpr uint64_t kNullId = 0;
 /// that needs the version resolves it by CAS rather than waiting.
 inline constexpr uint64_t kNullTs = 0;
 
+/// The timestamp every vector the bootstrap writes carries.
+///
+/// Bootstrap writes a SETTLED structure, so these cannot be kNullTs -- an early
+/// reader would try to resolve a version nobody is writing (ds_bootstrap.hpp).
+/// It has to be the smallest non-null value, because every later stamp must
+/// exceed it for the old_ver chain to stay strictly decreasing, and in Faa mode
+/// the later stamps come from a counter that starts near zero. Named rather
+/// than written as a literal 1 in five places, so that the relationship to
+/// tsFromFaa() is checkable: see the static_assert in ds_ts.hpp.
+inline constexpr uint64_t kBootstrapTs = 1;
+
 /// The 8-byte CAS unit.
 ///
 /// Bit layout, MSB first:

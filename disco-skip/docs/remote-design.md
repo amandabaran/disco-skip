@@ -174,6 +174,120 @@ A helper stamps with its own clock, which orders the write at the moment somebod
 needed it. A reader whose snapshot then falls below that timestamp walks `old_ver` for an
 older version, which is exactly what the chain is for.
 
+### The timestamp source: three modes, and which one is the default
+
+`--ts clock|tsc|faa`, one seam in [`ds_ts.hpp`](../src/ds_ts.hpp). There used to be three
+identical copies of `now()` returning `steady_clock`, which ordered nothing across clients
+(§6 q2); the clock is one decision, so it is one file.
+
+| Mode | Source | Cost | Correct at >1 client? | Keeps fault tolerance? |
+|---|---|---|---|---|
+| `clock` *(default)* | disciplined `CLOCK_REALTIME` via the vDSO | 31.4 ns | within a measured ε | yes |
+| `tsc` | raw `rdtscp` | 20.1 ns | **no** — 14.31 ppm of rate error | yes |
+| `faa` | RDMA fetch-and-add on a global counter | +1 round trip per write | yes, exactly | **no** |
+
+`tsc` and `faa` exist so the default's cost and its correctness are each priced against an
+alternative, the same reasoning as `--offset-hint`: the trade becomes a measurement rather
+than an argument. `main.cpp` warns when a mode is selected whose weakness the run will hit
+— `tsc` with more than one client, `faa` with more than one server.
+
+#### Why `faa` is not the default: it costs fault tolerance
+
+A total order from a counter needs **one** counter, and one counter lives on one memory
+server. The rest of the structure tolerates any single replica failing — that is what the
+2-of-3 commit buys — but a write cannot claim a timestamp if the counter's server is down.
+Enabling `faa` therefore silently narrows the failure model from "tolerates one memory
+node" to "tolerates one memory node unless it is server 0". The counter is replicated to
+all servers and every replica's word is advanced, but only replica 0's returned value is
+used, so the others are decoration.
+
+**The obvious fix does not work.** "FAA all three and take the max" loses uniqueness. Two
+writers, two replicas, interleaved in opposite order on each:
+
+```
+W1 FAAs R0 -> pre 0      W2 FAAs R0 -> pre 1
+W2 FAAs R1 -> pre 0      W1 FAAs R1 -> pre 1
+```
+
+W1's pre-values are {0,1}, W2's are {1,0}; both maxima are 1, so both writers claim the
+same timestamp. It generalises to three replicas with a majority.
+
+#### (b) Replicated FAA with a client-id tiebreak — left as a paper discussion
+
+The uniqueness failure above is repairable. Pack the timestamp as 48 bits of counter and 16
+bits of client id, and take `(max_of_pre_values, client_id)` lexicographically. Uniqueness
+is then immediate: two writers with the same counter maximum differ in the id. 64 bits still
+fits the one word the vector has for `ts`, and 48 bits of counter at the measured 2.70
+Mops/s write ceiling is ~3300 years, so neither field is tight.
+
+What is *not* immediate is the property the counter was there to provide. A single counter
+gives a total order that respects real time: if W1's FAA completes before W2's begins, W1's
+value is smaller. A majority-max does not obviously inherit that, because the two writers
+may touch their replicas in different orders, and the tiebreak is decided by client id —
+which has nothing to do with time. So a pair of writes can be ordered by id against real
+time. That is still a *linearization* of the writes (it is a total order, and it is
+consistent with the per-node `old_ver` chains), so it is sound for a snapshot read; what it
+stops being is *real-time* ordered, which is the stronger property `faa` was chosen for in
+the first place.
+
+Re-deriving what it does guarantee — and whether a quorum intersection argument recovers
+real-time ordering for non-overlapping operations — is a paper-sized argument, not a code
+change. **Deferred deliberately**, and recorded here so the design is not mistaken for an
+oversight. Option (c) below was built instead, because it keeps fault tolerance and pays
+in a quantity that can simply be measured.
+
+#### (c) What was built: a PTP-disciplined clock, and ε as a measured cost
+
+`clock` mode's guarantee is "linearizable within ε", and ε has to be measured rather than
+quoted. See [`clock-measurements.md`](clock-measurements.md) §8 for the PTP configuration
+and the resulting distribution. The short version is that ε is **not** small relative to an
+operation on this hardware, which is the strongest argument for `faa` that exists, and is
+stated there rather than hidden here.
+
+#### Two things that are load-bearing and easy to miss
+
+**Settle-before-write orders timestamps, not just split descriptors.** Both `clock` and
+`faa` fix a version's timestamp *after* it is visible (see "Why the timestamp is written
+after visibility" above). That opens a hazard: two writers can publish in the order W1 then
+W2 — W2 having CAS'd from W1's handle — and yet *stamp* in the order W2 then W1, giving the
+older version the higher timestamp and inverting the `old_ver` chain. This is not clock
+skew; it would happen with a single perfect counter, because the gap between publishing and
+stamping is schedulable. What prevents it is the rule that **a writer must settle a node
+before writing it**: W2 cannot publish over W1's unstamped version, it settles it first,
+stamping it with a value W2's own later stamp exceeds. That rule was written down for the
+split descriptor; it turns out to carry the timestamp ordering too.
+
+**`stampOver` is mode-dependent, and applying it in `faa` mode is a bug.** A writer holds
+the version it supersedes, so it can stamp with `max(source, predecessor + 1)` and make the
+chain monotonic by construction at any skew, for free. In `clock` mode that is a good trade:
+it converts an unbounded structural violation — a non-monotonic chain breaks the snapshot
+walk outright — into an ordering error already bounded by ε, since the predecessor's `ts` is
+itself a clock reading and the floor can only lift a stamp by as much as two clocks
+disagree. In `faa` mode the counter is already exact, so the floor can only *introduce*
+error, and it does:
+
+```
+node id 1, long history, predecessor ts 50
+  writer W_A claims counter pre-value 10 -> source 11 -> stampOver(11, 50) = 51
+node id 2, fresh from bootstrap, predecessor ts 1
+  writer W_B claims counter pre-value 11 -> source 12 -> stampOver(12,  1) = 12
+```
+
+W_A is globally *earlier* — it took counter value 10, W_B took 11 — and ends up with the
+*higher* stamp. A range query fixing T = 20 takes W_B and rejects W_A, returning a mixed
+state that never existed: a **wrong answer**, not an extra round trip and not something a
+retry detects. So `stampFor(mode, ...)` applies the floor for the clock modes and passes the
+counter value through raw for `faa`. Found by `ts_test.cc`, which failed in `faa` mode when
+`stampOver` was deliberately broken — which it should not have, if the counter were really
+in charge. Latent rather than live today: skip-vector ranges are A10 and deferred, and
+`faa` is not the default.
+
+A **helper** is not covered by the guard in either mode — it has not read the predecessor,
+so it passes a null predecessor and the raw source comes through. A helper's stamp therefore
+still depends on ε being smaller than the gap between two successive versions of one node,
+which is at least a write's latency. The verifier's chain check is what would catch a
+violation.
+
 ---
 
 ## 3. Arenas and allocation
@@ -281,6 +395,9 @@ Recorded so they are not re-proposed.
 | `k_min_next` CAS'd before `next_id` | this side, earlier revision | Unnecessary; any order is safe for a reader that checks the bookends (§2) |
 | Widen versions to 16/32, dropping the offset from the handle | this side, earlier revision | The offset needs 32 bits, so `14/18/32` stands (§1) |
 | Publish `ts` atomically with the data | this side, earlier revision | Lets a reader with a larger snapshot miss a visible write (§2) |
+| `rdtsc` plus a one-shot reset before each experiment | this side, earlier revision | Fixes offset and leaves *rate* error to accumulate: 14.31 ppm measured = 143 µs over a 10 s run ([`clock-measurements.md`](clock-measurements.md)) |
+| FAA all replicas and take the max, for a fault-tolerant counter | this side, earlier revision | Loses uniqueness — two writers can compute the same maximum (§2). Repairable with a client-id tiebreak, at the cost of re-deriving real-time ordering; left as a paper discussion (§2) |
+| `stampOver`'s floor applied in every timestamp mode | this side, earlier revision | Inverts the global order the FAA counter exists to provide, giving a range query a state that never existed (§2) |
 
 ---
 

@@ -37,6 +37,7 @@
 #include "ds_node.hpp"
 #include "ds_quorum.hpp"
 #include "ds_rdma.hpp"  // postBatchChain, stageBatchPayloads, kBlockingWrId
+#include "ds_ts.hpp"
 #include "layout.hpp"
 
 namespace ds {
@@ -238,10 +239,15 @@ class RdmaAsyncOps {
   BatchResult resolveBatch(Batch const &b) {
     BatchResult out;
     out.submitted = true;
+    out.ts = batchTs(b, layout_.casBufsFor(future_id_, 0));
     if (!b.hasCommit()) {
       out.committed = true;
       return out;
     }
+    // Replica 0 holds the authoritative counter (see Layout), so its
+    // pre-value is the timestamp; the others advance their own copies and are
+    // discarded. That asymmetry is the single point of failure Faa mode costs.
+    out.ts = batchTs(b, layout_.casBufsFor(future_id_, 0));
     size_t took = 0;
     for (size_t r = 0; r < conns_.size(); ++r) {
       if (batchCommitted(b, layout_.casBufsFor(future_id_, r))) ++took;
@@ -256,10 +262,12 @@ class RdmaAsyncOps {
     return out;
   }
 
-  uint64_t now() {
-    return static_cast<uint64_t>(
-        std::chrono::steady_clock::now().time_since_epoch().count());
-  }
+  [[nodiscard]] TsMode tsMode() const { return ts_mode_; }
+  void setTsMode(TsMode m) { ts_mode_ = m; }
+
+  /// The local timestamp for this run's mode. Faa has none -- its value comes
+  /// from the counter after the publish; see ds_ts.hpp.
+  uint64_t now() { return localNow(ts_mode_); }
 
   VecOffset allocVec() { return vecs_ == nullptr ? kNullVec : vecs_->allocate(); }
   RemoteAddr allocNode() {
@@ -310,6 +318,7 @@ class RdmaAsyncOps {
   NodeAllocator *nodes_;
   VecAllocator *vecs_;
 
+  TsMode ts_mode_ = TsMode::Clock;
   size_t bumped_ = 0;  ///< completions queued by the post in progress
   VecOffset spec_pending_ = kNullVec;
   size_t winner_ = 0;

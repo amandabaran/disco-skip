@@ -94,8 +94,8 @@ static void checkAgreementAcrossAPopulatedStructure() {
   ds::QuorumOps<FakeReplicaSet> ops(set, qs, nullptr);
   ds::PutStats ps;
   ds::WriteStats ws;
-  ds::NullPutCache cache;
-  ds::Putter<ds::QuorumOps<FakeReplicaSet>, ds::NullPutCache> p(ops, cache,
+  ds::NullCache cache;
+  ds::Putter<ds::QuorumOps<FakeReplicaSet>, ds::NullCache> p(ops, cache,
                                                                 kLayers, ps, ws);
   std::mt19937_64 rng(20260911);
   std::map<ds::Key, ds::Value> oracle;
@@ -262,8 +262,8 @@ static void checkAsyncGetAgreesWithTheBlockingGetter() {
   ds::QuorumOps<FakeReplicaSet> ops(set, qs, nullptr);
   ds::PutStats ps;
   ds::WriteStats ws;
-  ds::NullPutCache pcache;
-  ds::Putter<ds::QuorumOps<FakeReplicaSet>, ds::NullPutCache> p(ops, pcache,
+  ds::NullCache pcache;
+  ds::Putter<ds::QuorumOps<FakeReplicaSet>, ds::NullCache> p(ops, pcache,
                                                                 kLayers, ps, ws);
   std::mt19937_64 rng(20260911);
   std::map<ds::Key, ds::Value> oracle;
@@ -321,8 +321,8 @@ static void checkAsyncGetHitsTheCacheAndRepairsIt() {
   ds::QuorumOps<FakeReplicaSet> ops(set, qs, nullptr);
   ds::PutStats ps;
   ds::WriteStats ws;
-  ds::NullPutCache pcache;
-  ds::Putter<ds::QuorumOps<FakeReplicaSet>, ds::NullPutCache> p(ops, pcache,
+  ds::NullCache pcache;
+  ds::Putter<ds::QuorumOps<FakeReplicaSet>, ds::NullCache> p(ops, pcache,
                                                                 kLayers, ps, ws);
   std::mt19937_64 rng(4242);
   std::map<ds::Key, ds::Value> oracle;
@@ -384,10 +384,10 @@ static void checkAsyncPutBuildsTheSameStructure() {
   ds::QuorumStats qa, qb;
   ds::PutStats psa, psb;
   ds::WriteStats wsa, wsb;
-  ds::NullPutCache ca, cb;
+  ds::NullCache ca, cb;
 
   ds::QuorumOps<FakeReplicaSet> bops(b, qb, nullptr);
-  ds::Putter<ds::QuorumOps<FakeReplicaSet>, ds::NullPutCache> blocking(
+  ds::Putter<ds::QuorumOps<FakeReplicaSet>, ds::NullCache> blocking(
       bops, cb, kLayers, psb, wsb);
 
   std::mt19937_64 rng(777);
@@ -448,7 +448,7 @@ static void checkAsyncPutHandlesCapacityOverflow() {
   ds::QuorumStats qs;
   ds::PutStats ps;
   ds::WriteStats ws;
-  ds::NullPutCache cache;
+  ds::NullCache cache;
 
   for (uint32_t i = 0; i < ds::kNodeCapacity; ++i) {
     FakeAsyncOps aops(set, qs, nullptr);
@@ -481,7 +481,7 @@ static void checkAsyncPutIsIdempotentOnARepeatedBoundary() {
   ds::QuorumStats qs;
   ds::PutStats ps;
   ds::WriteStats ws;
-  ds::NullPutCache cache;
+  ds::NullCache cache;
 
   for (int i = 0; i < 5; ++i) {
     FakeAsyncOps aops(set, qs, nullptr);

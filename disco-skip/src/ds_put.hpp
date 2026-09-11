@@ -49,6 +49,9 @@ struct PutStats {
   uint64_t restarts = 0;      ///< a step lost its race, so the whole put redid
   uint64_t mirror_calls = 0;
   uint64_t not_covered = 0;   ///< traversal reported Miss: nothing routes to k
+  uint64_t hinted_writes = 0; ///< height-0 puts that skipped the traversal
+  uint64_t hint_misses = 0;   ///< ... where the cache had no entry (cold)
+  uint64_t hint_rejected = 0; ///< ... where it had one and it no longer covered k
   uint64_t failures = 0;
   uint64_t nodes_read = 0;
   uint64_t vec_reads = 0;
@@ -229,6 +232,12 @@ class Putter {
 
 /// A cache that records nothing, for the DS_CACHE_ENABLED=0 baseline. Mirrors
 /// ds_get.hpp's NullCache on the write side.
+///
+/// Only enough for the BLOCKING Putter, which never asks the cache where to
+/// write. PutOperation does ask, so it takes NullCache instead -- the full
+/// surface. Kept rather than merged because the blocking path's call sites do
+/// not need locateData and saying so is clearer than giving them a method that
+/// is never called.
 struct NullPutCache {
   void mirrorInsert(Key, uint32_t, RemoteAddr,
                     std::array<RemoteAddr, kMaxLayers> const &) {}
