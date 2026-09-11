@@ -781,20 +781,40 @@ int main(int argc, char** argv) {
                         auto keyend = line.find(" [", keystart);
                         auto key = line.substr(keystart, keyend - keystart);
 
-                        // NO MODULO, unlike every other op here, and that is the
-                        // whole point. YCSB draws run-phase insert keys from a
-                        // counter that starts at recordcount, so `% num_registers`
-                        // would fold them straight back onto keys the load phase
-                        // already wrote -- turning every insert into an update and
-                        // silently deleting the only difference between workload D
-                        // or E and workload B or C. The skip vector takes an
-                        // arbitrary uint64 key, so the raw value is used.
+                        // INSERTS GET THEIR OWN KEY BAND, above everything the
+                        // load phase wrote. Not the same mapping as the other ops,
+                        // and not the raw key either -- both are wrong here:
+                        //
+                        //  * `% num_registers`, as READ/UPDATE/SCAN and the load
+                        //    phase all use, folds insert keys straight back onto
+                        //    loaded keys. Every insert becomes an update and the
+                        //    only difference between D or E and B or C disappears.
+                        //
+                        //  * the raw key does not work either. YCSB's default
+                        //    insertorder is `hashed`, so these are not a counter
+                        //    from recordcount -- they are hashed 64-bit values
+                        //    spanning ~2e16 to ~9.2e18 (checked against the real
+                        //    generator). Using them raw scatters inserts across the
+                        //    whole key space, nowhere near the [0, num_registers)
+                        //    band everything else touches, and brushes up against
+                        //    kReservedKey (UINT64_MAX) as a sentinel collision.
+                        //
+                        // So: hash into a band of 4*num_registers starting at
+                        // num_registers. Keys are genuinely new (disjoint from the
+                        // loaded range by construction), bounded, adjacent to the
+                        // loaded data so the structure stays compact, and clear of
+                        // the sentinel. The band is 4x wider than the insert count
+                        // a standard run issues (5% of operationcount), which keeps
+                        // insert-on-insert collisions low without being sparse.
                         //
                         // BUDGET THE ARENA FOR THESE. An insert allocates a vector
                         // and may split, and nothing is reclaimed, so
                         // --vecs-per-client has to cover recordcount plus the
                         // inserts the run will issue.
-                        uint64_t const insert_key = std::stoull(key.substr(4));
+                        uint64_t const raw = std::stoull(key.substr(4));
+                        uint64_t const band = layout.num_registers * 4;
+                        uint64_t const insert_key =
+                            layout.num_registers + (raw % band);
                         operations.push_back({insert_key, OpInsert, 0});
                     }
                     else if (!(std::strncmp("SCAN ", line.c_str(), 5))) {
