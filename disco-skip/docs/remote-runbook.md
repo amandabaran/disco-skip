@@ -89,15 +89,16 @@ that is easy to leave out.
 If a full `cloudlab_deploy.sh` is too slow to iterate on — it `distclean`s and rebuilds the
 whole conan stack plus dLSM, none of which the remote side touches — the minimum honest
 chain is the last four lines above with `build.py disco-skip` in place of the first. Then
-verify rather than trust, using a string only the new build contains:
-
-```sh
-ssh w5 'strings ~/disco-skip-artifacts/bin/disco-skip-exe | grep -c "^--ts$"'
-```
-
-Same reasoning as the freshness check under **Cluster build**: conan prints
+verify rather than trust — **by hash**, using the check under *A deploy can silently skip a
+node* below. Same reasoning as the freshness check under **Cluster build**: conan prints
 `Already installed!` and `Copied 1 file` for a no-op, so neither its output nor a deploy
 script's exit status is evidence that the bytes on the workers are the bytes you compiled.
+
+Do not substitute `strings | grep <new flag>` for the hash. It works only when the thing
+you grep for really is in the binary: grepping for text that turned out to be a C++ comment
+returned `0` and was indistinguishable from a failed deploy, when the deploy had in fact
+succeeded. A hash has no such failure mode, and `bin.zip` carries several binaries now
+(disco-skip, swarmkv, fusee, and dLSM's three), any of which can be the stale one.
 
 `bin/zip-binaries.sh` **discovers** the built binary rather than hardcoding a path, and fails
 loudly if it cannot find one. That matters because `send-deployment.sh` renames
