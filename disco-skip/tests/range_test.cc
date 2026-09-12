@@ -22,7 +22,10 @@
 #include "ds_put.hpp"
 #include "ds_range.hpp"
 #include "ds_verify.hpp"
+#include "ds_range_future.hpp"
+#include "fake_async.hpp"
 #include "fake_ops.hpp"
+#include "fake_replicas.hpp"
 
 static int g_failures = 0;
 
@@ -180,6 +183,176 @@ static void checkEmptyAndInvertedRanges() {
   CHECK(got.empty(), "and is empty rather than an error");
 }
 
+/// Drive the resumable range to completion.
+template <class Ops>
+static ds::RangeResult runAsyncRange(Ops &ops, ds::Key lo, ds::Key hi,
+                                     size_t cap, ds::RangeStats &rs,
+                                     std::vector<ds::Entry> &out) {
+  ds::RangeOperation<Ops> r(ops, kLayers, rs);
+  size_t await = r.start(lo, hi, cap, out);
+  uint64_t guard = 0;
+  while (!r.finished()) {
+    (void)await;
+    await = r.step();
+    if (++guard > 200000) break;
+  }
+  return r.result();
+}
+
+static void checkAsyncRangeAgreesWithTheBlockingOne() {
+  // The differential test, and the reason the state machine is written at all
+  // rather than trusted. Two implementations of one algorithm over the same
+  // arena must return byte-identical results; a divergence between a blocking
+  // path and its async twin is what produced the unbounded-retry bug in
+  // ds_put_future.hpp, so the two are pinned together rather than separately
+  // asserted correct.
+  FakeReplicaSet set(3, kLayers, 16384);
+  set.setTsMode(ds::TsMode::Faa);
+  ds::QuorumStats qs;
+  ds::PutStats ps;
+  ds::WriteStats ws;
+  ds::NullPutCache cache;
+
+  std::mt19937_64 rng(0xD1FF);
+  {
+    ds::QuorumOps<FakeReplicaSet> ops(set, qs, nullptr);
+    for (int i = 0; i < 300; ++i) {
+      ds::Key const k = static_cast<ds::Key>(rng() % 4000);
+      uint32_t const h = ds::drawHeight(rng, kLayers);
+      ds::Putter<ds::QuorumOps<FakeReplicaSet>, ds::NullPutCache> p(
+          ops, cache, kLayers, ps, ws);
+      p.put(k, static_cast<ds::Value>(i + 1), h);
+    }
+  }
+
+  size_t compared = 0, entries = 0;
+  for (int trial = 0; trial < 30; ++trial) {
+    ds::Key lo = static_cast<ds::Key>(rng() % 4000);
+    ds::Key hi = static_cast<ds::Key>(rng() % 4000);
+    if (hi < lo) std::swap(lo, hi);
+
+    // One snapshot, both paths, so any difference is the walk and not the
+    // clock. Blocking first; the arena is quiescent, so order cannot matter.
+    ds::QuorumOps<FakeReplicaSet> bops(set, qs, nullptr);
+    uint64_t const T = ds::takeSnapshot(bops);
+
+    ds::RangeStats brs;
+    std::vector<ds::Entry> bgot;
+    ds::Ranger<ds::QuorumOps<FakeReplicaSet>> blocking(bops, brs);
+    ds::RangeResult const bres =
+        blocking.rangeAt(lo, hi, kLayers, 1u << 20, T, bgot);
+
+    FakeAsyncOps aops(set, qs, nullptr);
+    ds::RangeStats ars;
+    std::vector<ds::Entry> agot;
+    ds::RangeResult const ares =
+        runAsyncRange(aops, lo, hi, 1u << 20, ars, agot);
+
+    CHECK(bres.resolved && ares.resolved, "both paths resolve");
+    CHECK(bgot.size() == agot.size(), "both return the same number of entries");
+    bool same = bgot.size() == agot.size();
+    for (size_t i = 0; same && i < bgot.size(); ++i) {
+      if (bgot[i].key != agot[i].key || bgot[i].val != agot[i].val) same = false;
+    }
+    CHECK(same, "and the same keys and values in the same order");
+    if (!same) {
+      std::printf("  [%llu,%llu] blocking %zu vs async %zu\n",
+                  static_cast<unsigned long long>(lo),
+                  static_cast<unsigned long long>(hi), bgot.size(), agot.size());
+      break;
+    }
+    ++compared;
+    entries += agot.size();
+  }
+  std::printf("  differential: %zu ranges agree, %zu entries\n", compared,
+              entries);
+}
+
+static void checkAsyncSkipsANodeCreatedAfterTheSnapshot() {
+  // THE CASE THE DIFFERENTIAL TEST DOES NOT REACH, and the reason this exists
+  // separately. That test compares the two paths over a QUIESCENT arena, so no
+  // node is created after the snapshot and the as-of-T successor happens to
+  // equal the current one. Reintroducing the bug of taking next_id from the
+  // as-of-T version instead of the current header therefore passed it cleanly.
+  //
+  // Here a split lands AFTER the snapshot, so the two successors differ: the
+  // as-of-T version's next_id points past the node the split created, and a
+  // walk that followed it would skip that node entirely -- losing every key
+  // that existed at T and now lives there.
+  FakeReplicaSet set(3, kLayers, 16384);
+  set.setTsMode(ds::TsMode::Faa);
+  ds::QuorumStats qs;
+  ds::PutStats ps;
+  ds::WriteStats ws;
+  ds::NullPutCache cache;
+
+  {
+    ds::QuorumOps<FakeReplicaSet> ops(set, qs, nullptr);
+    for (ds::Key k = 10; k <= 90; k += 10) {
+      ds::Putter<ds::QuorumOps<FakeReplicaSet>, ds::NullPutCache> p(
+          ops, cache, kLayers, ps, ws);
+      CHECK(p.put(k, k, 0).resolved, "seed");
+    }
+  }
+
+  ds::QuorumOps<FakeReplicaSet> sops(set, qs, nullptr);
+  uint64_t const before = ds::takeSnapshot(sops);
+
+  {
+    // Height 1 splits the data node at 50, creating a node newer than `before`.
+    ds::QuorumOps<FakeReplicaSet> ops(set, qs, nullptr);
+    ds::Putter<ds::QuorumOps<FakeReplicaSet>, ds::NullPutCache> p(
+        ops, cache, kLayers, ps, ws);
+    CHECK(p.put(50, 5000, 1).resolved, "a height-1 put splits after the snapshot");
+  }
+
+  // Blocking, at the old snapshot.
+  ds::RangeStats brs;
+  std::vector<ds::Entry> bgot;
+  ds::Ranger<ds::QuorumOps<FakeReplicaSet>> blocking(sops, brs);
+  CHECK(blocking.rangeAt(0, 100, kLayers, 1u << 20, before, bgot).resolved,
+        "the blocking path resolves at the old snapshot");
+
+  // Async AT THE SAME OLD SNAPSHOT. A fresh snapshot would be newer than the
+  // split, so the old_ver walk would never run and the successor choice could
+  // not matter -- which is precisely why startAt exists.
+  FakeAsyncOps aops(set, qs, nullptr);
+  ds::RangeStats ars;
+  std::vector<ds::Entry> agot;
+  {
+    ds::RangeOperation<FakeAsyncOps> r(aops, kLayers, ars);
+    size_t await = r.startAt(0, 100, 1u << 20, before, agot);
+    uint64_t guard = 0;
+    while (!r.finished()) {
+      (void)await;
+      await = r.step();
+      if (++guard > 200000) break;
+    }
+    CHECK(r.finished() && r.result().resolved,
+          "the async path resolves at the old snapshot across the split");
+  }
+
+  CHECK(bgot.size() == 9, "blocking: nine keys, none lost or duplicated");
+  CHECK(agot.size() == 9, "async: nine keys, none lost or duplicated");
+  for (size_t i = 1; i < agot.size(); ++i) {
+    CHECK(agot[i - 1].key < agot[i].key, "async: key order, no duplicates");
+  }
+  CHECK(brs.nodes_skipped > 0, "blocking skipped the post-snapshot node");
+
+  CHECK(ars.nodes_skipped > 0, "async skipped the post-snapshot node too");
+
+  // Both are at the SAME old snapshot, so they must agree exactly -- and both
+  // must read the pre-split value, since the split is newer than T.
+  bool same = bgot.size() == agot.size();
+  for (size_t i = 0; same && i < bgot.size(); ++i) {
+    if (bgot[i].key != agot[i].key || bgot[i].val != agot[i].val) same = false;
+  }
+  CHECK(same, "blocking and async agree at the same old snapshot");
+  bool old_value = false;
+  for (auto const &e : agot) if (e.key == 50 && e.val == 50) old_value = true;
+  CHECK(old_value, "and key 50 reads its pre-split value in both");
+}
+
 int main() {
   std::printf("range_test: layers=%u\n", kLayers);
   checkRangeMatchesAnOracle();
@@ -187,6 +360,8 @@ int main() {
   checkANodeCreatedAfterTheSnapshotIsSkipped();
   checkTruncationIsReportedNotSilent();
   checkEmptyAndInvertedRanges();
+  checkAsyncRangeAgreesWithTheBlockingOne();
+  checkAsyncSkipsANodeCreatedAfterTheSnapshot();
 
   if (g_failures != 0) {
     std::printf("%d FAILURE(S)\n", g_failures);

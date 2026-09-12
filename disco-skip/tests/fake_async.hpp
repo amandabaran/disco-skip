@@ -137,6 +137,18 @@ class FakeAsyncOps {
     return true;
   }
 
+  /// Snapshot acquisition: READ the replicated counter, never FAA it.
+  ///
+  /// One round trip on the wire (one read per replica, all posted before any is
+  /// drained), and no mutation -- which is why concurrent range queries do not
+  /// contend with each other at all. See ds_range.hpp.
+  size_t postTsCounter() {
+    ts_counter_seen_ = set_.readTsCounter();
+    ++posts_;
+    return set_.replicas();
+  }
+  [[nodiscard]] uint64_t resolveTsCounter() const { return ts_counter_seen_; }
+
   size_t postVec(ds::VecOffset off) {
     // L4: from a replica that voted with the winning handle.
     vec_ok_ = set_.readVecFrom(winner_, off, vec_buf_);
@@ -216,6 +228,7 @@ class FakeAsyncOps {
   bool vec_ok_ = false;
   ds::BatchResult last_batch_{};
   uint64_t steal_commits_ = 0;
+  uint64_t ts_counter_seen_ = 0;
   uint64_t repair_desired_ = 0;
   size_t repair_landed_ = 0;
   uint64_t posts_ = 0;
