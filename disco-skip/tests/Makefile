@@ -45,6 +45,7 @@ SELFTEST := obj/selftest
 QUORUM  := obj/quorum
 ASYNC   := obj/async
 TS      := obj/ts
+RANGE   := obj/range
 
 # The dory toolchain's warning set, copied from the actual compile line rather
 # than approximated. This target's job is to fail here instead of on the
@@ -150,6 +151,11 @@ $(QUORUM): quorum_test.cc $(HDRS) fake_ops.hpp fake_replicas.hpp $(MACHINE_DEFIN
 	@$(CXX) $(CXXFLAGS) $(INCLUDES) -DDS_CACHE_ENABLED=0 -DDS_N_REPLICAS=3 \
 	  -DDS_MAX_LAYERS=8 -DDS_IDX_EXP=3 $< -o $@ $(LDFLAGS)
 
+$(RANGE): range_test.cc $(HDRS) fake_ops.hpp $(MACHINE_DEFINES) | obj
+	@echo "[CXX] range"
+	@$(CXX) $(CXXFLAGS) $(INCLUDES) -DDS_CACHE_ENABLED=0 -DDS_N_REPLICAS=1 \
+	  -DDS_MAX_LAYERS=8 -DDS_IDX_EXP=3 $< -o $@ $(LDFLAGS)
+
 $(TS): ts_test.cc $(HDRS) fake_ops.hpp $(MACHINE_DEFINES) | obj
 	@echo "[CXX] ts"
 	@$(CXX) $(CXXFLAGS) $(INCLUDES) -DDS_CACHE_ENABLED=0 -DDS_N_REPLICAS=1 \
@@ -160,7 +166,7 @@ $(ASYNC): async_test.cc $(HDRS) fake_ops.hpp fake_replicas.hpp fake_async.hpp $(
 	@$(CXX) $(CXXFLAGS) $(INCLUDES) -DDS_CACHE_ENABLED=0 -DDS_N_REPLICAS=3 \
 	  -DDS_MAX_LAYERS=8 -DDS_IDX_EXP=3 $< -o $@ $(LDFLAGS)
 
-check: $(BINS) $(VERIFY) $(TRAVERSE) $(GET) $(INSERT) $(PUT) $(SELFTEST) $(QUORUM) $(ASYNC) $(TS)
+check: $(BINS) $(VERIFY) $(TRAVERSE) $(GET) $(INSERT) $(PUT) $(SELFTEST) $(QUORUM) $(ASYNC) $(TS) $(RANGE)
 	@echo "---- $(VERIFY) ----"; $(VERIFY) || exit 1
 	@echo "---- $(TRAVERSE) ----"; $(TRAVERSE) || exit 1
 	@echo "---- $(GET) ----"; $(GET) || exit 1
@@ -170,6 +176,7 @@ check: $(BINS) $(VERIFY) $(TRAVERSE) $(GET) $(INSERT) $(PUT) $(SELFTEST) $(QUORU
 	@echo "---- $(QUORUM) ----"; $(QUORUM) || exit 1
 	@echo "---- $(ASYNC) ----"; $(ASYNC) || exit 1
 	@echo "---- $(TS) ----"; $(TS) || exit 1
+	@echo "---- $(RANGE) ----"; $(RANGE) || exit 1
 	@for b in $(BINS); do echo "---- $$b ----"; $$b || exit 1; done
 	@echo "==== all toggle combinations pass ===="
 

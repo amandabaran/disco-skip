@@ -120,6 +120,20 @@ class FakeReplicaSet {
   /// Stamps taken from fewer than all replicas: unique and monotone for their
   /// own writer, but without the cross-writer real-time guarantee. ds_ts.hpp.
   [[nodiscard]] uint64_t tsPartial() const { return ts_partial_; }
+
+  /// Observe the replicated counter without incrementing it: read every
+  /// replica, take the maximum. A replica that is down simply does not vote --
+  /// the maximum over those that answered is still a valid snapshot, it just
+  /// may sit further behind.
+  [[nodiscard]] uint64_t readTsCounter() const {
+    uint64_t best = 0;
+    for (size_t r = 0; r < arenas_.size(); ++r) {
+      if (down_[r]) continue;
+      uint64_t const c = arenas_[r].readTsCounter();
+      if (c > best) best = c;
+    }
+    return best;
+  }
   ds::VecOffset allocVec() {
     // Offsets must mean the same thing on every replica, so allocation is a
     // client-side decision handed to all of them -- which is exactly why a

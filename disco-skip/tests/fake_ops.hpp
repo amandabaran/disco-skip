@@ -108,6 +108,11 @@ class FakeOps {
   /// FaaTs. Starts at 0, so the first claimed timestamp is 1 -- which is what
   /// keeps it clear of kNullTs.
   uint64_t faaTs() { return ts_counter_++; }
+
+  /// Observe the counter WITHOUT incrementing it. A range query needs a
+  /// snapshot, not a slot: readers that FAA'd would contend with each other and
+  /// burn counter values for nothing. See ds_range.hpp.
+  [[nodiscard]] uint64_t readTsCounter() const { return ts_counter_; }
   void setClientIdx(uint64_t i) { client_idx_ = i; }
   [[nodiscard]] uint64_t clientIdx() const { return client_idx_; }
   [[nodiscard]] uint64_t tsCounter() const { return ts_counter_; }

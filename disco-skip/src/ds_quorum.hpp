@@ -423,6 +423,8 @@ class QuorumOps {
 
   uint64_t now() { return set_.now(); }
   [[nodiscard]] TsMode tsMode() const { return set_.tsMode(); }
+  /// Snapshot acquisition: observe the replicated counter, never FAA it.
+  [[nodiscard]] uint64_t readTsCounter() const { return set_.readTsCounter(); }
   VecOffset allocVec() { return set_.allocVec(); }
   RemoteAddr allocNode() { return set_.allocNode(); }
 
