@@ -627,6 +627,15 @@ class RdmaOps : public RdmaNodeReader<Conns> {
   /// index still tiebreaks against other clients writing the same node.
   void setClientIdx(uint64_t i) { client_idx_ = i; }
 
+  /// Observe the counter without incrementing it. See the replica-set version.
+  uint64_t readTsCounter() {
+    auto &rc = *conns_[replica_];
+    uint64_t v = 0;
+    blockingRead(rc, &v, sizeof(uint64_t),
+                 layout_.tsCounterAddrOf(rc.remoteBuf()));
+    return v;
+  }
+
   /// A fresh vector offset from this client's stripe, or kNullVec when spent.
   ///
   /// Exhaustion is a hard error rather than a retry: with no reclamation, it
@@ -900,6 +909,35 @@ class RdmaReplicaSet {
   /// This writer's index, the tiebreak that makes a replicated-counter
   /// timestamp unique when two writers compute the same maximum.
   void setClientIdx(uint64_t i) { client_idx_ = i; }
+
+  /// Snapshot acquisition: OBSERVE the replicated counter, never fetch-and-add
+  /// it.
+  ///
+  /// A writer claims a slot and so must FAA; a reader only needs to know how
+  /// far the counter has got, so it READs. That difference is why concurrent
+  /// range queries do not contend with each other at all and burn no counter
+  /// values -- see ds_range.hpp.
+  ///
+  /// Every replica is read and the maximum taken, for the same reason a write
+  /// takes the maximum: no single server's counter is authoritative. A replica
+  /// that fails to answer simply does not vote; the maximum over those that did
+  /// is still a valid snapshot, it just sits further behind, which costs
+  /// freshness rather than correctness.
+  uint64_t readTsCounter() {
+    size_t const n = conns_.size();
+    uint64_t best = 0;
+    for (size_t r = 0; r < n; ++r) {
+      auto &rc = *conns_[r];
+      // Reuse the per-replica CAS scratch: it is an 8-byte slot on a path that
+      // is not concurrent with a batch submit.
+      uint64_t *const buf = &cas_bufs_[r * kMaxBatchOps];
+      blockingRead(rc, buf, sizeof(uint64_t),
+                   layout_.tsCounterAddrOf(rc.remoteBuf()));
+      ++reads_;
+      if (*buf > best) best = *buf;
+    }
+    return best;
+  }
   /// Faa stamps taken from fewer than all replicas -- see ds_ts.hpp.
   [[nodiscard]] uint64_t tsPartial() const { return ts_partial_; }
 

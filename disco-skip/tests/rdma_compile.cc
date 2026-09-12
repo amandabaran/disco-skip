@@ -167,6 +167,26 @@ void instantiate_future(ds::DsState &state, ds::QuorumStats &q, ds::GetStats &g,
   (void)f.getStart();
   (void)f.getResult().resolved;
   (void)f.putResult().resolved;
+
+  // A10. Instantiated against the REAL RdmaAsyncOps so that postTsCounter,
+  // resolveTsCounter and the walk are type-checked against dory's surface
+  // rather than only against the fake -- the class of error this file exists
+  // for. It is never stepped here; the stub moves no data.
+  {
+    using AsyncOps = ds::SvFuture<ds::ClientCache>::AsyncOps;
+    std::vector<int64_t> ongoing(state.layout.num_servers, 0);
+    AsyncOps aops(state.server_conns, state.layout, state.to_poll_per_server,
+                  ongoing, /*future_id=*/0, q, &state.vec_hint,
+                  &state.node_alloc, &state.vec_alloc);
+    ds::RangeStats rstats;
+    ds::RangeOperation<AsyncOps> r(aops, 4, rstats);
+    std::vector<ds::Entry> out;
+    (void)r.start(10, 20, 64, out);
+    (void)r.startAt(10, 20, 64, /*snapshot=*/1, out);
+    (void)r.step();
+    (void)r.finished();
+    (void)r.result().snapshot;
+  }
 }
 
 int main() { return 0; }

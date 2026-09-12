@@ -190,6 +190,51 @@ class RdmaAsyncOps {
 
   // ── A vector read, from a replica that voted with the winner (L4) ────────
 
+  /// ── Snapshot acquisition ───────────────────────────────────────────────
+  ///
+  /// READ the replicated counter on every replica; never fetch-and-add it. A
+  /// writer claims a slot and must FAA; a reader only needs to know how far the
+  /// counter has got. That difference is why concurrent range queries do not
+  /// contend with each other at all and burn no counter values (ds_range.hpp).
+  ///
+  /// One round trip whatever the replica count: every read is posted before any
+  /// is drained, exactly as postHeaders does.
+  ///
+  /// A replica that does not answer simply does not vote. The maximum over
+  /// those that did is still a valid snapshot -- it sits further behind, which
+  /// costs freshness rather than correctness, and is the same trade the write
+  /// path makes when it stamps from fewer than all replicas.
+  size_t postTsCounter() {
+    size_t const n = conns_.size();
+    bumped_ = 0;
+    for (size_t r = 0; r < n; ++r) {
+      auto &rc = *conns_[r];
+      // One 8-byte slot per replica out of this future's CAS scratch. Safe
+      // because a snapshot read never overlaps a batch submit on the same
+      // future: the range takes its snapshot before it touches any node.
+      if (!rc.postSendSingle(dory::conn::ReliableConnection::RdmaRead,
+                             future_id_, layout_.casBufsFor(future_id_, r),
+                             sizeof(uint64_t),
+                             layout_.tsCounterAddrOf(rc.remoteBuf()))) {
+        throw std::runtime_error("failed to post a snapshot counter read");
+      }
+      bump(r, 1);
+    }
+    stats_.replica_reads += n;
+    return postedExactly(n, "postTsCounter");
+  }
+
+  /// The maximum counter value over the replicas that answered.
+  uint64_t resolveTsCounter() {
+    size_t const n = conns_.size();
+    uint64_t best = 0;
+    for (size_t r = 0; r < n; ++r) {
+      uint64_t const v = *layout_.casBufsFor(future_id_, r);
+      if (v > best) best = v;
+    }
+    return best;
+  }
+
   /// ── L2 read repair ────────────────────────────────────────────────────
   ///
   /// Pick a handle deterministically from the buffered headers and CAS it onto
