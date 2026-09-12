@@ -248,9 +248,9 @@ public:
                    pstats.hinted_writes, pstats.hint_misses,
                    pstats.hint_rejected);
         if (rstats.ranges != 0) {
-            fmt::print("ranges:       {} resolved, {} FAILED, {} truncated\n",
+            fmt::print("ranges:       {} resolved, {} FAILED, {} hit the entry cap\n",
                        rstats.ranges - rstats.failures, rstats.failures,
-                       rstats.truncated);
+                       rstats.capped);
             fmt::print("              {} entries, {} nodes walked, {} skipped "
                        "(newer than the snapshot)\n",
                        rstats.entries, rstats.nodes_walked,

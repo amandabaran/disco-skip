@@ -103,14 +103,21 @@ struct RangeStats {
   uint64_t helped = 0;           ///< pending versions settled on the way
   uint64_t vec_reads = 0;
   uint64_t nodes_read = 0;
-  uint64_t truncated = 0;        ///< hit the caller's cap
+  /// Ranges that stopped because they reached the caller's entry cap.
+  ///
+  /// NOT an anomaly. A YCSB scan is COUNT-bounded, so the upper key bound is
+  /// open and reaching the cap is how a scan that found enough entries is
+  /// SUPPOSED to end -- on a dense keyspace that is very nearly all of them.
+  /// It reads as a warning word, so do not read it as one: what it means is
+  /// "there were more entries in range than were asked for".
+  uint64_t capped = 0;
   uint64_t failures = 0;
 };
 
 struct RangeResult {
   bool resolved = false;
   uint64_t snapshot = kNullTs;
-  bool truncated = false;
+  bool capped = false;   ///< stopped at the entry cap; see RangeStats::capped
 };
 
 namespace detail {
@@ -142,7 +149,7 @@ class Ranger {
 
   /// Collect entries with lo <= key <= hi, in key order, as of one snapshot.
   ///
-  /// @param cap  stop after this many entries and report truncated
+  /// @param cap  stop after this many entries and report capped
   RangeResult range(Key lo, Key hi, uint32_t layers, size_t cap,
                     std::vector<Entry> &out) {
     return rangeAt(lo, hi, layers, cap, takeSnapshot(ops_), out);
@@ -204,8 +211,8 @@ class Ranger {
           if (k < lo) continue;
           if (k > hi) break;           // entries are sorted
           if (out.size() >= cap) {
-            res.truncated = true;
-            ++stats_.truncated;
+            res.capped = true;
+            ++stats_.capped;
             res.resolved = true;
             return res;
           }

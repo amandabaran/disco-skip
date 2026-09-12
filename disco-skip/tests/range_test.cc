@@ -168,7 +168,7 @@ static void checkTruncationIsReportedNotSilent() {
   std::vector<ds::Entry> got;
   ds::RangeResult const res = r.range(0, 1000, got, /*cap=*/10);
   CHECK(res.resolved, "a capped range resolves");
-  CHECK(res.truncated, "and says it truncated");
+  CHECK(res.capped, "and says it stopped at the cap");
   CHECK(got.size() == 10, "returning exactly the cap");
 }
 

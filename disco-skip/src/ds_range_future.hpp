@@ -183,6 +183,15 @@ class RangeOperation {
     // the version we are about to read is older than the header.
     if (node_.k_min > hi_) return done(true);
 
+    // Counted HERE, where the node is actually visited -- not in stepRight().
+    // stepRight is skipped whenever a range reaches its cap inside collect(),
+    // which for a count-bounded scan is the usual way a range ends, so counting
+    // there undercounted by roughly one node per range and made nodes_walked
+    // smaller than the range count. Ranger counts at the visit for the same
+    // reason; the two must agree or the differential test is comparing
+    // different quantities.
+    ++stats_.nodes_walked;
+
     if (!have_vec_) {
       step_ = RangeStep::AwaitVec;
       return ops_.postVec(node_.handle.offset());
@@ -290,8 +299,8 @@ class RangeOperation {
       if (k < lo_) continue;
       if (k > hi_) break;            // entries are sorted
       if (out_->size() >= cap_) {
-        res_.truncated = true;
-        ++stats_.truncated;
+        res_.capped = true;
+        ++stats_.capped;
         return done(true);
       }
       out_->push_back(vec_.e[i]);
@@ -301,7 +310,6 @@ class RangeOperation {
   }
 
   size_t stepRight() {
-    ++stats_.nodes_walked;
     // The CURRENT chain, from the header and vector we read before walking
     // back -- not from the as-of-T version, whose successor may since have
     // been split away. next_ was captured at that point for exactly this.
