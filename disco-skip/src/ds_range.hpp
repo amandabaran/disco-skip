@@ -112,6 +112,24 @@ struct RangeStats {
   /// "there were more entries in range than were asked for".
   uint64_t capped = 0;
   uint64_t failures = 0;
+
+  /// A10's violation check, always on.
+  ///
+  /// cache-remote-interface.md A10 asks that "the range-query path should be
+  /// checked for violations during the evaluation. Finding none is a result;
+  /// not looking is a gap." This is that check, and it is left enabled in
+  /// release builds because a check that only runs under a debug flag is not
+  /// looking during the evaluation.
+  ///
+  /// The invariant: every entry returned comes from a version that is stamped
+  /// (ts != kNullTs) and no newer than the snapshot. One comparison per NODE,
+  /// not per entry, so the cost is nil against the round trip that fetched it.
+  ///
+  /// A non-zero count means the walk selected a version it should not have --
+  /// the snapshot returned a state that never existed. It is reported, and the
+  /// range is failed rather than returned, because a silently wrong range is
+  /// the exact failure mode A10 exists to rule out.
+  uint64_t snapshot_violations = 0;
 };
 
 struct RangeResult {
@@ -136,6 +154,18 @@ template <class Ops>
 [[nodiscard]] uint64_t takeSnapshot(Ops &ops) {
   if (ops.tsMode() != TsMode::Faa) return ops.now();
   return (ops.readTsCounter() << kFaaClientBits) | kFaaClientMask;
+}
+
+/// A10's invariant: a version handed to a caller must be stamped and no newer
+/// than the snapshot it was requested at.
+///
+/// A free function, not a member, so the blocking and resumable ranges apply
+/// literally the same test. A checker that differed between the two paths would
+/// leave exactly the gap it exists to close -- and those two paths drifting is
+/// what produced the unbounded-retry bug in ds_put_future.hpp.
+[[nodiscard]] inline bool versionIsWithin(VecRecord const &v,
+                                          uint64_t snapshot) noexcept {
+  return v.ts != kNullTs && v.ts <= snapshot;
 }
 
 /// Blocking snapshot range.
@@ -206,6 +236,11 @@ class Ranger {
 
       VecRecord asof;
       if (versionAsOf(vec, res.snapshot, asof)) {
+        if (!versionIsWithin(asof, res.snapshot)) {
+          ++stats_.snapshot_violations;
+          ++stats_.failures;
+          return res;                  // resolved stays false
+        }
         for (uint32_t i = 0; i < asof.size; ++i) {
           Key const k = asof.e[i].key;
           if (k < lo) continue;

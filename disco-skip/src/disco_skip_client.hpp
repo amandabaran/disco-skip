@@ -260,6 +260,12 @@ public:
             // reported rather than folded into vec_reads.
             fmt::print("              {} old_ver hops, {} vector reads\n",
                        rstats.versions_walked, rstats.vec_reads);
+            // A10: "Finding none is a result; not looking is a gap." So it is
+            // printed either way -- a zero here is the result, and its absence
+            // would mean nobody looked.
+            fmt::print("              snapshot violations: {}{}\n",
+                       rstats.snapshot_violations,
+                       rstats.snapshot_violations == 0 ? " (none)" : "  *** ");
         }
         fmt::print("writes:       {} published, {} cas lost, {} retries, "
                    "{} retry-budget exhausted\n",

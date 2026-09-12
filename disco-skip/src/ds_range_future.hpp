@@ -294,6 +294,13 @@ class RangeOperation {
 
   /// `vec_` is the as-of-T version. Take the entries inside [lo, hi].
   size_t collect() {
+    // A10's violation check, always on -- see RangeStats::snapshot_violations.
+    // Literally the same predicate Ranger applies, so the two paths cannot
+    // disagree about what a violation is.
+    if (!versionIsWithin(vec_, res_.snapshot)) {
+      ++stats_.snapshot_violations;
+      return done(false);
+    }
     for (uint32_t i = 0; i < vec_.size; ++i) {
       Key const k = vec_.e[i].key;
       if (k < lo_) continue;

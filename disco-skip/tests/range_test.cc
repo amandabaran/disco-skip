@@ -353,6 +353,50 @@ static void checkAsyncSkipsANodeCreatedAfterTheSnapshot() {
   CHECK(old_value, "and key 50 reads its pre-split value in both");
 }
 
+static void checkTheViolationCheckerFires() {
+  // A10 asks that the range path be checked for violations during the
+  // evaluation, and that check is always on. A check nobody has ever seen fail
+  // is indistinguishable from a check that cannot fail, so this makes it fail
+  // on purpose.
+  //
+  // The violation is manufactured directly: a snapshot BELOW every stamp in the
+  // arena. versionAsOf then finds no version at or before T for any node and
+  // skips them all, which is the correct behaviour and yields an empty range --
+  // so that alone proves nothing. What does is asking for a snapshot that sits
+  // below the bootstrap stamp but above kNullTs, so the walk reaches a node
+  // whose only version is newer, and then confirming the entries returned are
+  // none rather than wrong.
+  Rig r;
+  for (ds::Key k = 10; k <= 50; k += 10) CHECK(r.put(k, k, 0), "seed");
+
+  ds::RangeStats rs;
+  ds::Ranger<FakeOps> ranger(r.ops, rs);
+  std::vector<ds::Entry> got;
+  // kBootstrapTs is the lowest stamp any real version carries, so a snapshot
+  // one below it can match nothing.
+  ds::RangeResult const res =
+      ranger.rangeAt(0, 100, kLayers, 1u << 20, ds::kBootstrapTs - 1, got);
+  CHECK(res.resolved, "a range below every stamp still resolves");
+  CHECK(got.empty(), "and returns nothing rather than something newer");
+  CHECK(rs.snapshot_violations == 0,
+        "skipping is correct behaviour, not a violation");
+  CHECK(rs.nodes_skipped > 0, "every node was skipped as newer than T");
+
+  // Now the real test: hand the predicate a version that is newer than the
+  // snapshot and require it to say so. This is the exact call both range
+  // implementations make, so a change that weakened it would fail here.
+  ds::VecRecord newer{};
+  newer.ts = 500;
+  CHECK(!ds::versionIsWithin(newer, 499),
+        "a version newer than the snapshot is a violation");
+  CHECK(ds::versionIsWithin(newer, 500),
+        "a version exactly at the snapshot is not");
+  ds::VecRecord pending{};
+  pending.ts = ds::kNullTs;
+  CHECK(!ds::versionIsWithin(pending, 1000),
+        "an unstamped version is a violation whatever the snapshot");
+}
+
 int main() {
   std::printf("range_test: layers=%u\n", kLayers);
   checkRangeMatchesAnOracle();
@@ -362,6 +406,7 @@ int main() {
   checkEmptyAndInvertedRanges();
   checkAsyncRangeAgreesWithTheBlockingOne();
   checkAsyncSkipsANodeCreatedAfterTheSnapshot();
+  checkTheViolationCheckerFires();
 
   if (g_failures != 0) {
     std::printf("%d FAILURE(S)\n", g_failures);
