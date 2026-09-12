@@ -114,10 +114,30 @@ class FakeAsyncOps {
     // wire the two halves are genuinely separate: the chains are posted, the
     // future suspends, and the swapbacks only become meaningful once the
     // completions land.
+    if (steal_commits_ > 0) {
+      // Simulate losing the publishing CAS to a concurrent writer. The batch is
+      // NOT applied: that is what a lost CAS means -- the staged version
+      // describes a state that never existed. Nothing else about the arena
+      // changes, so the operation re-reads and sees exactly what it saw before,
+      // which is the shape that made the retry loop spin forever.
+      --steal_commits_;
+      last_batch_ = ds::BatchResult{};
+      last_batch_.submitted = true;
+      last_batch_.committed = false;
+      ++posts_;
+      return set_.replicas();
+    }
     last_batch_ = quorum_.submit(b);
     ++posts_;
     return set_.replicas();
   }
+
+  /// Make the next /n/ publishing CASes lose, as a concurrent writer would.
+  ///
+  /// Set it high to model a writer that is being starved indefinitely -- which
+  /// is what workload D at 8 clients produced on the cluster, and what the
+  /// unbounded retry in ds_put_future.hpp turned into a process abort.
+  void stealNextCommits(uint64_t n) { steal_commits_ = n; }
 
   /// Whether the batch's publishing CAS reached a majority (L1).
   ds::BatchResult resolveBatch(ds::Batch const &) { return last_batch_; }
@@ -155,6 +175,7 @@ class FakeAsyncOps {
   ds::VecRecord vec_buf_{};
   bool vec_ok_ = false;
   ds::BatchResult last_batch_{};
+  uint64_t steal_commits_ = 0;
   uint64_t posts_ = 0;
 };
 

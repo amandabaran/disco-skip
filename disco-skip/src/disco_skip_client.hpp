@@ -216,6 +216,40 @@ public:
 
     void reportStats(bool detailed = false) {
         state.reportStats(detailed);
+
+        // THE OPERATION-LEVEL COUNTERS WERE NEVER PRINTED. GetStats, PutStats
+        // and WriteStats are accumulated by every future and then went nowhere:
+        // reportStats only showed DsState's own RDMA counters. So a put that
+        // gave up -- done(false) increments PutStats::failures -- was completely
+        // invisible, and worse, the benchmark loop does not check `resolved`,
+        // so the operation still counted toward throughput. A run could report
+        // a healthy number while silently resolving nothing.
+        //
+        // That mattered the moment the unbounded retry in ds_put_future.hpp was
+        // bounded: without this, the fix would have converted a loud crash into
+        // a quiet wrong number, which is the worse failure.
+        fmt::print("\n################ Operations:\n");
+        fmt::print("gets:         {} ok, {} not-found, {} FAILED\n",
+                   gstats.cache_hits + gstats.traversals, gstats.not_found,
+                   gstats.failures);
+        fmt::print("              {} cache hits, {} misses, {} kmin mismatch\n",
+                   gstats.cache_hits, gstats.cache_misses, gstats.kmin_mismatch);
+        fmt::print("puts:         {} resolved, {} FAILED ({} height-0, {} structural)\n",
+                   pstats.puts, pstats.failures, pstats.height0,
+                   pstats.structural);
+        fmt::print("              {} hinted, {} hint misses, {} hint rejected\n",
+                   pstats.hinted_writes, pstats.hint_misses,
+                   pstats.hint_rejected);
+        fmt::print("writes:       {} published, {} cas lost, {} retries, "
+                   "{} retry-budget exhausted\n",
+                   wstats.published, wstats.cas_lost, wstats.retries,
+                   wstats.retry_exhausted);
+        if (pstats.failures != 0 || gstats.failures != 0) {
+            fmt::print("*** {} put and {} get operations DID NOT RESOLVE. The "
+                       "throughput above counts them as completed, so it "
+                       "OVERSTATES useful work. ***\n",
+                       pstats.failures, gstats.failures);
+        }
     }
 };
 

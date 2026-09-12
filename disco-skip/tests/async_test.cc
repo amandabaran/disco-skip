@@ -501,6 +501,87 @@ static void checkAsyncPutIsIdempotentOnARepeatedBoundary() {
         "and the last value written is the one readable");
 }
 
+static void checkAPermanentlyLosingCasTerminatesInsteadOfSpinning() {
+  // THE WORKLOAD-D CRASH, reproduced without a cluster.
+  //
+  // On the cluster, workload D (95/5 over `latest`, so writes pile onto a few
+  // hot keys) killed all 8 clients at 8 clients with
+  //   "future 0 is stuck after 4097 steps without finishing"
+  // -- SvFuture's step guard, which throws. The cause was that a lost
+  // publishing CAS retried via `return fetch()` without counting against any
+  // bound: only beginTraversal() touches attempts_. The blocking twin wraps the
+  // same retry in `for (attempt < kMaxWriteAttempts)`.
+  //
+  // Here the fake steals every commit, so the writer can NEVER publish -- the
+  // limit case of that contention. The operation must give up and report
+  // failure. Before the fix this loop ran until the test's own 200000-step
+  // guard, i.e. it did not terminate.
+  FakeReplicaSet set(3, kLayers, 16384);
+  ds::QuorumStats qs;
+  ds::PutStats ps;
+  ds::WriteStats ws;
+  ds::NullCache cache;
+
+  FakeAsyncOps aops(set, qs, nullptr);
+  aops.stealNextCommits(1000000);
+
+  ds::PutOperation<FakeAsyncOps, ds::NullCache> p(aops, cache, kLayers, ps, ws);
+  size_t await = p.start(500, 4242, 0);
+  uint64_t steps = 0;
+  while (!p.finished()) {
+    (void)await;
+    await = p.step();
+    // Deliberately BELOW SvFuture's kMaxFutureSteps (4096): the point is that
+    // the operation stops on its own bound, well before the guard that throws.
+    if (++steps > 4000) break;
+  }
+
+  CHECK(p.finished(), "a put that can never commit still terminates");
+  CHECK(steps <= 4000, "and terminates below SvFuture's throwing step guard");
+  CHECK(!p.result().resolved, "it reports failure rather than false success");
+  CHECK(ps.failures == 1, "the failure is counted, not silent");
+  CHECK(ws.retry_exhausted > 0,
+        "and the re-read budget is what stopped it");
+
+  // Bounded by kMaxPutAttempts * kMaxFetchesPerAttempt, with a little slack for
+  // the steps between fetches. Asserting an upper bound rather than just
+  // termination is what keeps a future change from making this merely slow.
+  uint64_t const ceiling =
+      static_cast<uint64_t>(ds::detail::kMaxPutAttempts) *
+      static_cast<uint64_t>(ds::detail::kMaxFetchesPerAttempt) * 4;
+  CHECK(steps < ceiling, "termination is bounded, not merely eventual");
+
+  // The arena must be untouched: a lost CAS publishes nothing.
+  ds::QuorumOps<FakeReplicaSet> ops(set, qs, nullptr);
+  CHECK(ds::verifyStructure(ops, kLayers).ok(),
+        "and the structure is unharmed by the abandoned attempts");
+}
+
+static void checkTransientContentionStillSucceeds() {
+  // The complement, and the reason the bound escalates to a traversal instead
+  // of failing outright: losing a few CASes is NORMAL under concurrency and
+  // must not turn into a failed operation.
+  FakeReplicaSet set(3, kLayers, 16384);
+  ds::QuorumStats qs;
+  ds::PutStats ps;
+  ds::WriteStats ws;
+  ds::NullCache cache;
+
+  FakeAsyncOps aops(set, qs, nullptr);
+  aops.stealNextCommits(3);
+
+  ds::PutResult const r = runAsyncPut(aops, cache, 500, 4242, 0, ps, ws);
+  CHECK(r.resolved, "a put that loses three CASes still succeeds");
+  CHECK(ps.failures == 0, "and is not counted as a failure");
+
+  ds::QuorumOps<FakeReplicaSet> ops(set, qs, nullptr);
+  ds::Traversal<ds::QuorumOps<FakeReplicaSet>> t(ops);
+  ds::PathStep path[ds::kMaxLayers];
+  ds::TraversalResult const tr = t.traverse(500, kLayers, path);
+  CHECK(tr.ok() && tr.found && tr.value == 4242,
+        "and the value it eventually wrote is readable");
+}
+
 int main() {
   std::printf("async_test: layers=%u\n", kLayers);
   checkEmptyStructure();
@@ -513,6 +594,8 @@ int main() {
   checkAsyncPutBuildsTheSameStructure();
   checkAsyncPutHandlesCapacityOverflow();
   checkAsyncPutIsIdempotentOnARepeatedBoundary();
+  checkAPermanentlyLosingCasTerminatesInsteadOfSpinning();
+  checkTransientContentionStillSucceeds();
 
   if (g_failures != 0) {
     std::printf("%d FAILURE(S)\n", g_failures);

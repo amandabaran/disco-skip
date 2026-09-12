@@ -61,6 +61,11 @@ struct WriteStats {
   uint64_t not_covered = 0;    ///< the target node does not own the key
   uint64_t cas_lost = 0;       ///< handle CAS lost to a concurrent writer
   uint64_t retries = 0;
+  /// Attempts that burned their whole re-read budget on one target and gave up
+  /// on it, escalating to a full traversal. Non-zero means real contention --
+  /// this is the counter that would have made the workload-D crash obvious
+  /// before it became a crash, so watch it rather than only the failure count.
+  uint64_t retry_exhausted = 0;
   uint64_t batches = 0;      ///< chained submissions, i.e. round trips
   uint64_t faa_stamps = 0;   ///< extra round trips spent stamping in Faa mode
   uint64_t nodes_read = 0;
@@ -87,6 +92,17 @@ namespace detail {
 /// by somebody, so this bounds our own starvation rather than guarding a
 /// livelock.
 inline constexpr int kMaxWriteAttempts = 8;
+
+/// Re-reads allowed within ONE attempt of the async put state machine, before
+/// it gives up on the current target and re-traverses from the head.
+///
+/// The async path's equivalent of the `for (attempt < kMaxWriteAttempts)` loops
+/// below. It needs its own, larger bound because a single attempt legitimately
+/// re-reads several times as it walks phases -- a full-height climb does about
+/// 2h + 3 fetches, so ~20 at kMaxLayers -- while kMaxWriteAttempts bounds one
+/// CAS retry loop. 64 leaves generous room for progress while still catching a
+/// spin long before SvFuture's 4096-step guard, which throws.
+inline constexpr int kMaxFetchesPerAttempt = 64;
 
 }  // namespace detail
 

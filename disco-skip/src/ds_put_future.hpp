@@ -82,6 +82,7 @@ class PutOperation {
     out_.height = height_;
     index_ = {};
     attempts_ = 0;
+    fetches_ = 0;
 
     // ── Ask the cache where to write ──────────────────────────────────────
     //
@@ -150,6 +151,8 @@ class PutOperation {
 
   size_t beginTraversal() {
     from_hint_ = false;
+    fetches_ = 0;   // a fresh attempt gets a fresh budget; the total is still
+                    // bounded by kMaxPutAttempts * kMaxFetchesPerAttempt
     if (++attempts_ > static_cast<uint32_t>(detail::kMaxPutAttempts)) {
       return done(false);
     }
@@ -192,7 +195,44 @@ class PutOperation {
 
   // ── Fetch the target node, settling it if need be ─────────────────────────
 
+  /// Re-read the target's header (and speculatively its vector).
+  ///
+  /// EVERY RETRY EDGE IN THIS CLASS GOES THROUGH HERE, which is why the bound
+  /// lives here and not at the call sites. There are nine `return fetch()`
+  /// edges: four are forward progress (a new target or phase), and the rest
+  /// are retries -- a lost publishing CAS in actInsert and actSplit, and the
+  /// re-poll in onHeader when no handle yet has majority support. Those three
+  /// were UNBOUNDED. `attempts_`/kMaxPutAttempts only counts beginTraversal(),
+  /// so a writer that kept losing its CAS looped here forever and was stopped
+  /// only by SvFuture's 4096-step guard, which THROWS and takes the process
+  /// down with it.
+  ///
+  /// That is not hypothetical: workload D (95/5 over `latest`, so the writes
+  /// concentrate on a few hot keys) killed all 8 clients at 8 clients with
+  /// "future 0 is stuck after 4097 steps". It survived at 4 clients, and it
+  /// survived at 8 with the cache OFF -- because without a hint every attempt
+  /// pays a full traversal first, and that latency was accidentally acting as
+  /// backoff. Adding the write-path hint removed the backoff and made a
+  /// pre-existing unbounded loop reachable.
+  ///
+  /// The blocking twin never had this problem: ds_insert.hpp wraps the same
+  /// retry in `for (attempt < kMaxWriteAttempts)`. Converting that loop into a
+  /// state machine turned the loop edge into `return fetch()` and dropped the
+  /// counter. Guarding fetch() itself rather than the three retry sites is
+  /// deliberate: the bug WAS a forgotten counter, so the fix should not rely
+  /// on remembering one.
+  ///
+  /// On exhaustion, escalate to a full traversal rather than failing outright.
+  /// A re-traversal is genuinely different work -- it re-derives the target
+  /// from the head, so it recovers from a stale hint or a node that split away
+  /// -- and it counts against kMaxPutAttempts, so the total is bounded at
+  /// kMaxPutAttempts * kMaxFetchesPerAttempt and the operation ends in
+  /// done(false) rather than a throw.
   size_t fetch() {
+    if (++fetches_ > static_cast<uint32_t>(detail::kMaxFetchesPerAttempt)) {
+      ++wstats_.retry_exhausted;
+      return beginTraversal();
+    }
     step_ = PutStep::AwaitHeader;
     return ops_.postHeaders(target_, ops_.guess(target_));
   }
@@ -602,6 +642,7 @@ class PutOperation {
   PutPhase phase_ = PutPhase::DataInsert;
   PutPhase resume_phase_ = PutPhase::DataInsert;
   uint32_t attempts_ = 0;  ///< unsigned: see the note in ds_async.hpp
+  uint32_t fetches_ = 0;   ///< re-reads within the current attempt
 
   RemoteAddr target_{}, data_addr_{}, created_{}, created_data_{}, down_{};
   RemoteAddr top_orphan_{};
