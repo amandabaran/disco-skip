@@ -112,6 +112,16 @@ inline constexpr uint32_t kMaxHopsPerLevel = 1u << 20;
 /// failing to settle.
 inline constexpr int kMaxSettleAttempts = 8;
 
+/// L2 read repairs allowed per traversal before giving up.
+///
+/// A repair adopts the max raw handle and CASes it onto the laggards, so it
+/// makes progress by construction when it lands. It can still lose to a
+/// concurrent writer, and a reader that keeps losing is spinning just as surely
+/// as one that keeps re-polling -- hence a bound. Small, because a repair that
+/// fails twice means contention no read can win, and the caller retrying is
+/// better than this traversal holding a future forever.
+inline constexpr int kMaxReadRepairs = 3;
+
 }  // namespace detail
 
 /// What settleNode() cost, so callers with different stat structs can each

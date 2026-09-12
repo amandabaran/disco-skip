@@ -53,6 +53,7 @@ enum class TraversalStep : uint8_t {
   AwaitHeaders,   ///< a quorum header read is outstanding
   AwaitVec,       ///< a vector read is outstanding
   AwaitHelp,      ///< a helping batch is outstanding
+  AwaitRepair,    ///< an L2 read repair is outstanding
   Done,
 };
 
@@ -83,6 +84,7 @@ class TraversalFuture {
     have_vec_ = false;
     hops_ = 0;
     settle_tries_ = 0;
+    repairs_ = 0;
     return postHeaders();
   }
 
@@ -93,6 +95,7 @@ class TraversalFuture {
       case TraversalStep::AwaitHeaders: return onHeaders();
       case TraversalStep::AwaitVec:     return onVec();
       case TraversalStep::AwaitHelp:    return onHelp();
+      case TraversalStep::AwaitRepair:  return onRepair();
       case TraversalStep::Idle:
       case TraversalStep::Done:
         break;
@@ -135,8 +138,24 @@ class TraversalFuture {
       // No majority-supported handle yet: a commit is in flight. Re-poll
       // rather than guess, exactly as the blocking quorum read does.
       if (++settle_tries_ > static_cast<uint32_t>(detail::kMaxSettleAttempts)) {
-        res_.gave_up = TraversalGaveUp::NoMajority;
-        return fail(TraversalStatus::ReadFailed);
+        // No handle has majority support and re-polling is not fixing it: a
+        // commit is continuously in flight on a contended node. Fall back to
+        // L2 -- adopt the max raw handle and CAS it onto the laggards, which is
+        // ABD's read phase completing a partial write. Bounded, because a
+        // repair that keeps racing is itself a spin.
+        if (++repairs_ > detail::kMaxReadRepairs) {
+          res_.gave_up = TraversalGaveUp::NoMajority;
+          return fail(TraversalStatus::ReadFailed);
+        }
+        settle_tries_ = 0;
+        step_ = TraversalStep::AwaitRepair;
+        size_t const await = ops_.postRepair(cur_);
+        if (await == 0) {
+          // Nothing to repair means every replica already agrees, so the next
+          // poll will resolve. Do not spin here.
+          return postHeaders();
+        }
+        return await;
       }
       return postHeaders();
     }
@@ -186,6 +205,21 @@ class TraversalFuture {
     cur_ = next;
     ++res_.right_hops;
     have_vec_ = false;
+    return postHeaders();
+  }
+
+  /// An L2 read repair has completed.
+  ///
+  /// Success means our chosen handle now sits at a majority, so a plain re-poll
+  /// will resolve it -- we re-read rather than trusting the buffered headers,
+  /// because the repair told us where the handle is, not what the vector holds.
+  /// Failure means a replica moved under us, which is somebody else making
+  /// progress; re-poll and, if it is still contended, repair again up to the
+  /// bound.
+  size_t onRepair() {
+    NodeRecord repaired;
+    if (ops_.resolveRepair(repaired)) ++repairs_landed_;
+    step_ = TraversalStep::AwaitHeaders;
     return postHeaders();
   }
 
@@ -277,6 +311,8 @@ class TraversalFuture {
   VecRecord vec_{};
   bool have_vec_ = false;
   uint32_t hops_ = 0;
+  uint32_t repairs_ = 0;       ///< L2 read repairs attempted this traversal
+  uint32_t repairs_landed_ = 0;
   uint32_t settle_tries_ = 0;  ///< unsigned: `++x > C` on an int is the
                               ///< shape -Wstrict-overflow=5 rejects
   TraversalResult res_{};

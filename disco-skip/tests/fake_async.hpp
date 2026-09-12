@@ -97,6 +97,46 @@ class FakeAsyncOps {
     return true;
   }
 
+  /// L2 read repair, mirroring RdmaAsyncOps::postRepair.
+  ///
+  /// Adopts the largest RAW handle seen -- tag order refined by the offset,
+  /// which is unique per write -- and CASes it onto every replica holding
+  /// something smaller. Applied immediately here; the real one posts one CAS
+  /// per laggard with that replica's own expected value, which is why it
+  /// cannot be expressed as a Batch (a Batch carries one expected for all).
+  size_t postRepair(ds::RemoteAddr a) {
+    size_t const n = set_.replicas();
+    repair_desired_ = 0;
+    for (size_t r = 0; r < n; ++r) {
+      if (ok_[r] && seen_[r].handle.raw > repair_desired_) {
+        repair_desired_ = seen_[r].handle.raw;
+      }
+    }
+    repair_landed_ = 0;
+    size_t posted = 0;
+    for (size_t r = 0; r < n; ++r) {
+      if (!ok_[r]) continue;
+      if (seen_[r].handle.raw == repair_desired_) { ++repair_landed_; continue; }
+      if (seen_[r].handle.raw > repair_desired_) continue;  // never move back
+      if (set_.casHandleOn(r, a, seen_[r].handle.raw, repair_desired_)) {
+        ++repair_landed_;
+      }
+      ++posted;
+    }
+    ++posts_;
+    ++stats_.repairs;   // counted here too, so a test can assert the
+                       // repair is what rescued the read rather than luck
+    return posted;
+  }
+
+  bool resolveRepair(ds::NodeRecord &node) {
+    if (repair_landed_ < majority()) return false;
+    ++stats_.repairs_landed;
+    node = seen_[0];
+    node.handle = ds::Handle{repair_desired_};
+    return true;
+  }
+
   size_t postVec(ds::VecOffset off) {
     // L4: from a replica that voted with the winning handle.
     vec_ok_ = set_.readVecFrom(winner_, off, vec_buf_);
@@ -176,6 +216,8 @@ class FakeAsyncOps {
   bool vec_ok_ = false;
   ds::BatchResult last_batch_{};
   uint64_t steal_commits_ = 0;
+  uint64_t repair_desired_ = 0;
+  size_t repair_landed_ = 0;
   uint64_t posts_ = 0;
 };
 

@@ -190,6 +190,103 @@ class RdmaAsyncOps {
 
   // ── A vector read, from a replica that voted with the winner (L4) ────────
 
+  /// ── L2 read repair ────────────────────────────────────────────────────
+  ///
+  /// Pick a handle deterministically from the buffered headers and CAS it onto
+  /// every replica holding something older. This is ABD's read phase: a reader
+  /// that finds a partially applied write COMPLETES it rather than waiting for
+  /// the writer to, which is what makes the read terminate.
+  ///
+  /// WHY THIS IS NEEDED. resolveHeaders requires a handle with MAJORITY SUPPORT
+  /// -- deliberately stronger than L2, which only requires hearing from a
+  /// majority. Under write contention on one key the three replicas are
+  /// essentially never in agreement: each write CASes them in a chain, so a
+  /// reader sampling all three lands mid-flight, and re-polling does not help
+  /// because the next write is already arriving. Workload D at 8 clients failed
+  /// 76,311 reads this way, every single one of them here and none at any other
+  /// guard.
+  ///
+  /// WHY MAX-RAW AND NOT MAX-TAG. tag() is (struct_ver, content_ver) and is NOT
+  /// unique per write: a writer that loses its CAS re-stages the same logical
+  /// update at the same versions with a different offset, so two distinct
+  /// handles can share a tag -- the tag_ties case. Adopting "a" max-tag handle
+  /// would let two readers adopt DIFFERENT ones and fight. The offset is
+  /// allocated from a per-client stripe and so is unique per write, and it
+  /// occupies the low 32 bits, so comparing the full raw handle is tag order
+  /// refined by offset: a total order every reader computes identically.
+  ///
+  /// WHY ADOPTING A MINORITY HANDLE IS SAFE. The vector it names was WRITTEN to
+  /// every replica before the CAS -- the write is unconditional, only the
+  /// publish is contended -- so its contents exist and are self-consistent. Its
+  /// writer may consider that attempt abandoned, but completing it is a valid
+  /// linearization: the write did happen, and the repair is what fixes its
+  /// point. That is precisely what ABD does with a partial write.
+  ///
+  /// The repair must reach a majority BEFORE the read returns, or a later read
+  /// hearing from the other replicas could still see an older value and invert.
+  /// resolveRepair reports whether it did.
+  ///
+  /// @return completions to await; 0 when nothing needs repairing
+  size_t postRepair(RemoteAddr a) {
+    size_t const n = conns_.size();
+    NodeRecord const *const hdrs = layout_.getNodeBufs(future_id_);
+    bumped_ = 0;
+    repair_posted_ = 0;
+
+    // Deterministic choice: the largest raw handle any replica showed.
+    size_t best = 0;
+    for (size_t r = 1; r < n; ++r) {
+      if (hdrs[r].handle.raw > hdrs[best].handle.raw) best = r;
+    }
+    repair_desired_ = hdrs[best].handle.raw;
+    repair_addr_ = a;
+    repair_holders_ = 0;
+
+    size_t completions = 0;
+    for (size_t r = 0; r < n; ++r) {
+      if (hdrs[r].handle.raw == repair_desired_) {
+        ++repair_holders_;   // already correct; counts toward the majority
+        continue;
+      }
+      // Only ever move a replica FORWARD. One that has raced ahead of our
+      // chosen handle is left alone -- clobbering it would undo a newer commit.
+      if (hdrs[r].handle.raw > repair_desired_) continue;
+      auto &rc = *conns_[r];
+      uint64_t *const buf = layout_.casBufsFor(future_id_, r);
+      if (!rc.postSendSingleCas(future_id_, buf,
+                                Layout::nodeAddrOf(rc.remoteBuf(), a),
+                                hdrs[r].handle.raw, repair_desired_)) {
+        throw std::runtime_error("failed to post a read-repair CAS");
+      }
+      repair_replica_[repair_posted_++] = r;
+      completions += 1;
+      bump(r, 1);
+    }
+    ++stats_.repairs;
+    return postedExactly(completions, "postRepair");
+  }
+
+  /// Did the repair leave the chosen handle at a majority?
+  ///
+  /// A CAS that failed is not an error: the replica moved under us, which means
+  /// somebody else is making progress. The read simply re-polls.
+  bool resolveRepair(NodeRecord &node) {
+    uint64_t const *const bufs_base = layout_.casBufsFor(future_id_, 0);
+    (void)bufs_base;
+    size_t landed = repair_holders_;
+    for (size_t i = 0; i < repair_posted_; ++i) {
+      size_t const r = repair_replica_[i];
+      uint64_t const *const buf = layout_.casBufsFor(future_id_, r);
+      // An RDMA CAS returns the PRE-value; equal to expected means it took.
+      if (*buf == layout_.getNodeBufs(future_id_)[r].handle.raw) ++landed;
+    }
+    if (landed < majority()) return false;
+    node = layout_.getNodeBufs(future_id_)[0];
+    node.handle = Handle{repair_desired_};
+    ++stats_.repairs_landed;
+    return true;
+  }
+
   size_t postVec(VecOffset off) {
     bumped_ = 0;
     auto &rc = *conns_[winner_];
@@ -321,6 +418,11 @@ class RdmaAsyncOps {
   TsMode ts_mode_ = TsMode::Clock;
   size_t bumped_ = 0;  ///< completions queued by the post in progress
   VecOffset spec_pending_ = kNullVec;
+  uint64_t repair_desired_ = 0;
+  RemoteAddr repair_addr_{};
+  size_t repair_posted_ = 0;
+  size_t repair_holders_ = 0;
+  size_t repair_replica_[8]{};
   size_t winner_ = 0;
   Batch const *batch_ = nullptr;
 };

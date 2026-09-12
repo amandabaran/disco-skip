@@ -119,6 +119,13 @@ struct QuorumStats {
   uint64_t commits_lost = 0;    ///< handle CASes that did not
   uint64_t partial_commits = 0; ///< ... of those, with at least one success
   uint64_t writebacks = 0;      ///< lagged replicas repaired
+  /// L2 read repair: a read that could not find a majority-supported handle
+  /// after its poll budget, so it adopted the max raw handle and CAS'd it onto
+  /// the laggards -- ABD's read phase completing a partial write. See
+  /// RdmaAsyncOps::postRepair. `landed` counts those that reached a majority;
+  /// the difference is repairs that raced and will be re-polled.
+  uint64_t repairs = 0;
+  uint64_t repairs_landed = 0;
   uint64_t batches = 0;         ///< chained submissions, i.e. round trips
   uint64_t write_shortfalls = 0;///< a batch landed on fewer than a majority
   uint64_t vec_writes = 0;      ///< logical vector writes, summed over batches
@@ -218,7 +225,24 @@ class QuorumOps {
         // Every value is short of majority support, so a commit is in flight.
         // Re-poll rather than pick: returning a value no majority holds would
         // publish contents that were never committed.
+        //
+        // BUT RE-POLLING IS NOT ALWAYS ENOUGH. Under sustained write contention
+        // on one key the replicas are essentially never in agreement -- each
+        // write CASes them in a chain, so a reader sampling all three lands
+        // mid-flight and the next write is already arriving. On the cluster this
+        // failed 76,311 reads on workload D at 8 clients, every one of them
+        // here. So on the last attempt, fall back to L2 and REPAIR: adopt a
+        // handle deterministically and CAS it onto the laggards, which is ABD's
+        // read phase completing a partial write.
+        //
+        // Kept in step with TraversalFuture's AwaitRepair deliberately. The two
+        // read paths diverging is what produced today's other bug, where the
+        // async put dropped a retry bound its blocking twin had.
         ++stats_.read_retries;
+        if (attempt + 1 == detail::kMaxQuorumReadAttempts &&
+            repairRead(a, seen, ok, n)) {
+          continue;  // repaired; one more poll will now find a majority
+        }
         continue;
       }
 
@@ -404,6 +428,48 @@ class QuorumOps {
   ///
   /// Repaired by CAS rather than by write, so a replica that has meanwhile
   /// moved *ahead* of this commit is left alone rather than clobbered.
+  /// L2 read repair: adopt the max RAW handle and CAS it onto the laggards.
+  ///
+  /// Max *raw*, not max tag. tag() is (struct_ver, content_ver) and is not
+  /// unique per write -- a writer that loses its CAS re-stages the same logical
+  /// update at the same versions with a different offset, so two distinct
+  /// handles can share a tag (the tag_ties case counted above). The offset is
+  /// allocated from a per-client stripe and occupies the low 32 bits, so the
+  /// raw handle is tag order refined by offset: a total order every reader
+  /// computes identically, which is what stops two readers adopting different
+  /// handles and fighting.
+  ///
+  /// Adopting a handle no majority holds is safe because the vector it names
+  /// was WRITTEN to every replica before the CAS -- the write is unconditional,
+  /// only the publish is contended -- so its contents exist and are
+  /// self-consistent. Its writer may consider that attempt abandoned;
+  /// completing it is still a valid linearization, which is exactly what ABD
+  /// does with a partial write.
+  ///
+  /// @return true if the chosen handle now sits at a majority
+  bool repairRead(RemoteAddr a, NodeRecord const *seen, bool const *ok,
+                  size_t n) {
+    uint64_t desired = 0;
+    for (size_t r = 0; r < n; ++r) {
+      if (ok[r] && seen[r].handle.raw > desired) desired = seen[r].handle.raw;
+    }
+    if (desired == 0) return false;
+
+    size_t holders = 0;
+    for (size_t r = 0; r < n; ++r) {
+      if (!ok[r]) continue;
+      if (seen[r].handle.raw == desired) { ++holders; continue; }
+      // Never move a replica backwards: one that raced ahead of our choice has
+      // a newer commit and clobbering it would undo that.
+      if (seen[r].handle.raw > desired) continue;
+      if (set_.casHandleOn(r, a, seen[r].handle.raw, desired)) ++holders;
+    }
+    ++stats_.repairs;
+    if (holders < majority()) return false;
+    ++stats_.repairs_landed;
+    return true;
+  }
+
   void writeBack(Batch const &b, bool const *submitted, bool const *committed) {
     RemoteAddr addr{};
     uint64_t desired = 0;

@@ -12,6 +12,7 @@
 // disagreement is a real bug in one of them rather than an argument about what
 // the right answer is.
 
+#include <algorithm>
 #include <cstdio>
 #include <map>
 #include <random>
@@ -582,6 +583,101 @@ static void checkTransientContentionStillSucceeds() {
         "and the value it eventually wrote is readable");
 }
 
+static void checkReadRepairRescuesAReadWithNoMajority() {
+  // THE WORKLOAD-D READ FAILURE, reproduced without a cluster.
+  //
+  // At 8 clients on hot keys, 76,311 reads failed and EVERY ONE of them was
+  // TraversalGaveUp::NoMajority -- resolveHeaders never found a handle that a
+  // majority of replicas held, because a commit was continuously in flight.
+  // Re-polling cannot fix that: the next write is already arriving.
+  //
+  // Here the three replicas are driven to three DISTINCT handles, which is the
+  // limit case: no majority exists and none will appear, because nothing else
+  // is running. Before the L2 fallback this read failed. It must now adopt the
+  // max raw handle, CAS it onto the laggards, and succeed.
+  FakeReplicaSet set(3, kLayers, 16384);
+  ds::QuorumStats qs;
+  ds::PutStats ps;
+  ds::WriteStats ws;
+  ds::NullCache cache;
+
+  // Populate so there is a real data node to diverge.
+  for (ds::Key k = 10; k < 60; k += 10) {
+    FakeAsyncOps a(set, qs, nullptr);
+    CHECK(runAsyncPut(a, cache, k, static_cast<ds::Value>(k), 0, ps, ws).resolved,
+          "population put resolves");
+  }
+
+  // Find the data node covering 30 and give each replica its own handle. The
+  // vectors all exist on every replica -- a writer WRITEs before it CASes, so
+  // contents are never the contended part -- so every candidate handle names
+  // readable data. That is exactly why adopting a minority handle is safe.
+  ds::RemoteAddr const target{ds::kInitialDataId};
+  ds::NodeRecord base;
+  CHECK(set.readNodeFrom(0, target, base), "the data node reads back");
+
+  ds::VecOffset offs[3];
+  for (size_t r = 0; r < 3; ++r) {
+    offs[r] = set.arena(r).allocVec();
+    for (size_t q = 0; q < 3; ++q) {
+      // Same contents on every replica, so the only disagreement is the handle.
+      ds::VecRecord v;
+      CHECK(set.readVecFrom(0, base.handle.offset(), v), "base vector reads");
+      v.content_ver = static_cast<uint32_t>(base.handle.contentVer() + 1 + r);
+      set.arena(q).vecAt(offs[r]) = v;
+    }
+  }
+  // Distinct handles: different content_ver AND different offset, which is the
+  // shape a partially applied commit leaves behind.
+  for (size_t r = 0; r < 3; ++r) {
+    // Distinct in BOTH fields: content_ver differs so the tags differ, and the
+    // offset differs so the raw handles would still be distinct even at equal
+    // tags -- which is the tag_ties shape the repair has to order deterministically.
+    ds::Handle const h = ds::Handle::make(
+        base.handle.structVer(),
+        static_cast<uint32_t>(base.handle.contentVer() + 1 + r), offs[r]);
+    CHECK(set.casHandleOn(r, target, base.handle.raw, h.raw),
+          "each replica takes its own handle");
+  }
+
+  ds::NodeRecord check0, check1, check2;
+  set.readNodeFrom(0, target, check0);
+  set.readNodeFrom(1, target, check1);
+  set.readNodeFrom(2, target, check2);
+  CHECK(check0.handle.raw != check1.handle.raw &&
+        check1.handle.raw != check2.handle.raw,
+        "the three replicas really do disagree");
+  uint64_t const want = std::max({check0.handle.raw, check1.handle.raw,
+                                  check2.handle.raw});
+
+  // A read must now succeed rather than give up.
+  FakeAsyncOps aops(set, qs, nullptr);
+  ds::GetStats gs;
+  ds::GetOperation<FakeAsyncOps, ds::NullCache> g(aops, cache, kLayers, gs);
+  size_t await = g.start(30);
+  uint64_t steps = 0;
+  while (!g.finished()) {
+    (void)await;
+    await = g.step();
+    if (++steps > 4000) break;
+  }
+  CHECK(g.finished(), "the read terminates");
+  CHECK(g.result().resolved, "and resolves, where before it gave up");
+  CHECK(gs.gave_up_no_majority == 0, "not via the no-majority guard");
+
+  // The repair must have converged the replicas, or a later read could still
+  // hear from the laggards and invert -- which is the whole reason ABD writes
+  // back before returning.
+  ds::NodeRecord after[3];
+  size_t holders = 0;
+  for (size_t r = 0; r < 3; ++r) {
+    set.readNodeFrom(r, target, after[r]);
+    if (after[r].handle.raw == want) ++holders;
+  }
+  CHECK(holders >= 2, "the chosen handle now sits at a majority");
+  CHECK(qs.repairs > 0, "and a repair is what did it");
+}
+
 int main() {
   std::printf("async_test: layers=%u\n", kLayers);
   checkEmptyStructure();
@@ -596,6 +692,7 @@ int main() {
   checkAsyncPutIsIdempotentOnARepeatedBoundary();
   checkAPermanentlyLosingCasTerminatesInsteadOfSpinning();
   checkTransientContentionStillSucceeds();
+  checkReadRepairRescuesAReadWithNoMajority();
 
   if (g_failures != 0) {
     std::printf("%d FAILURE(S)\n", g_failures);
