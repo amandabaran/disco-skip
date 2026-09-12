@@ -250,6 +250,16 @@ public:
                    "{} retry-budget exhausted\n",
                    wstats.published, wstats.cas_lost, wstats.retries,
                    wstats.retry_exhausted);
+        fmt::print("quorum:       {} node reads -> {} replica reads, {} re-polls\n",
+                   qstats.node_reads, qstats.replica_reads,
+                   qstats.read_retries);
+        fmt::print("              {} stale votes, {} tag ties, {} writebacks\n",
+                   qstats.stale_votes, qstats.tag_ties, qstats.writebacks);
+        // The L2 read repair. Printed unconditionally because "did the repair
+        // fire?" was otherwise only inferable from failures going to zero
+        // between two runs -- a correlation, not evidence.
+        fmt::print("              {} L2 read repairs, {} reached majority\n",
+                   qstats.repairs, qstats.repairs_landed);
         if (pstats.failures != 0 || gstats.failures != 0) {
             fmt::print("*** {} put and {} get operations DID NOT RESOLVE. The "
                        "throughput above counts them as completed, so it "
