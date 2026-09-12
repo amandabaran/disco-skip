@@ -154,6 +154,7 @@ int run_structure_selftest(ds::DsState& state) {
         state.layout.getStageNode(0), state.layout.getStageVec(0),
         &state.node_alloc, &state.vec_alloc, &state.vec_hint);
     replicas.setTsMode(state.layout.ts_mode);
+    replicas.setClientIdx(state.client_idx);
     ds::QuorumStats qstats;
     // The hint makes a node read speculate its vector read alongside the
     // headers rather than serialising after them -- see ds_quorum.hpp.

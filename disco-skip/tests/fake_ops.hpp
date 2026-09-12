@@ -108,6 +108,8 @@ class FakeOps {
   /// FaaTs. Starts at 0, so the first claimed timestamp is 1 -- which is what
   /// keeps it clear of kNullTs.
   uint64_t faaTs() { return ts_counter_++; }
+  void setClientIdx(uint64_t i) { client_idx_ = i; }
+  [[nodiscard]] uint64_t clientIdx() const { return client_idx_; }
   [[nodiscard]] uint64_t tsCounter() const { return ts_counter_; }
 
   // ── The write half of the Ops concept (F1/F2) ────────────────────────────
@@ -191,7 +193,7 @@ class FakeOps {
         case ds::BatchKind::FaaTs:
           // Claimed here, in chain order -- so it lands after the publishing
           // CAS, which is the property the ordering depends on.
-          out.ts = ds::tsFromFaa(faaTs());
+          out.ts = ds::tsFromFaa(faaTs(), client_idx_);
           break;
       }
     }
@@ -262,6 +264,10 @@ class FakeOps {
   uint64_t clock_ = 1000;
   int64_t clock_step_ = 10;
   uint64_t ts_counter_ = 0;
+  /// This writer's tiebreak index. One arena models one replica, so the
+  /// maximum is trivially this counter's value; the index is what keeps two
+  /// writers that saw the same value from claiming the same stamp.
+  uint64_t client_idx_ = 0;
   ds::TsMode ts_mode_ = ds::TsMode::Tsc;
   uint64_t next_node_ = ds::kFirstDynamicId;
   uint64_t next_vec_ = ds::kFirstDynamicVec;

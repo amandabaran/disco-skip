@@ -290,12 +290,31 @@ inline void stageBatchPayloads(Batch const &b, NodeRecord *stage_nodes,
   }
 }
 
-/// The timestamp a batch's FaaTs claimed, or kNullTs if it carried none.
-inline uint64_t batchTs(Batch const &b, uint64_t const *cas_bufs) {
+/// Sentinel for "this batch carried no FaaTs", distinct from a pre-value of 0
+/// (which is legitimate: the very first writer sees an unincremented counter).
+inline constexpr uint64_t kNoFaa = ~uint64_t{0};
+
+/// The RAW pre-value a batch's FaaTs returned on one replica, or kNoFaa.
+///
+/// Raw, not a timestamp: with the counter replicated, a timestamp is a function
+/// of the MAXIMUM pre-value across replicas plus the writer's client index, so
+/// no single replica's reply is a timestamp on its own.
+inline uint64_t batchPreFaa(Batch const &b, uint64_t const *cas_bufs) {
   for (size_t i = 0; i < b.size(); ++i) {
-    if (b[i].kind == BatchKind::FaaTs) return tsFromFaa(cas_bufs[i]);
+    if (b[i].kind == BatchKind::FaaTs) return cas_bufs[i];
   }
-  return kNullTs;
+  return kNoFaa;
+}
+
+/// The timestamp a batch's FaaTs claimed at ONE replica, or kNullTs.
+///
+/// Only correct where there is a single replica -- RdmaOps, and the selftest.
+/// The replicated path uses batchPreFaa and takes the maximum; see
+/// RdmaReplicaSet::submitAll.
+inline uint64_t batchTs(Batch const &b, uint64_t const *cas_bufs,
+                        uint64_t client_idx) {
+  uint64_t const pre = batchPreFaa(b, cas_bufs);
+  return pre == kNoFaa ? kNullTs : tsFromFaa(pre, client_idx);
 }
 
 /// Did the publishing CAS in /b/ take, given the swapbacks it wrote?
@@ -598,12 +617,15 @@ class RdmaOps : public RdmaNodeReader<Conns> {
     cas_ += b.size() - b.vecWrites() - b.nodeWrites();
     out.submitted = true;
     out.committed = batchCommitted(b, cas);
-    out.ts = batchTs(b, cas);
+    out.ts = batchTs(b, cas, client_idx_);
     return out;
   }
 
   [[nodiscard]] TsMode tsMode() const { return ts_mode_; }
   void setTsMode(TsMode m) { ts_mode_ = m; }
+  /// Single-replica path, so the maximum is that one replica's pre-value; the
+  /// index still tiebreaks against other clients writing the same node.
+  void setClientIdx(uint64_t i) { client_idx_ = i; }
 
   /// A fresh vector offset from this client's stripe, or kNullVec when spent.
   ///
@@ -634,6 +656,7 @@ class RdmaOps : public RdmaNodeReader<Conns> {
   VecRecord *stage_vec_ = nullptr;
   NodeAllocator *nodes_ = nullptr;
   VecAllocator *vecs_ = nullptr;
+  uint64_t client_idx_ = 0;
   bool doorbell_ = true;
   // Clock, matching the documented default in ds_ts.hpp. This used to be Tsc
   // in ds_rdma.hpp and Clock in ds_rdma_async.hpp, so a blocking path and an
@@ -807,6 +830,8 @@ class RdmaReplicaSet {
   /// is chimera's put_future.hpp pattern: post to all servers, then poll.
   void submitAll(Batch const &b, bool *submitted, bool *committed) {
     size_t const n = conns_.size();
+    max_faa_pre_ = kNoFaa;   // no replica has answered yet
+    size_t answered_ = 0;
     size_t to_drain[kMaxReplicaFanout] = {};
 
     // Stage the payloads once. Every replica's work requests read from these
@@ -838,17 +863,45 @@ class RdmaReplicaSet {
       submitted[r] = true;
       // Only now are the swapbacks meaningful.
       committed[r] = batchCommitted(b, &cas_bufs_[r * kMaxBatchOps]);
-      // Replica 0's counter is the authoritative one (see Layout), so its
-      // pre-value is the timestamp. The others' FAAs advance their own copies
-      // and are discarded -- which is why the counter is a single point of
-      // failure and said to be one.
-      if (r == 0) last_ts_ = batchTs(b, &cas_bufs_[0]);
+      // THE COUNTER IS REPLICATED, so the timestamp is the MAXIMUM pre-value
+      // over the replicas that answered, not replica 0's. The FAAs already went
+      // to every replica on this same chain, so the maximum is free; what it
+      // buys is that no single server's counter is a point of failure.
+      //
+      // Real-time ordering across writers needs the maximum to be taken over
+      // ALL replicas -- a majority is not enough, because the replica that
+      // decided another writer's maximum may not be in the intersection. See
+      // the derivation in ds_ts.hpp; ts_partial below counts when that held.
+      uint64_t const pre = batchPreFaa(b, &cas_bufs_[r * kMaxBatchOps]);
+      if (pre != kNoFaa) {
+        ++answered_;
+        if (max_faa_pre_ == kNoFaa || pre > max_faa_pre_) max_faa_pre_ = pre;
+      }
+    }
+
+    // One timestamp for the batch, from the maximum over the replicas that
+    // answered plus this writer's index. The index is what makes it unique when
+    // two writers compute the same maximum; the maximum is what makes it
+    // real-time ordered against writers that finished before this one started.
+    if (max_faa_pre_ == kNoFaa) {
+      last_ts_ = kNullTs;
+    } else {
+      last_ts_ = tsFromFaa(max_faa_pre_, client_idx_);
+      // Fewer than all replicas answered: still unique, still monotone for this
+      // writer, but the cross-writer real-time argument needs every replica.
+      if (answered_ < n) ++ts_partial_;
     }
   }
 
   uint64_t now() { return localNow(ts_mode_); }
   [[nodiscard]] TsMode tsMode() const { return ts_mode_; }
   void setTsMode(TsMode m) { ts_mode_ = m; }
+
+  /// This writer's index, the tiebreak that makes a replicated-counter
+  /// timestamp unique when two writers compute the same maximum.
+  void setClientIdx(uint64_t i) { client_idx_ = i; }
+  /// Faa stamps taken from fewer than all replicas -- see ds_ts.hpp.
+  [[nodiscard]] uint64_t tsPartial() const { return ts_partial_; }
 
   // Client-local, so one of each however many replicas there are: a RemoteAddr
   // and a VecOffset mean the same thing on every replica, which is what lets
@@ -891,6 +944,9 @@ class RdmaReplicaSet {
   // async path on the same run stamped from two different clocks.
   TsMode ts_mode_ = TsMode::Clock;
   uint64_t last_ts_ = kNullTs;
+  uint64_t max_faa_pre_ = kNoFaa;
+  uint64_t ts_partial_ = 0;
+  uint64_t client_idx_ = 0;
   uint64_t reads_ = 0, writes_ = 0, cas_ = 0, batches_ = 0;
 };
 

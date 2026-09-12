@@ -67,12 +67,19 @@ static void checkNoSourceEverReturnsTheNullMarker() {
   // would therefore look like an unstamped version.
   CHECK(ds::tscNow() != ds::kNullTs, "tscNow avoids the null marker");
   CHECK(ds::clockNow() != ds::kNullTs, "clockNow avoids the null marker");
-  CHECK(ds::tsFromFaa(0) != ds::kNullTs, "the first FAA value is not null");
+  CHECK(ds::tsFromFaa(0, /*client=*/0) != ds::kNullTs, "the first FAA value is not null");
+  // The counter is REPLICATED, so two writers can compute the same maximum --
+  // that is the uniqueness failure the client index exists to fix. See the
+  // derivation in ds_ts.hpp.
+  CHECK(ds::tsFromFaa(5, 1) != ds::tsFromFaa(5, 2),
+        "the same maximum from two writers gives different timestamps");
+  CHECK(ds::tsFromFaa(5, 99) < ds::tsFromFaa(6, 0),
+        "a larger maximum outranks any client tiebreak");
   // Must CLEAR the bootstrap timestamp, not merely dodge kNullTs: bootstrap
   // writes every vector at kBootstrapTs, so a first stamp equal to it ties and
   // the chain stops being strictly decreasing. ds_ts.hpp static_asserts this
   // too; asserted here as well so the reason is stated where it is tested.
-  CHECK(ds::tsFromFaa(0) > ds::kBootstrapTs,
+  CHECK(ds::tsFromFaa(0, /*client=*/0) > ds::kBootstrapTs,
         "the first FAA timestamp clears the bootstrap timestamp");
   CHECK(ds::localNow(ds::TsMode::Tsc) != ds::kNullTs, "localNow(Tsc) not null");
   CHECK(ds::localNow(ds::TsMode::Clock) != ds::kNullTs, "localNow(Clock) not null");
@@ -140,19 +147,28 @@ static void checkTheFloorIsNotAppliedInFaaMode() {
   // The worked counterexample from ds_ts.hpp, asserted rather than only
   // described, so that reinstating the floor in Faa mode fails here.
   //
-  //   node id 1, long history, predecessor ts 50, claims counter pre-value 10
-  //   node id 2, fresh from bootstrap,  ts 1, claims counter pre-value 11
+  //   node id 1, long history: its predecessor was stamped at counter max 50
+  //   node id 2, fresh from bootstrap: predecessor is kBootstrapTs
+  //   W_A claims counter maximum 10, W_B claims 11
   //
   // W_A is globally earlier (10 < 11) so it must get the lower stamp.
-  uint64_t const a_src = ds::tsFromFaa(10);
-  uint64_t const b_src = ds::tsFromFaa(11);
-  uint64_t const a = ds::stampFor(ds::TsMode::Faa, a_src, 50);
+  //
+  // The predecessor is written as a REAL Faa timestamp rather than a bare
+  // integer. It used to be the literal 50, which stopped being a plausible
+  // stamp once tsFromFaa began packing 16 bits of client index underneath the
+  // counter -- a bare 50 is smaller than every stamp the encoding can produce,
+  // so the floor could never bind and the test's own premise evaporated. It
+  // failed loudly when that changed, which is what it is for.
+  uint64_t const a_pred = ds::tsFromFaa(50, /*client=*/0);
+  uint64_t const a_src = ds::tsFromFaa(10, /*client=*/0);
+  uint64_t const b_src = ds::tsFromFaa(11, /*client=*/0);
+  uint64_t const a = ds::stampFor(ds::TsMode::Faa, a_src, a_pred);
   uint64_t const b = ds::stampFor(ds::TsMode::Faa, b_src, ds::kBootstrapTs);
   CHECK(a < b, "the earlier FAA claim keeps the lower timestamp across nodes");
 
   // And show the floor really would have inverted it, so this test cannot pass
   // for an unrelated reason.
-  CHECK(ds::stampOver(a_src, 50) > ds::stampOver(b_src, ds::kBootstrapTs),
+  CHECK(ds::stampOver(a_src, a_pred) > ds::stampOver(b_src, ds::kBootstrapTs),
         "the floor really would have inverted the counter's global order");
 }
 
@@ -222,7 +238,7 @@ static void checkFaaConsumesOneCounterValuePerStampAndNeverRepeats() {
   // the range tsFromFaa can produce -- rather than floored ones. If the floor
   // were applied, a hammered node's stamps would drift above the counter's
   // reach, which is precisely how the inversion above arises.
-  uint64_t const ceiling = ds::tsFromFaa(r.ops.tsCounter());
+  uint64_t const ceiling = ds::tsFromFaa(r.ops.tsCounter(), /*client=*/0);
   uint64_t chain = 0;
   for (uint64_t off = 0; off < r.ops.vecCount(); ++off) {
     uint64_t const ts = r.ops.vecAt(static_cast<ds::VecOffset>(off)).ts;
@@ -237,7 +253,7 @@ static void checkFaaConsumesOneCounterValuePerStampAndNeverRepeats() {
   // Here there is one counter, so it must hold exactly.
   std::set<uint64_t> seen;
   for (uint64_t pre = 0; pre < r.ops.tsCounter(); ++pre) {
-    uint64_t const ts = ds::tsFromFaa(pre);
+    uint64_t const ts = ds::tsFromFaa(pre, /*client=*/0);
     CHECK(seen.insert(ts).second, "no counter value maps to a repeated ts");
     CHECK(ts != ds::kNullTs, "no counter value maps to the null marker");
   }

@@ -34,33 +34,58 @@
 //   Tsc    Raw rdtscp. The cheapest possible source, and the baseline the other
 //          two are priced against. NOT correct across machines.
 //
-//   Faa    RDMA fetch-and-add on a counter. No timing assumption at all, at the
-//          cost of a round trip per write and -- as things stand -- of the
-//          system's fault tolerance. See the note on that below; it is the
-//          reason this is not the default.
+//   Faa    RDMA fetch-and-add on a counter REPLICATED ON EVERY SERVER. No
+//          timing assumption at all, at the cost of a round trip per write.
+//          This is what a range query needs: see below for why the replicated
+//          form is unique and real-time ordered, and for the one condition
+//          (FAA all replicas, not a majority) that it rests on.
 //
-// ── Why Faa is not the default: it costs fault tolerance ────────────────────
+// ── The replicated counter: why it is unique AND real-time ordered ──────────
 //
-// A total order from a counter needs ONE counter, and one counter lives on one
-// memory server. The rest of the structure tolerates any single replica failing
-// -- that is what the 2-of-3 commit of invariants.md §4 buys -- but a write
-// cannot claim a timestamp if the counter's server is down. So enabling Faa
-// silently reduces the failure model from "tolerates one memory node" to
-// "tolerates one memory node unless it is the counter's".
+// A single counter would be a single point of failure: the rest of the
+// structure tolerates any one replica failing -- that is what the 2-of-3 commit
+// of invariants.md §4 buys -- but a write could not claim a timestamp if the
+// counter's server were down. So the counter lives on EVERY server
+// (Layout::tsCounterOffset is part of serverSize), and the FAA already rides
+// the publish chain to all of them, which means taking the maximum costs NO
+// EXTRA ROUND TRIP over using one.
 //
-// THE OBVIOUS FIX DOES NOT WORK, which is worth recording so it is not
-// re-proposed. "FAA all three and take the max" fails uniqueness. Two writers,
+// UNIQUENESS needs a tiebreak, because two writers can compute the same
+// maximum -- the counterexample below. (max_pre, client_idx) is unique because
+// client indices are; tsFromFaa packs 48 bits of counter over 16 of client.
+//
+// REAL-TIME ORDER holds, on one condition: a writer must FAA ALL replicas.
+// Suppose W1 completes before W2 begins. W1 incremented every replica, so when
+// W2 starts each sits at least one above the value W1 saw there, hence W2's
+// maximum M2 >= M1 + 1 > M1 -- strictly greater. The tiebreak therefore never
+// engages between non-overlapping writers; it engages only for CONCURRENT
+// ones, where any order is a valid linearization anyway.
+//
+// WITH ONLY A MAJORITY IT BREAKS, and this is the part that is easy to miss.
+// Let W1's maximum come from replica A, and let W2's quorum exclude A. W2 does
+// touch some B in Q1 ∩ Q2, whose value after W1 is v_B + 1 -- but v_B + 1 can
+// still be <= M1, because M1 came from A, not B. So a later write can take a
+// SMALLER timestamp than an earlier one. Quorum intersection guarantees W2 sees
+// some replica W1 touched; it does not guarantee W2 sees the one that decided
+// M1, and that is the whole difference.
+//
+// So submit() takes the maximum over every replica that ANSWERED and counts the
+// runs where that was not all of them (QuorumStats::ts_partial). A partial FAA
+// still yields a unique timestamp that is monotone for its own writer; what it
+// loses is the cross-writer real-time guarantee. That is precisely the case
+// worth counting rather than assuming away.
+//
+// THE TIEBREAK IS NOT OPTIONAL, which is worth recording so the naive form is
+// not re-proposed. "FAA all three and take the max" alone fails uniqueness. Two writers,
 // two replicas, interleaved in opposite order on each:
 //
 //     W1 FAAs R0 -> pre 0      W2 FAAs R0 -> pre 1
 //     W2 FAAs R1 -> pre 0      W1 FAAs R1 -> pre 1
 //
 // W1's pre-values are {0,1}, W2's are {1,0}; both maxima are 1, so both writers
-// claim the same timestamp. It generalises to three replicas with a majority. A
-// client-id tiebreak restores uniqueness -- 48 bits of counter and 16 of client
-// id fit one word -- but the real-time ordering guarantee then has to be
-// re-derived, and that is left as a paper discussion rather than built. See
-// remote-design.md.
+// claim the same timestamp. It generalises to three replicas with a majority.
+// The client-id tiebreak is what fixes it, and the real-time argument above is
+// the re-derivation this comment previously said was still owed.
 //
 // ── What makes stamping-after-publish safe, which is not obvious ────────────
 //
@@ -280,17 +305,31 @@ enum class TsMode : uint8_t {
 /// server CPU's read of the word, and an RDMA READ of it -- all agreeing
 /// (experiments/rdma-counter/RESULTS.md). It is a device property, not a
 /// guarantee, so re-check it if the adapter generation changes.
-[[nodiscard]] inline constexpr uint64_t tsFromFaa(uint64_t pre_value) noexcept {
-  return pre_value + kBootstrapTs + 1;
+/// Bits of a Faa timestamp reserved for the writer's client index.
+///
+/// The tiebreak that makes a REPLICATED counter's timestamp unique. See
+/// tsFromFaa. 16 bits is 65536 clients; the remaining 48 bits of counter at the
+/// measured 2.70 Mops/s ceiling is about 3300 years, so neither field is tight.
+inline constexpr unsigned kFaaClientBits = 16;
+inline constexpr uint64_t kFaaClientMask = (1ull << kFaaClientBits) - 1;
+
+[[nodiscard]] inline constexpr uint64_t tsFromFaa(uint64_t max_pre_value,
+                                                  uint64_t client_idx) noexcept {
+  return ((max_pre_value + 1) << kFaaClientBits) |
+         (client_idx & kFaaClientMask);
 }
 
 /// The counter's first value must clear the bootstrap's, or the first write to
 /// a node ties with the vector bootstrap wrote and the chain stops being
 /// STRICTLY decreasing. Checked here rather than trusted, because the two
 /// constants live in different files.
-static_assert(tsFromFaa(0) > kBootstrapTs,
+static_assert(tsFromFaa(0, 0) > kBootstrapTs,
               "the first FAA timestamp must exceed the bootstrap timestamp");
-static_assert(tsFromFaa(0) != kNullTs,
+static_assert(tsFromFaa(0, 0) != kNullTs,
               "no FAA timestamp may collide with the pending marker");
+static_assert(tsFromFaa(5, 1) != tsFromFaa(5, 2),
+              "two writers computing the same counter maximum must still differ");
+static_assert(tsFromFaa(5, 9) < tsFromFaa(6, 0),
+              "a larger counter maximum outranks any client tiebreak");
 
 }  // namespace ds

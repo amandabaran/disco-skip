@@ -332,19 +332,43 @@ class RdmaAsyncOps {
     return postedExactly(completions, "postBatch");
   }
 
+  /// The batch's Faa timestamp: the MAXIMUM pre-value over the replicas that
+  /// answered, plus this writer's index.
+  ///
+  /// The counter is replicated on every server and the FAA already rides this
+  /// same chain to all of them, so the maximum costs no extra round trip -- and
+  /// it is what stops any one server's counter being a point of failure. The
+  /// client index is the tiebreak that keeps two writers computing the same
+  /// maximum from claiming the same stamp.
+  ///
+  /// Real-time ordering across writers needs the maximum over ALL replicas; a
+  /// majority is not enough, because the replica that decided another writer's
+  /// maximum need not be in the intersection. ts_partial counts when that
+  /// condition did not hold. The derivation is in ds_ts.hpp.
+  uint64_t faaTimestamp(Batch const &b) {
+    uint64_t best = kNoFaa;
+    size_t answered = 0;
+    size_t const n = conns_.size();
+    for (size_t r = 0; r < n; ++r) {
+      uint64_t const pre = batchPreFaa(b, layout_.casBufsFor(future_id_, r));
+      if (pre == kNoFaa) continue;
+      ++answered;
+      if (best == kNoFaa || pre > best) best = pre;
+    }
+    if (best == kNoFaa) return kNullTs;
+    if (answered < n) ++stats_.ts_partial;
+    return tsFromFaa(best, client_idx_);
+  }
+
   /// Did the batch's publishing CAS reach a majority (L1)?
   BatchResult resolveBatch(Batch const &b) {
     BatchResult out;
     out.submitted = true;
-    out.ts = batchTs(b, layout_.casBufsFor(future_id_, 0));
+    out.ts = faaTimestamp(b);
     if (!b.hasCommit()) {
       out.committed = true;
       return out;
     }
-    // Replica 0 holds the authoritative counter (see Layout), so its
-    // pre-value is the timestamp; the others advance their own copies and are
-    // discarded. That asymmetry is the single point of failure Faa mode costs.
-    out.ts = batchTs(b, layout_.casBufsFor(future_id_, 0));
     size_t took = 0;
     for (size_t r = 0; r < conns_.size(); ++r) {
       if (batchCommitted(b, layout_.casBufsFor(future_id_, r))) ++took;
@@ -361,6 +385,8 @@ class RdmaAsyncOps {
 
   [[nodiscard]] TsMode tsMode() const { return ts_mode_; }
   void setTsMode(TsMode m) { ts_mode_ = m; }
+  /// The tiebreak that makes a replicated-counter stamp unique.
+  void setClientIdx(uint64_t i) { client_idx_ = i; }
 
   /// The local timestamp for this run's mode. Faa has none -- its value comes
   /// from the counter after the publish; see ds_ts.hpp.
@@ -416,6 +442,7 @@ class RdmaAsyncOps {
   VecAllocator *vecs_;
 
   TsMode ts_mode_ = TsMode::Clock;
+  uint64_t client_idx_ = 0;
   size_t bumped_ = 0;  ///< completions queued by the post in progress
   VecOffset spec_pending_ = kNullVec;
   uint64_t repair_desired_ = 0;

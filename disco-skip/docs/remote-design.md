@@ -212,7 +212,7 @@ W2 FAAs R1 -> pre 0      W1 FAAs R1 -> pre 1
 W1's pre-values are {0,1}, W2's are {1,0}; both maxima are 1, so both writers claim the
 same timestamp. It generalises to three replicas with a majority.
 
-#### (b) Replicated FAA with a client-id tiebreak — left as a paper discussion
+#### (b) Replicated FAA with a client-id tiebreak — BUILT
 
 The uniqueness failure above is repairable. Pack the timestamp as 48 bits of counter and 16
 bits of client id, and take `(max_of_pre_values, client_id)` lexicographically. Uniqueness
@@ -220,21 +220,36 @@ is then immediate: two writers with the same counter maximum differ in the id. 6
 fits the one word the vector has for `ts`, and 48 bits of counter at the measured 2.70
 Mops/s write ceiling is ~3300 years, so neither field is tight.
 
-What is *not* immediate is the property the counter was there to provide. A single counter
-gives a total order that respects real time: if W1's FAA completes before W2's begins, W1's
-value is smaller. A majority-max does not obviously inherit that, because the two writers
-may touch their replicas in different orders, and the tiebreak is decided by client id —
-which has nothing to do with time. So a pair of writes can be ordered by id against real
-time. That is still a *linearization* of the writes (it is a total order, and it is
-consistent with the per-node `old_ver` chains), so it is sound for a snapshot read; what it
-stops being is *real-time* ordered, which is the stronger property `faa` was chosen for in
-the first place.
+**Real-time ordering does hold**, and the derivation turns on one condition that is easy to
+miss. Suppose W1 completes before W2 begins. If a writer FAAs **all** replicas, then W1
+incremented every one, so when W2 starts each sits at least one above the value W1 saw
+there — hence W2's maximum M2 ≥ M1 + 1 > M1, strictly. The tiebreak therefore never engages
+between non-overlapping writers; it engages only for *concurrent* ones, where any order is a
+valid linearization anyway. So the scheme is unique **and** real-time ordered.
 
-Re-deriving what it does guarantee — and whether a quorum intersection argument recovers
-real-time ordering for non-overlapping operations — is a paper-sized argument, not a code
-change. **Deferred deliberately**, and recorded here so the design is not mistaken for an
-oversight. Option (c) below was built instead, because it keeps fault tolerance and pays
-in a quantity that can simply be measured.
+**With only a majority it breaks.** Let W1's maximum come from replica A, and let W2's quorum
+exclude A. W2 does touch some B ∈ Q1 ∩ Q2, whose value after W1 is `v_B + 1` — but `v_B + 1`
+can still be ≤ M1, because M1 came from A, not B. A later write can then take a *smaller*
+timestamp than an earlier one. Quorum intersection guarantees W2 sees *some* replica W1
+touched; it does not guarantee it sees the one that decided M1, and that is the whole
+difference.
+
+So the implementation takes the maximum over every replica that **answered** and counts the
+runs where that was not all of them (`QuorumStats::ts_partial`). A partial FAA still yields a
+timestamp that is unique and monotone for its own writer; what it loses is the cross-writer
+real-time guarantee. That is the case worth counting rather than assuming away.
+
+It costs **no extra round trip** over a single counter: the counter region is already part of
+`serverSize()` on every server, and the FAA already rides the publish chain to all of them.
+Only the choice of which reply to keep changed — replica 0's, to the maximum.
+
+Why this and not option (c): §8 of [`clock-measurements.md`](clock-measurements.md) measured
+ε at **p99 ≈ 56 µs** against ~2 µs operations. `cache-remote-interface.md` §9 proposed
+commit-wait on the assumption that ε ≈ 100 ns would make it cost ~5% — "a graph rather than
+an argument". At the measured ε that argument does not survive: commit-wait would cost ~28×
+the operation it protects, and the ε-parameterised alternative is a guarantee 28 operations
+wide. The counter costs one round trip per *write*, and on the workload where ranges matter
+(E, 95% scan / 5% insert) that is one extra round trip on 5% of operations.
 
 #### (c) What was built: a PTP-disciplined clock, and ε as a measured cost
 

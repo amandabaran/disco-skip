@@ -78,6 +78,8 @@ class FakeReplicaSet {
   /// count -- the thing the chaining exists to reduce.
   void submitAll(ds::Batch const &b, bool *submitted, bool *committed) {
     ++batches_;
+    uint64_t best = ds::kNullTs;
+    size_t answered = 0;
     for (size_t r = 0; r < arenas_.size(); ++r) {
       if (down_[r]) {
         submitted[r] = false;
@@ -87,7 +89,21 @@ class FakeReplicaSet {
       ds::BatchResult const res = arenas_[r].submit(b);
       submitted[r] = res.submitted;
       committed[r] = res.committed;
-      if (r == 0) last_ts_ = res.ts;
+      // THE COUNTER IS REPLICATED, so the stamp is the maximum over the
+      // replicas that answered -- not replica 0's. Each arena has its own
+      // counter and they advance independently (a replica that was down misses
+      // increments), which is exactly the divergence the maximum exists to
+      // absorb. Modelled here rather than left as replica 0, or the tests would
+      // pass against a single-counter fake while the cluster ran a replicated
+      // one.
+      if (res.ts != ds::kNullTs) {
+        ++answered;
+        if (best == ds::kNullTs || res.ts > best) best = res.ts;
+      }
+    }
+    if (best != ds::kNullTs) {
+      last_ts_ = best;
+      if (answered < arenas_.size()) ++ts_partial_;
     }
   }
 
@@ -98,8 +114,12 @@ class FakeReplicaSet {
   void setTsMode(ds::TsMode m) {
     for (auto &a : arenas_) a.setTsMode(m);
   }
-  /// Replica 0 holds the authoritative counter, matching Layout.
+  /// The maximum stamp over the replicas that answered -- the counter is
+  /// replicated on every server, so no one of them is authoritative.
   [[nodiscard]] uint64_t lastTs() const { return last_ts_; }
+  /// Stamps taken from fewer than all replicas: unique and monotone for their
+  /// own writer, but without the cross-writer real-time guarantee. ds_ts.hpp.
+  [[nodiscard]] uint64_t tsPartial() const { return ts_partial_; }
   ds::VecOffset allocVec() {
     // Offsets must mean the same thing on every replica, so allocation is a
     // client-side decision handed to all of them -- which is exactly why a
@@ -162,5 +182,6 @@ class FakeReplicaSet {
   std::vector<bool> down_;
   uint64_t clock_ = 1000;
   uint64_t last_ts_ = ds::kNullTs;
+  uint64_t ts_partial_ = 0;
   uint64_t batches_ = 0;
 };

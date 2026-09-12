@@ -581,6 +581,65 @@ static void checkHintHelpsATraversalAndCostsNothingWrong() {
               (unsigned long long)warm.qs.vec_reads_served);
 }
 
+static void checkTheCounterSurvivesAReplicaFailure() {
+  // THE POINT OF REPLICATING THE COUNTER. A single counter on one server would
+  // mean a write cannot claim a timestamp when that server is down -- the
+  // failure model would silently drop from "tolerates one memory node" to
+  // "tolerates one unless it is the counter's". With the counter on every
+  // server and the stamp taken as the maximum over those that answered, a
+  // downed replica costs nothing but the real-time guarantee.
+  FakeReplicaSet set(3, kLayers, 8192);
+  ds::QuorumStats qs;
+  ds::QuorumOps<FakeReplicaSet> ops(set, qs, nullptr);
+  set.setTsMode(ds::TsMode::Faa);
+
+  ds::PutStats ps;
+  ds::WriteStats ws;
+  ds::NullPutCache cache;
+
+  {
+    ds::Putter<ds::QuorumOps<FakeReplicaSet>, ds::NullPutCache> p(
+        ops, cache, kLayers, ps, ws);
+    CHECK(p.put(10, 100, 0).resolved, "a put resolves with every replica up");
+  }
+  uint64_t const healthy = set.lastTs();
+  CHECK(healthy != ds::kNullTs, "and it claimed a timestamp");
+  CHECK(set.tsPartial() == 0, "from all three replicas");
+
+  // Lose REPLICA 0 specifically. That is the one a single-counter design would
+  // have called authoritative, so this is precisely the failure that design
+  // could not survive: the commit still reaches a majority (1 and 2 are up),
+  // and the timestamp must too. Taking down replica 2 instead would pass
+  // against a single-counter implementation and prove nothing -- which it did,
+  // until this test was pointed at the right replica.
+  set.setDown(0, true);
+  {
+    ds::Putter<ds::QuorumOps<FakeReplicaSet>, ds::NullPutCache> p(
+        ops, cache, kLayers, ps, ws);
+    CHECK(p.put(20, 200, 0).resolved, "a put still resolves with one down");
+  }
+  CHECK(set.lastTs() != ds::kNullTs,
+        "and still claims a timestamp -- the counter is not a single point "
+        "of failure");
+  CHECK(set.lastTs() > healthy, "which is larger than the previous one");
+  CHECK(set.tsPartial() > 0,
+        "recorded as partial, since the real-time argument needs all replicas");
+
+  ds::VerifyReport const rep = ds::verifyStructure(ops, kLayers);
+  CHECK(rep.ok(), "and the structure is intact");
+}
+
+static void checkTwoWritersOnTheSameMaximumDoNotCollide() {
+  // The uniqueness failure the client index fixes. Replicated counters let two
+  // writers compute the SAME maximum -- interleave their FAAs in opposite order
+  // on two replicas and both see {0,1}. Without a tiebreak both claim the same
+  // stamp, and a range query cannot order them.
+  CHECK(ds::tsFromFaa(1, 0) != ds::tsFromFaa(1, 1),
+        "same maximum, different writers, different timestamps");
+  CHECK(ds::tsFromFaa(1, 300) < ds::tsFromFaa(2, 0),
+        "and the maximum still dominates the tiebreak");
+}
+
 int main() {
   std::printf("quorum_test: layers=%u\n", kLayers);
   checkMajorityIsComputedFromTheReplicaCount();
@@ -601,6 +660,8 @@ int main() {
   checkAStaleGuessNeverServesOldBytes();
   checkSpeculationIsRejectedWhenReplicaZeroDissents();
   checkHintHelpsATraversalAndCostsNothingWrong();
+  checkTheCounterSurvivesAReplicaFailure();
+  checkTwoWritersOnTheSameMaximumDoNotCollide();
 
   if (g_failures != 0) {
     std::printf("%d FAILURE(S)\n", g_failures);

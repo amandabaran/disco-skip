@@ -88,6 +88,11 @@ class SvFuture : public BasicFuture {
     // per-future one -- every future on a client must agree, or the old_ver
     // chains they write interleave two incomparable clocks.
     ops_.setTsMode(s.layout.ts_mode);
+    // The tiebreak for the replicated counter. Without this every client
+    // stamps with index 0 and two writers computing the same maximum collide
+    // -- which is the uniqueness failure the index exists to prevent, so a
+    // missing setter here would silently undo it.
+    ops_.setClientIdx(s.client_idx);
   }
 
   void doGet(Key k, bool measuring = false) {

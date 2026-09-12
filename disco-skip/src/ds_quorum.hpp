@@ -126,6 +126,13 @@ struct QuorumStats {
   /// the difference is repairs that raced and will be re-polled.
   uint64_t repairs = 0;
   uint64_t repairs_landed = 0;
+  /// Faa timestamps taken from fewer than ALL replicas, because one did not
+  /// answer. Such a stamp is still unique and still monotone for its own
+  /// writer; what it loses is the cross-writer real-time guarantee, since the
+  /// replica that decided another writer's maximum may not have been touched.
+  /// See the derivation in ds_ts.hpp. Non-zero means the timestamps in that run
+  /// are a linearization but not necessarily a real-time one.
+  uint64_t ts_partial = 0;
   uint64_t batches = 0;         ///< chained submissions, i.e. round trips
   uint64_t write_shortfalls = 0;///< a batch landed on fewer than a majority
   uint64_t vec_writes = 0;      ///< logical vector writes, summed over batches
