@@ -81,6 +81,19 @@
 
 namespace ds {
 
+/// An upper bound meaning "no upper bound": use the entry cap instead.
+///
+/// One below kReservedKey, which is the sentinel a node's k_min_next carries
+/// when it has no successor -- a scan whose hi equalled it would compare
+/// against a value that is deliberately not a key.
+///
+/// This is what a count-bounded scan wants. YCSB gives a start key and a COUNT,
+/// and for an ordered structure a count bounds the entries returned, not the
+/// key distance: a fixed key width would return wildly different numbers of
+/// entries depending on how dense the keyspace happens to be there. dLSM's
+/// iterator does the same, which is what makes the two comparable on workload E.
+inline constexpr Key kUnboundedKey = kReservedKey - 1;
+
 struct RangeStats {
   uint64_t ranges = 0;
   uint64_t nodes_walked = 0;     ///< data nodes visited on the current chain

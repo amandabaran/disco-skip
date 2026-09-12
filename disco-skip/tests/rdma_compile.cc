@@ -157,9 +157,14 @@ void instantiate_future(ds::DsState &state, ds::QuorumStats &q, ds::GetStats &g,
 #else
   ds::ClientCache cache;
 #endif
-  ds::SvFuture<ds::ClientCache> f(state, /*id=*/0, cache, q, g, p, w);
+  ds::RangeStats rq;
+  ds::SvFuture<ds::ClientCache> f(state, /*id=*/0, cache, q, g, p, w, rq);
   f.doGet(42);
   f.doPut(43, 4343, 2);
+  // A10 through the future, which is how main.cpp issues a scan.
+  f.doRange(10, ds::kUnboundedKey, /*cap=*/8);
+  (void)f.rangeResult().snapshot;
+  (void)f.rangeEntries().size();
   f.addToOngoingRDMA(0, -1);
   (void)f.tryStepForward();
   (void)f.isDone();

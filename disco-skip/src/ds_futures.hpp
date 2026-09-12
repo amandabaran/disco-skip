@@ -69,21 +69,23 @@ inline constexpr uint64_t kMaxFutureSteps = 4096;
 template <class Cache>
 class SvFuture : public BasicFuture {
  public:
-  enum class Kind : uint8_t { None, Get, Put };
+  enum class Kind : uint8_t { None, Get, Put, Range };
 
   using Conns = std::vector<dory::conn::ReliableConnection *>;
   using Tally = std::vector<int64_t>;
   using AsyncOps = RdmaAsyncOps<Conns, Tally>;
 
   SvFuture(DsState &s, uint64_t id, Cache &cache, QuorumStats &qstats,
-           GetStats &gstats, PutStats &pstats, WriteStats &wstats)
+           GetStats &gstats, PutStats &pstats, WriteStats &wstats,
+           RangeStats &rstats)
       : BasicFuture{s, id},
         ongoing_(s.layout.num_servers, 0),
         ops_(s.server_conns, s.layout, s.to_poll_per_server, ongoing_, id,
              qstats, &s.vec_hint, &s.node_alloc, &s.vec_alloc),
         get_(ops_, cache, static_cast<uint32_t>(s.layout.cache_layers), gstats),
         put_(ops_, cache, static_cast<uint32_t>(s.layout.cache_layers), pstats,
-             wstats) {
+             wstats),
+        range_(ops_, static_cast<uint32_t>(s.layout.cache_layers), rstats) {
     // The timestamp source is a per-run decision carried on Layout, not a
     // per-future one -- every future on a client must agree, or the old_ver
     // chains they write interleave two incomparable clocks.
@@ -105,6 +107,20 @@ class SvFuture : public BasicFuture {
   void doPut(Key k, Value v, uint32_t height, bool measuring = false) {
     begin(Kind::Put, measuring);
     awaiting_ = put_.start(k, v, height);
+    settleIfImmediate();
+    recordIfDone();
+  }
+
+  /// A10. The entries land in this future's own buffer, readable through
+  /// rangeEntries() until the next doRange on the same future.
+  ///
+  /// Owned rather than caller-supplied because the future outlives any single
+  /// call site here: the benchmark issues a range and comes back to it several
+  /// steps later, and a caller's vector would have to stay alive across that.
+  void doRange(Key lo, Key hi, size_t cap, bool measuring = false) {
+    begin(Kind::Range, measuring);
+    range_out_.clear();
+    awaiting_ = range_.start(lo, hi, cap, range_out_);
     settleIfImmediate();
     recordIfDone();
   }
@@ -131,15 +147,20 @@ class SvFuture : public BasicFuture {
           std::to_string(steps_) +
           " steps without finishing: a state transition is not terminating");
     }
-    awaiting_ = (kind_ == Kind::Get) ? get_.step() : put_.step();
+    awaiting_ = stepActive();
     settleIfImmediate();
     recordIfDone();
     return true;
   }
 
   [[nodiscard]] bool isDone() const {
-    if (kind_ == Kind::None) return true;
-    return (kind_ == Kind::Get) ? get_.finished() : put_.finished();
+    switch (kind_) {
+      case Kind::Get:   return get_.finished();
+      case Kind::Put:   return put_.finished();
+      case Kind::Range: return range_.finished();
+      case Kind::None:  break;
+    }
+    return true;
   }
 
   [[nodiscard]] bool isMeasuring() const { return measuring_; }
@@ -147,6 +168,12 @@ class SvFuture : public BasicFuture {
   [[nodiscard]] Kind kind() const { return kind_; }
   [[nodiscard]] GetResult const &getResult() const { return get_.result(); }
   [[nodiscard]] PutResult const &putResult() const { return put_.result(); }
+  [[nodiscard]] RangeResult const &rangeResult() const {
+    return range_.result();
+  }
+  [[nodiscard]] std::vector<Entry> const &rangeEntries() const {
+    return range_out_;
+  }
 
  private:
   void begin(Kind k, bool measuring) {
@@ -176,14 +203,27 @@ class SvFuture : public BasicFuture {
   /// is a fact this class owns; asking every call site to notice it is how it
   /// came to be missed. Guarded by recorded_ so a future that is stepped again
   /// after completing cannot double-count.
+  /// Step whichever operation is active. One place, so a new Kind cannot be
+  /// half-wired: the switch has no default, so omitting an arm fails to build.
+  size_t stepActive() {
+    switch (kind_) {
+      case Kind::Get:   return get_.step();
+      case Kind::Put:   return put_.step();
+      case Kind::Range: return range_.step();
+      case Kind::None:  break;
+    }
+    return 0;
+  }
+
   void recordIfDone() {
     if (!measuring_ || recorded_ || !isDone()) return;
     recorded_ = true;
     timepoint const end = std::chrono::steady_clock::now();
-    if (kind_ == Kind::Get) {
-      state.addGetMeasurement(start_, end);
-    } else if (kind_ == Kind::Put) {
-      state.addPutMeasurement(start_, end);
+    switch (kind_) {
+      case Kind::Get:   state.addGetMeasurement(start_, end); break;
+      case Kind::Put:   state.addPutMeasurement(start_, end); break;
+      case Kind::Range: state.addRangeMeasurement(start_, end); break;
+      case Kind::None:  break;
     }
   }
 
@@ -199,7 +239,7 @@ class SvFuture : public BasicFuture {
             " made no progress and posted nothing: a transition returned zero "
             "completions without finishing");
       }
-      awaiting_ = (kind_ == Kind::Get) ? get_.step() : put_.step();
+      awaiting_ = stepActive();
     }
   }
 
@@ -207,6 +247,8 @@ class SvFuture : public BasicFuture {
   AsyncOps ops_;
   GetOperation<AsyncOps, Cache> get_;
   PutOperation<AsyncOps, Cache> put_;
+  RangeOperation<AsyncOps> range_;
+  std::vector<Entry> range_out_;
 
   Kind kind_ = Kind::None;
   bool measuring_ = false;

@@ -32,6 +32,7 @@ private:
     GetStats gstats;
     PutStats pstats;
     WriteStats wstats;
+    RangeStats rstats;
 #if DS_CACHE_ENABLED
     ClientCache cache;
 #else
@@ -62,7 +63,7 @@ public:
 
         for (size_t i = 0; i < state.layout.async_parallelism; ++i) {
             futures.emplace_back(state, i, cache, qstats, gstats, pstats,
-                                 wstats);
+                                 wstats, rstats);
             range_futures.emplace_back(state, i);
         }
     }
@@ -246,6 +247,20 @@ public:
         fmt::print("              {} hinted, {} hint misses, {} hint rejected\n",
                    pstats.hinted_writes, pstats.hint_misses,
                    pstats.hint_rejected);
+        if (rstats.ranges != 0) {
+            fmt::print("ranges:       {} resolved, {} FAILED, {} truncated\n",
+                       rstats.ranges - rstats.failures, rstats.failures,
+                       rstats.truncated);
+            fmt::print("              {} entries, {} nodes walked, {} skipped "
+                       "(newer than the snapshot)\n",
+                       rstats.entries, rstats.nodes_walked,
+                       rstats.nodes_skipped);
+            // The old_ver hops are a range's distinctive cost -- one round trip
+            // each, chasing a linked list in remote memory -- so they are
+            // reported rather than folded into vec_reads.
+            fmt::print("              {} old_ver hops, {} vector reads\n",
+                       rstats.versions_walked, rstats.vec_reads);
+        }
         fmt::print("writes:       {} published, {} cas lost, {} retries, "
                    "{} retry-budget exhausted\n",
                    wstats.published, wstats.cas_lost, wstats.retries,

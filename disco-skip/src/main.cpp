@@ -926,16 +926,28 @@ int main(int argc, char** argv) {
                         break;
                     }
                     case OpScan: {
-                        // Still the register path: there is no skip-vector
-                        // range (A10). A scan here measures the old structure,
-                        // so a scan-heavy workload is not yet a disco-skip
-                        // measurement.
+                        // A10: the SKIP-VECTOR range. This used to go to the
+                        // register RangeFuture over the old flat array, which
+                        // meant a scan-heavy workload measured the previous
+                        // structure -- and, worse, that E's scans and its
+                        // inserts touched two disjoint structures, so the
+                        // inserts never grew the thing being scanned.
+                        //
+                        // The interval is a KEY RANGE now, not a register span.
+                        // YCSB gives a start key and a count, and the skip
+                        // vector is ordered, so the count becomes an upper
+                        // bound on the entries returned rather than a bound on
+                        // the key distance -- which is what a scan means for an
+                        // ordered structure and what dLSM's iterator does too.
+                        // The key window is left open at the top and the CAP is
+                        // what stops it; a fixed key width would return a
+                        // wildly variable number of entries depending on how
+                        // dense the keyspace is there.
                         uint64_t len = op.scan_len;
                         if (len > layout.max_range) len = layout.max_range;
-                        if (op.target_reg + len > layout.num_registers) len = layout.num_registers - op.target_reg;
-
-                        uint64_t end_reg = op.target_reg + len - 1;
-                        client.getFreeRangeFuture().doRange(op.target_reg, end_reg, measuring);
+                        if (len == 0) len = 1;
+                        client.getFreeFuture().doRange(
+                            op.target_reg, ds::kUnboundedKey, len, measuring);
                         break;
                     }
                     case OpPut: {
