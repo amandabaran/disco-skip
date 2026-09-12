@@ -44,6 +44,11 @@ struct GetStats {
   uint64_t helped = 0;          ///< in-flight operations completed for a writer
   uint64_t not_found = 0;       ///< resolved, and k genuinely does not exist
   uint64_t failures = 0;        ///< could not resolve; caller should retry
+  /// Breakdown of `failures` by which livelock guard fired. Every one of these
+  /// is starvation under contention, not an error -- see TraversalGaveUp.
+  uint64_t gave_up_no_majority = 0;
+  uint64_t gave_up_settle_stuck = 0;
+  uint64_t gave_up_too_many_hops = 0;
 };
 
 struct GetResult {

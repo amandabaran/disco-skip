@@ -42,6 +42,33 @@ enum class TraversalStatus {
   Exhausted,   ///< too many hops; treated as a live-lock guard, not a result
 };
 
+/// WHY a traversal gave up. ReadFailed covers two genuinely different
+/// situations and the distinction decides what to do about them, so it is
+/// recorded rather than collapsed.
+///
+/// This existed only as "some bound was hit" until workload D at 8 clients
+/// produced 61,019 failed gets and there was no way to say which bound. Every
+/// value here is a LIVELOCK GUARD firing, not an error: nothing is broken, the
+/// operation is being starved by other clients writing the same key.
+enum class TraversalGaveUp : uint8_t {
+  No,           ///< did not give up
+  NoMajority,   ///< kMaxSettleAttempts polls, never a majority-supported handle
+                ///< -- a commit is permanently in flight on a hot node
+  SettleStuck,  ///< kMaxSettleAttempts helps, and the node was STILL pending or
+                ///< mid-split each time -- we settle it, a writer re-dirties it
+  TooManyHops,  ///< kMaxHopsPerLevel right-hops at one level
+};
+
+[[nodiscard]] inline char const *gaveUpName(TraversalGaveUp g) {
+  switch (g) {
+    case TraversalGaveUp::No:          return "no";
+    case TraversalGaveUp::NoMajority:  return "no-majority";
+    case TraversalGaveUp::SettleStuck: return "settle-stuck";
+    case TraversalGaveUp::TooManyHops: return "too-many-hops";
+  }
+  return "?";
+}
+
 struct TraversalResult {
   TraversalStatus status = TraversalStatus::ReadFailed;
 
@@ -66,6 +93,9 @@ struct TraversalResult {
   uint32_t right_hops = 0;
   uint32_t helped_ts = 0;
   uint32_t helped_splits = 0;
+
+  /// Which guard fired, when status is not Ok. See TraversalGaveUp.
+  TraversalGaveUp gave_up = TraversalGaveUp::No;
 
   [[nodiscard]] bool ok() const { return status == TraversalStatus::Ok; }
 };

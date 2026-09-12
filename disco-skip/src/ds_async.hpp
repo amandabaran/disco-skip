@@ -135,6 +135,7 @@ class TraversalFuture {
       // No majority-supported handle yet: a commit is in flight. Re-poll
       // rather than guess, exactly as the blocking quorum read does.
       if (++settle_tries_ > static_cast<uint32_t>(detail::kMaxSettleAttempts)) {
+        res_.gave_up = TraversalGaveUp::NoMajority;
         return fail(TraversalStatus::ReadFailed);
       }
       return postHeaders();
@@ -179,6 +180,7 @@ class TraversalFuture {
     }
 
     if (++hops_ > detail::kMaxHopsPerLevel) {
+      res_.gave_up = TraversalGaveUp::TooManyHops;
       return fail(TraversalStatus::Exhausted);
     }
     cur_ = next;
@@ -193,6 +195,7 @@ class TraversalFuture {
     bool const unstable = !node_.isStable();
     if (pending || unstable) {
       if (++settle_tries_ > static_cast<uint32_t>(detail::kMaxSettleAttempts)) {
+        res_.gave_up = TraversalGaveUp::SettleStuck;
         return fail(TraversalStatus::ReadFailed);
       }
       // The same batch settleNode() would build, in the same order -- the tail

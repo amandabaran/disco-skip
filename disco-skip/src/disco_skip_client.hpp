@@ -234,6 +234,12 @@ public:
                    gstats.failures);
         fmt::print("              {} cache hits, {} misses, {} kmin mismatch\n",
                    gstats.cache_hits, gstats.cache_misses, gstats.kmin_mismatch);
+        if (gstats.failures != 0) {
+            fmt::print("              gave up: {} no-majority, {} settle-stuck, "
+                       "{} too-many-hops\n",
+                       gstats.gave_up_no_majority, gstats.gave_up_settle_stuck,
+                       gstats.gave_up_too_many_hops);
+        }
         fmt::print("puts:         {} resolved, {} FAILED ({} height-0, {} structural)\n",
                    pstats.puts, pstats.failures, pstats.height0,
                    pstats.structural);

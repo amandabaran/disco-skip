@@ -171,7 +171,19 @@ class GetOperation {
         out_.resolved = true;
         ++stats_.not_found;
       } else {
+        // Attribute it. "The operation failed" was previously all the log
+        // said, which made 61,019 failed gets on workload D at 8 clients
+        // impossible to explain -- and the three causes want different fixes:
+        // NoMajority is quorum-read churn on a hot handle, SettleStuck is a
+        // reader helping faster than writers re-dirty, TooManyHops is a
+        // runaway right-walk.
         ++stats_.failures;  // resolved stays false: the caller retries
+        switch (r.gave_up) {
+          case TraversalGaveUp::NoMajority:  ++stats_.gave_up_no_majority; break;
+          case TraversalGaveUp::SettleStuck: ++stats_.gave_up_settle_stuck; break;
+          case TraversalGaveUp::TooManyHops: ++stats_.gave_up_too_many_hops; break;
+          case TraversalGaveUp::No: break;
+        }
       }
       step_ = GetStep::Done;
       return 0;
