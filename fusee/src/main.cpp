@@ -646,6 +646,18 @@ int main(int argc, char* argv[]) {
     std::cout << "Done. Results:" << std::endl;
 
     fmt::print("\n");
+    if (range_lock) {
+      // Byte-identical in swarm-kv/src/main.cpp, and the harness greps for this
+      // exact text to flag an arm labelled locked that took no locks. Retries
+      // per acquire is the contention figure: a locked arm with none was never
+      // contended, and its throughput says nothing about what locking costs.
+      fmt::print("range lock:   {} acquires, {} retries ({:.2f} per acquire)\n",
+                 range_lock->acquires(), range_lock->retries(),
+                 range_lock->acquires() == 0
+                     ? 0.0
+                     : static_cast<double>(range_lock->retries()) /
+                           static_cast<double>(range_lock->acquires()));
+    }
     fmt::print("################ Main stats:\n");
     fmt::print("######## SEARCH stats:\n");
     fmt::print("cache-hits: {}%\n",
