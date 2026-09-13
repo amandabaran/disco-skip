@@ -34,6 +34,23 @@ but by leaving less in the one file that cannot be compiled.
 The rule that follows: logic added to `main.cpp` is unverified until a cluster
 build, so it belongs in a header with an instantiation in `tests/`.
 
+**A fourth cluster build was then lost to a plain missing include** — `main.cpp`
+used `ds::Descender` without including `ds_descend.hpp`. Moving logic out of
+`main.cpp` does not help with that, because the failure is in what `main.cpp`
+*includes*, not in what it contains. So `src/ds.hpp` is now an umbrella that
+main.cpp includes instead of naming headers one by one, and `rdma_compile.cc`
+includes the umbrella — which makes a header missing from it a local failure.
+
+`main.cpp` itself is still not compiled here, and the third bullet above still
+holds: it needs lyra, fmt and the dory control plane, and stubbing that is not
+worth it. What is checked locally is its *include surface*, not its body.
+
+Verifying that gate took two attempts, which is the part worth remembering.
+Removing `ds_descend.hpp` from the umbrella did **not** fail the build, because
+`ds_get.hpp` includes it transitively, so the first check proved nothing.
+Removing both does fail, with exactly the cluster's error. A gate that has not
+been observed to fail is not a gate.
+
 What it *does* buy is type-checking of the RDMA-facing headers and everything
 built on them: wrong argument order, a signature that drifted from
 `conn/src/rc.hpp`, a template that does not instantiate, and narrowing of
