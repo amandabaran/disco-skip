@@ -34,6 +34,15 @@ struct Layout {
 
   uint64_t num_tsp;
 
+  // Range-lock arm. 0 disables locking entirely (the unlocked baseline, which
+  // has a non-linearizable scan -- see range_lock.hpp). 1 is a single global
+  // lock. Larger values stripe the key space.
+  //
+  // The region sits at offset 0 of the server and everything else shifts past
+  // it, so a binary built with locking disabled and one built with it enabled
+  // do NOT share an address space. They are separate runs, never mixed.
+  uint64_t lock_stripes;
+
   bool guess_ts;
 
   uint64_t firstServerId() { return 1; }
@@ -94,14 +103,42 @@ struct Layout {
            async_parallelism;
   }
 
-  static uint64_t serverLogsOffset() { return 0; }
-  uint64_t serverDataOffset() const { return serverLogSize(); }
+  /// One cacheline per stripe. Two stripes in one line would be one lock as
+  /// far as the NIC's atomic unit and the coherence traffic are concerned, and
+  /// the striped arm would silently measure the global one.
+  static constexpr uint64_t kLockStride = 64;
+  uint64_t lockRegionSize() const {
+    return lock_stripes == 0 ? 0 : kLockStride * lock_stripes;
+  }
+  static uint64_t lockRegionOffset() { return 0; }
+  uintptr_t getLockAddress(uintptr_t region, uint64_t stripe) const {
+    if (lock_stripes == 0 || stripe >= lock_stripes) {
+      throw std::invalid_argument(
+          fmt::format("Lock stripe out of range: {} (num: {})", stripe,
+                      lock_stripes));
+    }
+    return region + lockRegionOffset() + kLockStride * stripe;
+  }
+
+  // No longer static: the logs now start past the lock region.
+  uint64_t serverLogsOffset() const { return lockRegionSize(); }
+  uint64_t serverDataOffset() const {
+    return lockRegionSize() + serverLogSize();
+  }
   uint64_t serverSize() const {
-    return serverLogSize() + fullKVSizeWithPadding() * keys_per_server;
+    return lockRegionSize() + serverLogSize() +
+           fullKVSizeWithPadding() * keys_per_server;
   }
 
   static uint64_t clientLogsOffset() { return 0; }
-  uint64_t clientSize() const { return clientLogSize(); }
+  /// One cacheline of client-local memory for the lock's CAS result. The CAS
+  /// returns the PRE-image into local memory, so it needs a registered landing
+  /// slot of its own -- reusing a log entry would corrupt an in-flight write.
+  uint64_t lockScratchSize() const { return lock_stripes == 0 ? 0 : 64; }
+  uint64_t clientSize() const { return clientLogSize() + lockScratchSize(); }
+  uintptr_t getLockScratchAddress() const {
+    return client_local_region + clientLogSize();
+  }
 
   // Access the remote server's RDMA memory (only used in clients):
   uintptr_t getServerLogAddress(uintptr_t region, uint64_t client_idx,

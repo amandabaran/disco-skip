@@ -1,4 +1,5 @@
 #include <memory>
+#include <optional>
 #include <thread>
 #include <chrono>
 #include <iostream>
@@ -12,6 +13,7 @@
 
 #include "latency.hpp"
 #include "layout.hpp"
+#include "range_lock.hpp"
 #include "main.hpp"
 #include "oops_client.hpp"
 
@@ -31,6 +33,21 @@ void run_ml_prog_tracker_workload(
     uint64_t global_thread_id, 
     uint64_t active_workers, 
     uint64_t ops_to_run);
+
+/// The numeric part of a YCSB key ("user0000123" -> 123).
+///
+/// MUST agree with IncrementYcsbKey, which is what a SCAN walks: the stripes a
+/// scan locks are derived from this, so if the two disagreed about key ordering
+/// the lock would cover a different range than the scan reads -- a lock that is
+/// held, and protects the wrong thing.
+///
+/// strtoull, not stoll: with insertorder=hashed YCSB keys run to ~9.2e18, which
+/// is at the edge of a signed 64-bit integer.
+inline uint64_t ycsbKeyToInt(const std::string& key) {
+  size_t const digit = key.find_first_of("0123456789");
+  if (digit == std::string::npos) return 0;
+  return std::strtoull(key.c_str() + digit, nullptr, 10);
+}
 
 inline std::string IncrementYcsbKey(const std::string& key) {
     size_t non_digit = key.find_first_of("0123456789");
@@ -167,6 +184,10 @@ int main(int argc, char* argv[]) {
   layout.key_size = 24;
   layout.value_size = 64;
   layout.num_tsp = 1;
+  // 0 = off: the unlocked baseline, whose SCAN is not linearizable. See
+  // range_lock.hpp for why that matters when this is compared against a system
+  // with a snapshot.
+  layout.lock_stripes = 0;
   uint64_t death_point = uint64_t(-1);
   bool measure_batches = false;
 
@@ -212,6 +233,13 @@ int main(int argc, char* argv[]) {
           .optional()["-o"]["--doorbell"] |
       lyra::opt(layout.in_place, "in_place").optional()["-e"]["--in_place"] |
       lyra::opt(layout.num_tsp, "num_tsp").optional()["-T"]["--num_tsp"] |
+      lyra::opt(layout.lock_stripes, "lock_stripes")
+          .optional()["--lock-stripes"](
+              "Make SCAN linearizable by locking (0 = off, the default and the "
+              "non-linearizable baseline; 1 = one global lock; N = the key "
+              "space striped N ways). Writers take the lock too, which they "
+              "must for a scan to be linearizable at all, so this costs the "
+              "write path as well as the scan path.") |
       lyra::opt(death_point, "death_point").optional()["-D"]["--death_point"] |
       lyra::opt(measure_batches, "measure_batches")
           .optional()["-B"]["--measure_batches"] |
@@ -356,6 +384,24 @@ int main(int argc, char* argv[]) {
         layout,          ce,          proc_id,   pointer_cache_size,
         measure_batches, death_point, iter_count};
 
+    std::optional<RangeLock> range_lock;
+    if (layout.lock_stripes > 0) {
+      if (layout.async_parallelism != 1) {
+        throw std::runtime_error(
+            "--lock-stripes requires -a 1. The lock's CAS drains the send CQ, "
+            "which it shares with the future machinery, so it can only be "
+            "taken when nothing else is in flight.");
+      }
+      range_lock.emplace(
+          layout, ce.connections().at(1), static_cast<uint64_t>(proc_id),
+          reinterpret_cast<uint64_t*>(layout.getLockScratchAddress()),
+          layout.lock_stripes);
+      std::cout << "Range lock ON: " << layout.lock_stripes
+                << (layout.lock_stripes == 1 ? " stripe (global)" : " stripes")
+                << ", " << RangeLock::kKeysPerStripe << " keys each"
+                << std::endl;
+    }
+
     if (proc_id == layout.firstClientId()) {
       std::cout << "Querying YCSB for the set of initial key-pairs... " << std::flush;
       std::vector<std::pair<std::string, std::string>> inserts = {};
@@ -491,6 +537,24 @@ int main(int argc, char* argv[]) {
           end = std::chrono::steady_clock::now();
         }
 
+        // THE LOCK. Taken at operation boundaries, never with RDMA in flight:
+        // casBlocking drains the send CQ, which the future machinery shares, so
+        // a completion belonging to a future would be eaten. finishAllFutures()
+        // below and the per-key drain inside SCAN are what make these points
+        // quiescent.
+        if (range_lock) {
+          if (op.type == OpType::SCAN) {
+            range_lock->acquireRange(ycsbKeyToInt(op.key),
+                                     static_cast<uint64_t>(op.scan_count));
+          } else if (op.type == OpType::UPDATE) {
+            range_lock->acquireKey(ycsbKeyToInt(op.key));
+          }
+          // READ is a single point read and is already atomic on its own, so
+          // it does not take the lock. A reader that took it would serialise
+          // the read-only workloads against nothing, which would overstate the
+          // cost rather than measure it.
+        }
+
         if (op.type == OpType::UPDATE) {
           auto& future = client.getFreeFuture();
           future.doUpdate(op.key, op.value, measuring);
@@ -526,12 +590,34 @@ int main(int argc, char* argv[]) {
             total_scans_measured++;
           }
         }
+
+        if (range_lock &&
+            (op.type == OpType::SCAN || op.type == OpType::UPDATE)) {
+          // The write must LAND before the lock is dropped, or a scan could
+          // take the lock immediately afterwards and miss it. This drain is
+          // not an artefact of how the lock is implemented: releasing before
+          // the protected write has completed would be incorrect under any
+          // implementation.
+          client.finishAllFutures();
+          range_lock->release();
+        }
       }
 
       client.finishAllFutures();
 
       std::cout << "Done. Results:" << std::endl;
       client.reportStats(detailed);
+      if (range_lock) {
+        // Retries per acquire is the contention figure. A locked arm whose
+        // retry count is ~0 was not contended, so its throughput says nothing
+        // about what locking costs under load.
+        fmt::print("range lock:   {} acquires, {} retries ({:.2f} per acquire)\n",
+                   range_lock->acquires(), range_lock->retries(),
+                   range_lock->acquires() == 0
+                       ? 0.0
+                       : static_cast<double>(range_lock->retries()) /
+                             static_cast<double>(range_lock->acquires()));
+      }
 
       if (total_scans_measured > 0) {
           double avg_scan_latency_ms = static_cast<double>(total_scan_duration_ns) 
