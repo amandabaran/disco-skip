@@ -437,7 +437,13 @@ int main(int argc, char* argv[]) {
     }
     
     std::cout << "Querying YCSB for the list of operations... " << std::flush;
-    enum class OpType { READ, UPDATE, SCAN };
+    // INSERT IS PART OF THE RUN PHASE, not only the load phase. Without it an
+    // "INSERT usertable ..." line matched none of the branches below and was
+    // dropped silently -- no else, no warning. Workload E is 95% scan / 5%
+    // insert, so this system executed the scans, skipped the inserts, and its
+    // tree never grew while the system it is compared against did. Same defect
+    // disco-skip had and fixed.
+    enum class OpType { READ, UPDATE, SCAN, INSERT };
 
     struct KvsOp {
       OpType type;
@@ -465,6 +471,17 @@ int main(int argc, char* argv[]) {
           auto end = line.length() - std::string(" ]").length();
           auto value = line.substr(start, end - start);
           operations.push_back({OpType::UPDATE, key, value, 0});
+        } else if (!(std::strncmp("INSERT ", line.c_str(), std::string("INSERT ").length()))) {
+          // Byte-identical to the load-phase parse above: same prefix, same
+          // " [ field0=" split. Two parsers for one line format would drift.
+          auto keystart = std::string("INSERT usertable ").length();
+          auto keyend = line.find(" [", keystart);
+          auto key = line.substr(keystart, keyend - keystart);
+
+          auto start = keyend + std::string(" [ field0=").length();
+          auto end = line.length() - std::string(" ]").length();
+          auto value = line.substr(start, end - start);
+          operations.push_back({OpType::INSERT, key, value, 0});
         } else if (!(std::strncmp("SCAN ", line.c_str(), std::string("SCAN ").length()))) {
           auto keystart = std::string("SCAN usertable ").length();
           auto keyend = line.find(" ", keystart);
@@ -546,7 +563,10 @@ int main(int argc, char* argv[]) {
           if (op.type == OpType::SCAN) {
             range_lock->acquireRange(ycsbKeyToInt(op.key),
                                      static_cast<uint64_t>(op.scan_count));
-          } else if (op.type == OpType::UPDATE) {
+          } else if (op.type == OpType::UPDATE || op.type == OpType::INSERT) {
+            // An INSERT is a write. A scan that is atomic against updates but
+            // not against inserts is not linearizable -- workload E's inserts
+            // are exactly what a concurrent scan would otherwise tear on.
             range_lock->acquireKey(ycsbKeyToInt(op.key));
           }
           // READ is a single point read and is already atomic on its own, so
@@ -555,7 +575,11 @@ int main(int argc, char* argv[]) {
           // cost rather than measure it.
         }
 
-        if (op.type == OpType::UPDATE) {
+        if (op.type == OpType::INSERT) {
+          auto& future = client.getFreeFuture();
+          future.doInsert(op.key, op.value, measuring);
+        }
+        else if (op.type == OpType::UPDATE) {
           auto& future = client.getFreeFuture();
           future.doUpdate(op.key, op.value, measuring);
         } 
@@ -592,7 +616,8 @@ int main(int argc, char* argv[]) {
         }
 
         if (range_lock &&
-            (op.type == OpType::SCAN || op.type == OpType::UPDATE)) {
+            (op.type == OpType::SCAN || op.type == OpType::UPDATE ||
+             op.type == OpType::INSERT)) {
           // The write must LAND before the lock is dropped, or a scan could
           // take the lock immediately afterwards and miss it. This drain is
           // not an artefact of how the lock is implemented: releasing before

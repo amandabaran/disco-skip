@@ -18,7 +18,12 @@ const uint64_t default_warmup = 1'000'000;
 const uint64_t default_iter_count = 1'000'000;
 const uint64_t default_keepwarm = 500'000;
 
-enum class OpType { READ, UPDATE, SCAN };
+// INSERT IS PART OF THE RUN PHASE, not only the load phase. Without it an
+// "INSERT usertable ..." line matched none of the parser's branches and was
+// dropped silently -- no else, no warning. Workload E is 95% scan / 5% insert,
+// so this system executed the scans, skipped the inserts, and its table never
+// grew while the system it is compared against did.
+enum class OpType { READ, UPDATE, SCAN, INSERT };
 
 struct KvsOp {
   OpType type;
@@ -380,6 +385,15 @@ int main(int argc, char* argv[]) {
           auto value = line.substr(start, end - start);
 
           operations.push_back({OpType::UPDATE, key, value, 0});
+        } else if (!(std::strncmp("INSERT ", line.c_str(), std::string("INSERT ").length()))) {
+          auto keystart = std::string("INSERT usertable ").length();
+          auto keyend = line.find(" [", keystart);
+          auto key = line.substr(keystart, keyend - keystart);
+
+          auto start = keyend + std::string(" [ field0=").length();
+          auto end = line.length() - std::string(" ]").length();
+          auto value = line.substr(start, end - start);
+          operations.push_back({OpType::INSERT, key, value, 0});
         } else if (!(std::strncmp("SCAN ", line.c_str(), std::string("SCAN ").length()))) {
           auto keystart = std::string("SCAN usertable ").length();
           auto keyend = line.find(" ", keystart);
@@ -405,6 +419,43 @@ int main(int argc, char* argv[]) {
 
     std::vector<dory::race::ClientIndex::TryInsertFuture> futures;
     futures.reserve(layout.num_servers - 1);
+
+    // The same sequence the load phase runs inline: write the entry, then
+    // insert the pointer into every server's index. Lifted into a lambda so the
+    // run phase executes exactly what the load phase does -- two copies of a
+    // multi-step distributed insert would drift, and a run-phase insert that
+    // differed from the load-phase one would make the table's contents depend
+    // on when a key arrived.
+    // BY VALUE, not by const reference: prepareToWriteEntry takes non-const
+    // std::string&. The load phase gets away with it by copying into locals
+    // first (`auto key = insert.first;`), so this does the same rather than
+    // changing a signature in the client.
+    auto execute_insert = [&](std::string key, std::string value) {
+      auto hkey = hash(key);
+      auto search = indexes[0]->search(hkey);
+
+      auto* local_log = client.prepareToWriteEntry(key, value);
+      auto kv_id = client.write(local_log, 0);
+
+      auto search_res = search.await();
+      if (search_res.nb_free == 0) {
+        throw std::runtime_error("No free space in the index");
+      }
+      auto free = search_res.free;
+
+      futures.clear();
+      for (size_t sv = 0; sv < layout.num_servers; sv++) {
+        auto& index = *(indexes.at(sv));
+        futures.emplace_back(index.tryInsert(free, hkey, kv_id));
+      }
+      for (size_t sv = 0; sv < layout.num_servers; sv++) {
+        auto res = futures.at(sv).await();
+        if (res.asUint64() != 0) {
+          throw std::runtime_error("Failed to insert key " + key +
+                                   " in server " + std::to_string(sv));
+        }
+      }
+    };
 
     std::chrono::time_point now = std::chrono::steady_clock::now();
     auto start = now;
@@ -621,12 +672,19 @@ int main(int argc, char* argv[]) {
         if (operation.type == OpType::SCAN) {
           range_lock->acquireRange(ycsbKeyToInt(operation.key),
                                    static_cast<uint64_t>(operation.scan_count));
-        } else if (operation.type == OpType::UPDATE) {
+        } else if (operation.type == OpType::UPDATE ||
+                   operation.type == OpType::INSERT) {
+          // An INSERT is a write. A scan atomic against updates but not against
+          // inserts is not linearizable, and workload E's inserts are exactly
+          // what a concurrent scan would tear on.
           range_lock->acquireKey(ycsbKeyToInt(operation.key));
         }
       }
 
-      if (operation.type == OpType::UPDATE) {
+      if (operation.type == OpType::INSERT) {
+        execute_insert(operation.key, operation.value);
+      }
+      else if (operation.type == OpType::UPDATE) {
         execute_point_op(operation.key, OpType::UPDATE, operation.value);
       } 
       else if (operation.type == OpType::READ) {
