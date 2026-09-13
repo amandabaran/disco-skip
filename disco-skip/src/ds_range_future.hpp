@@ -173,6 +173,13 @@ class RangeOperation {
       return done(r.status == TraversalStatus::Miss);
     }
     cur_ = r.data_addr;
+    if (batched_ && r.levels == 0) {
+      // Nothing above the data level to take a backbone from, so this range is
+      // serial no matter what the toggle says. Counted: a measured run where
+      // most of the walk was serial reported "0 fallbacks", which read as the
+      // batched path running cleanly when it had barely run at all.
+      ++stats_.batch_abandoned;
+    }
     if (batched_ && r.levels > 0) {
       // path_[0] is the level-0 INDEX node covering lo, already located by the
       // traversal we just paid for. Its entries name up to kNodeCapacity
@@ -280,6 +287,10 @@ class RangeOperation {
     // past the end of the index, or an orphan chain. The serial walk finishes
     // the range; it stops on its own at hi.
     if (!tail_succ_.isNull()) {
+      // Off the end of the index with nodes still to come. Everything from
+      // here is serial, and for a long scan that is most of the range -- at
+      // scan 1000 this path turned 139k batches into 17.7M nodes walked.
+      ++stats_.batch_abandoned;
       batched_ = false;
       cur_ = tail_succ_;
       tail_succ_ = RemoteAddr{};

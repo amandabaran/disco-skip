@@ -135,6 +135,12 @@ struct RangeStats {
   uint64_t batches = 0;          ///< index-driven fetches of up to K nodes
   uint64_t batch_fallbacks = 0;  ///< a contended index or node sent us serial
   uint64_t batch_misses = 0;     ///< node needed settling or an old_ver walk
+  /// Ranges that gave up on batching entirely and finished serially: either no
+  /// index level existed to take a backbone from, or the walk ran off the end
+  /// of the index with nodes still to come. Distinct from batch_fallbacks,
+  /// which is a CONTENDED read -- this one is structural, and without it a run
+  /// that batched almost nothing still reported "0 fallbacks".
+  uint64_t batch_abandoned = 0;
   /// Nodes reached by the next_id chain that the INDEX DOES NOT NAME. Capacity
   /// splits produce parentless nodes -- 2535 against 16783 height-driven splits
   /// on a measured workload-E run -- so a walk taking its node list from the

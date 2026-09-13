@@ -272,14 +272,15 @@ public:
                 // the serial detours it could not avoid. A fallback rate near
                 // the orphan rate means the index bought little.
                 fmt::print("              batched walk: {} batches, {} nodes/batch, "
-                           "{} fallbacks, {} misses, {} orphan detours\n",
+                           "{} fallbacks, {} misses, {} orphan detours, "
+                           "{} abandoned\n",
                            rstats.batches,
                            rstats.batches == 0
                                ? 0.0
                                : static_cast<double>(rstats.nodes_walked) /
                                      static_cast<double>(rstats.batches),
                            rstats.batch_fallbacks, rstats.batch_misses,
-                           rstats.orphans_walked);
+                           rstats.orphans_walked, rstats.batch_abandoned);
             }
         }
         // Orphans decide whether an index-batched range walk is sound: a
