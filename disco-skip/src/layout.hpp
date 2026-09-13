@@ -46,6 +46,22 @@ struct Layout {
     // for write-heavy ones, where every write moves the vector.
     bool offset_hint;
 
+    // Whether a range takes its backbone from a level-0 index node and fetches
+    // up to kWalkFanout data nodes at once, instead of following next_id one
+    // node per round trip. A scan of 100 entries costs 10.9 serial round trips
+    // measured, 26.2 at scan 255, and an index node names 16 consecutive data
+    // nodes whose address RangeOperation already holds in path_[0] -- so the
+    // dependency between round trips is breakable.
+    //
+    // It is not free and it is not always right: the index does not name
+    // capacity-split ORPHANS (2535 against 16783 height-driven splits in a
+    // workload-E run, ~13%), so every node's next_id is still checked and an
+    // orphan costs a serial detour. Short ranges pay for an index read they
+    // would not otherwise do. Hence a toggle, default OFF, with the serial walk
+    // as the reference: range_test.cc pins the two to byte-identical results,
+    // so this is a throughput measurement and not an argument.
+    bool batched_walk;
+
     // Runtime arms of the two toggles. invariants.md §9 specifies
     // DS_CACHE_ENABLED as compile-time, and it has to be: the cache is a member
     // of DsState, so whether it exists at all is decided at build time. But the
@@ -282,9 +298,27 @@ struct Layout {
         return getCasBufs(future_id) + replica * kMaxBatchOps;
     }
 
+    /// A10's batched range walk: kWalkFanout data nodes fetched in ONE round
+    /// trip instead of one round trip each.
+    ///
+    /// A node read is a QUORUM read, so a batch of K nodes needs
+    /// K * num_servers header slots -- the majority rule is applied per node
+    /// over its own replicas. Vectors are one per node: only the winning
+    /// replica's is read (L4).
+    ///
+    /// 16 because that is a level-0 index node's capacity: its entries name up
+    /// to kNodeCapacity consecutive data nodes, so a fanout wider than that
+    /// could not be filled from one index vector anyway.
+    static constexpr size_t kWalkFanout = 16;
+    size_t walkNodeBufsSize() const {
+        return kWalkFanout * static_cast<size_t>(num_servers) * sizeof(NodeRecord);
+    }
+    size_t walkVecBufsSize() const { return kWalkFanout * sizeof(VecRecord); }
+
     size_t nodePerFutureSize() const {
         return align64(2 * nodeBufsSize() + 2 * vecBufsSize() +
-                       stageNodeSize() + stageVecSize() + casBufsSize());
+                       stageNodeSize() + stageVecSize() + casBufsSize() +
+                       walkNodeBufsSize() + walkVecBufsSize());
     }
     size_t nodeClientSize() const { return async_parallelism * nodePerFutureSize(); }
 
@@ -327,6 +361,21 @@ struct Layout {
         return reinterpret_cast<uint64_t*>(nodeFutureBase(f) + 2 * nodeBufsSize() +
                                            2 * vecBufsSize() + stageNodeSize() +
                                            stageVecSize());
+    }
+
+    /// Batched-walk scratch, after the CAS buffers. Header slots are grouped by
+    /// NODE: walkNodeBufs(f) + i * num_servers is node i's replica set, which is
+    /// the shape resolveHeaders already expects.
+    NodeRecord* getWalkNodeBufs(uint64_t f) const {
+        return reinterpret_cast<NodeRecord*>(nodeFutureBase(f) + 2 * nodeBufsSize() +
+                                             2 * vecBufsSize() + stageNodeSize() +
+                                             stageVecSize() + casBufsSize());
+    }
+    VecRecord* getWalkVecBufs(uint64_t f) const {
+        return reinterpret_cast<VecRecord*>(nodeFutureBase(f) + 2 * nodeBufsSize() +
+                                            2 * vecBufsSize() + stageNodeSize() +
+                                            stageVecSize() + casBufsSize() +
+                                            walkNodeBufsSize());
     }
 
     size_t totalClientSize() const { return nodeRegionOffset() + nodeClientSize(); }

@@ -85,7 +85,8 @@ class SvFuture : public BasicFuture {
         get_(ops_, cache, static_cast<uint32_t>(s.layout.cache_layers), gstats),
         put_(ops_, cache, static_cast<uint32_t>(s.layout.cache_layers), pstats,
              wstats),
-        range_(ops_, static_cast<uint32_t>(s.layout.cache_layers), rstats) {
+        range_(ops_, static_cast<uint32_t>(s.layout.cache_layers), rstats,
+               s.layout.batched_walk) {
     // The timestamp source is a per-run decision carried on Layout, not a
     // per-future one -- every future on a client must agree, or the old_ver
     // chains they write interleave two incomparable clocks.

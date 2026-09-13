@@ -266,7 +266,31 @@ public:
             fmt::print("              snapshot violations: {}{}\n",
                        rstats.snapshot_violations,
                        rstats.snapshot_violations == 0 ? " (none)" : "  *** ");
+            if (rstats.batches != 0) {
+                // What the batched walk actually bought, in the only terms
+                // that settle it: nodes fetched in parallel per batch, against
+                // the serial detours it could not avoid. A fallback rate near
+                // the orphan rate means the index bought little.
+                fmt::print("              batched walk: {} batches, {} nodes/batch, "
+                           "{} fallbacks, {} misses, {} orphan detours\n",
+                           rstats.batches,
+                           rstats.batches == 0
+                               ? 0.0
+                               : static_cast<double>(rstats.nodes_walked) /
+                                     static_cast<double>(rstats.batches),
+                           rstats.batch_fallbacks, rstats.batch_misses,
+                           rstats.orphans_walked);
+            }
         }
+        // Orphans decide whether an index-batched range walk is sound: a
+        // capacity split produces a node with NO PARENT, reachable only along
+        // the next_id chain, so a walk that took its node list from the index
+        // alone would silently skip one. Counted here because the design
+        // question is "do these occur in practice", not "can they".
+        fmt::print("splits:       {} height-driven, {} capacity (ORPHANS), "
+                   "{} boundary no-ops\n",
+                   wstats.splits, wstats.capacity_splits,
+                   wstats.boundary_noops);
         fmt::print("writes:       {} published, {} cas lost, {} retries, "
                    "{} retry-budget exhausted\n",
                    wstats.published, wstats.cas_lost, wstats.retries,

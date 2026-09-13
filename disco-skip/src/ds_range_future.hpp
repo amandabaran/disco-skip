@@ -50,6 +50,10 @@ enum class RangeStep : uint8_t {
   AwaitVec,       ///< that header did not carry its vector
   AwaitSettle,    ///< helping a pending or mid-split node
   AwaitOldVer,    ///< chasing old_ver back towards the snapshot
+  AwaitIdxHeader, ///< batched walk: reading the level-0 index node
+  AwaitIdxVec,    ///< batched walk: its vector, which names the backbone
+  AwaitBatchHdrs, ///< batched walk: K data-node headers in one round trip
+  AwaitBatchVecs, ///< batched walk: their vectors, likewise
   Done,
 };
 
@@ -57,8 +61,10 @@ enum class RangeStep : uint8_t {
 template <class Ops>
 class RangeOperation {
  public:
-  RangeOperation(Ops &ops, uint32_t layers, RangeStats &stats)
-      : ops_(ops), layers_(layers), stats_(stats), trav_(ops) {}
+  RangeOperation(Ops &ops, uint32_t layers, RangeStats &stats,
+                 bool batched_walk = false)
+      : ops_(ops), layers_(layers), stats_(stats), trav_(ops),
+        batched_(batched_walk) {}
 
   /// @return completions to await before the first step()
   size_t start(Key lo, Key hi, size_t cap, std::vector<Entry> &out) {
@@ -98,6 +104,10 @@ class RangeOperation {
       case RangeStep::AwaitVec:      return onVec();
       case RangeStep::AwaitSettle:   return onSettle();
       case RangeStep::AwaitOldVer:   return onOldVer();
+      case RangeStep::AwaitIdxHeader: return onIdxHeader();
+      case RangeStep::AwaitIdxVec:    return onIdxVec();
+      case RangeStep::AwaitBatchHdrs: return onBatchHdrs();
+      case RangeStep::AwaitBatchVecs: return onBatchVecs();
       case RangeStep::Idle:
       case RangeStep::Done:
         break;
@@ -117,6 +127,13 @@ class RangeOperation {
     res_ = RangeResult{};
     hops_ = 0;
     settle_tries_ = 0;
+    bone_n_ = bone_ok_ = bone_i_ = 0;
+    batch_resume_ = kNoResume;
+    orphan_until_ = RemoteAddr{};
+    tail_succ_ = RemoteAddr{};
+    bone_pending_ = false;
+    idx_i_ = 0;
+    idx_past_hi_ = false;
     ++stats_.ranges;
   }
 
@@ -156,7 +173,218 @@ class RangeOperation {
       return done(r.status == TraversalStatus::Miss);
     }
     cur_ = r.data_addr;
+    if (batched_ && r.levels > 0) {
+      // path_[0] is the level-0 INDEX node covering lo, already located by the
+      // traversal we just paid for. Its entries name up to kNodeCapacity
+      // consecutive data nodes, which is what makes a batched fetch possible at
+      // all -- their addresses are known without reading them.
+      idx_addr_ = path_[0].addr;
+      return postIdxHeader();
+    }
     return postHeader();
+  }
+
+  // ── The batched walk ──────────────────────────────────────────────────────
+  //
+  // Backbone from the index, fetched K at a time; orphans picked up from the
+  // next_id chain. See the note on postWalkHeaders in ds_rdma_async.hpp for why
+  // the index breaks the round-trip dependency, and RangeStats::orphans_walked
+  // for why the chain still has to be checked.
+
+  size_t postIdxHeader() {
+    step_ = RangeStep::AwaitIdxHeader;
+    return ops_.postHeaders(idx_addr_, ops_.guess(idx_addr_));
+  }
+
+  size_t onIdxHeader() {
+    bool have = false;
+    if (!ops_.resolveHeaders(idx_addr_, idx_node_, have, idx_vec_)) {
+      // The index is contended. Fall back rather than spin: the serial walk
+      // reaches the same answer, only slower, and correctness is not on the
+      // line here.
+      ++stats_.batch_fallbacks;
+      batched_ = false;
+      return postHeader();
+    }
+    ++stats_.nodes_read;
+    if (have) { ++stats_.vec_reads; return useIndex(); }
+    step_ = RangeStep::AwaitIdxVec;
+    return ops_.postVec(idx_node_.handle.offset());
+  }
+
+  size_t onIdxVec() {
+    if (!ops_.resolveVec(idx_vec_)) return done(false);
+    ++stats_.vec_reads;
+    return useIndex();
+  }
+
+  /// A fresh index node: position the cursor and take the first backbone.
+  size_t useIndex() {
+    int const first = findLte(idx_vec_, lo_);
+    idx_i_ = first < 0 ? 0 : static_cast<uint32_t>(first);
+    // The next index node, captured now for the same reason the data walk
+    // captures next_: the vector is about to be reused.
+    idx_next_ = nextNode(idx_node_, idx_vec_);
+    return fillBackbone();
+  }
+
+  /// Take up to K data-node addresses out of the index vector, continuing from
+  /// wherever the last batch stopped.
+  ///
+  /// One index node names more data nodes than one batch can carry, so a
+  /// backbone that stops because it hit the fanout is NOT a finished index
+  /// node -- it is refilled from the same vector. Conflating the two truncated
+  /// every range at exactly K nodes; the differential test against the serial
+  /// walk is what caught it.
+  size_t fillBackbone() {
+    bone_n_ = 0;
+    for (; idx_i_ < idx_vec_.size && bone_n_ < Ops::walkFanout(); ++idx_i_) {
+      if (idx_vec_.e[idx_i_].key > hi_) { idx_past_hi_ = true; break; }
+      bone_[bone_n_++] = RemoteAddr{idx_vec_.e[idx_i_].val};
+    }
+    if (bone_n_ == 0) return nextIndexNode();
+
+    // THE TAIL CHECK. The last node of the previous backbone had no bone_[i+1]
+    // to compare its successor against, so the judgement was deferred to here,
+    // where the next backbone's first address is finally known. Guessing null
+    // for it instead sent every batch down a bogus orphan detour and truncated
+    // the range at one node.
+    if (!tail_succ_.isNull() && tail_succ_ != bone_[0]) {
+      ++stats_.orphans_walked;
+      cur_ = tail_succ_;
+      tail_succ_ = RemoteAddr{};
+      orphan_until_ = bone_[0];
+      batch_resume_ = 0;
+      bone_pending_ = true;   // addresses chosen, not yet fetched
+      return postHeader();
+    }
+    tail_succ_ = RemoteAddr{};
+    return postBackbone();
+  }
+
+  size_t postBackbone() {
+    bone_pending_ = false;
+    ++stats_.batches;
+    step_ = RangeStep::AwaitBatchHdrs;
+    return ops_.postWalkHeaders(bone_, bone_n_);
+  }
+
+  /// This index vector is spent. Step right along level 0 of the index, unless
+  /// its keys have already passed hi.
+  size_t nextIndexNode() {
+    if (!idx_past_hi_ && idx_i_ >= idx_vec_.size && !idx_next_.isNull()) {
+      idx_addr_ = idx_next_;
+      return postIdxHeader();
+    }
+    // The index has run out but the last node still had a successor -- nodes
+    // past the end of the index, or an orphan chain. The serial walk finishes
+    // the range; it stops on its own at hi.
+    if (!tail_succ_.isNull()) {
+      batched_ = false;
+      cur_ = tail_succ_;
+      tail_succ_ = RemoteAddr{};
+      return postHeader();
+    }
+    return done(true);
+  }
+
+  size_t onBatchHdrs() {
+    // Resolve every node's quorum, collecting the vector offsets to fetch.
+    bone_ok_ = 0;
+    for (size_t i = 0; i < bone_n_; ++i) {
+      size_t winner = 0;
+      if (!ops_.resolveWalkHeader(i, bone_node_[i], winner)) {
+        // One contended node. Everything before it is still good; walk the rest
+        // serially from here rather than discarding the batch.
+        ++stats_.batch_fallbacks;
+        break;
+      }
+      bone_win_[bone_ok_] = winner;
+      bone_off_[bone_ok_] = bone_node_[i].handle.offset();
+      ++bone_ok_;
+    }
+    if (bone_ok_ == 0) {
+      batched_ = false;
+      return postHeader();
+    }
+    step_ = RangeStep::AwaitBatchVecs;
+    return ops_.postWalkVecs(bone_off_, bone_win_, bone_ok_);
+  }
+
+  size_t onBatchVecs() {
+    bone_i_ = 0;
+    return drainBatch();
+  }
+
+  /// Walk the fetched nodes in key order, collecting entries.
+  ///
+  /// Anything the batch cannot answer -- a pending or mid-split node, a version
+  /// newer than the snapshot, or an ORPHAN sitting between two backbone nodes
+  /// -- hands off to the serial path for that node and resumes afterwards. The
+  /// orphan case is not rare: a capacity split produces a node with no parent,
+  /// and a workload-E run produced 2535 of them against 16783 height-driven
+  /// splits, so an index-only walk would drop roughly one node in eight.
+  size_t drainBatch() {
+    while (bone_i_ < bone_ok_) {
+      size_t const i = bone_i_;
+      NodeRecord const &nd = bone_node_[i];
+      VecRecord const &vc = ops_.walkVec(i);
+
+      if (nd.k_min > hi_) return done(true);
+
+      if (vc.isPending() || !nd.isStable() || vc.ts > res_.snapshot) {
+        // Not answerable from the batch. Resume the serial path at this node;
+        // it settles, walks old_ver, and continues from there.
+        ++stats_.batch_misses;
+        cur_ = bone_[i];
+        batch_resume_ = i + 1;
+        // The serial path walks this node; its successor still has to be
+        // checked for an orphan, exactly as the batched path would have.
+        orphan_until_ = (i + 1 < bone_ok_) ? bone_[i + 1] : RemoteAddr{};
+        return postHeader();
+      }
+
+      if (!versionIsWithin(vc, res_.snapshot)) {
+        ++stats_.snapshot_violations;
+        return done(false);
+      }
+      for (uint32_t e = 0; e < vc.size; ++e) {
+        Key const k = vc.e[e].key;
+        if (k < lo_) continue;
+        if (k > hi_) break;
+        if (out_->size() >= cap_) {
+          res_.capped = true;
+          ++stats_.capped;
+          return done(true);
+        }
+        out_->push_back(vc.e[e]);
+        ++stats_.entries;
+      }
+      ++stats_.nodes_walked;
+
+      // ORPHAN CHECK. The backbone comes from the index, which does not name
+      // capacity-split nodes. If this node's successor is not the next backbone
+      // node, an orphan chain sits between them and must be walked.
+      RemoteAddr const succ = nextNode(nd, vc);
+      ++bone_i_;
+      if (i + 1 >= bone_ok_) {
+        // Last node of the backbone: nothing to compare against yet. Defer to
+        // fillBackbone, which will know the next backbone's first address.
+        tail_succ_ = succ;
+        break;
+      }
+      RemoteAddr const expect = bone_[i + 1];
+      if (!succ.isNull() && succ != expect) {
+        ++stats_.orphans_walked;
+        cur_ = succ;
+        batch_resume_ = bone_i_;
+        orphan_until_ = expect;
+        return postHeader();
+      }
+    }
+    // Backbone done. Refill from this index vector if it has more, else step
+    // to the next index node, else finished -- fillBackbone decides which.
+    return fillBackbone();
   }
 
   size_t postHeader() {
@@ -317,6 +545,31 @@ class RangeOperation {
   }
 
   size_t stepRight() {
+    // A serial detour out of the batched walk ends here. Two ways back:
+    //   * an ORPHAN chain -- keep walking until we reach the backbone node the
+    //     index said comes next, then resume the batch after it;
+    //   * a settle or old_ver detour -- that one node is done, so resume at the
+    //     next backbone entry.
+    if (batch_resume_ != kNoResume) {
+      RemoteAddr const succ = nextNode(node_, vec_);
+      if (!orphan_until_.isNull()) {
+        if (succ != orphan_until_ && !succ.isNull()) {
+          cur_ = succ;            // still inside the orphan chain
+          ++stats_.orphans_walked;
+          return postHeader();
+        }
+        orphan_until_ = RemoteAddr{};
+      } else if (batch_resume_ >= bone_ok_) {
+        // A detour off the LAST backbone node: its successor is the tail the
+        // next fillBackbone has to validate.
+        tail_succ_ = succ;
+      }
+      bone_i_ = batch_resume_;
+      batch_resume_ = kNoResume;
+      if (bone_pending_) return postBackbone();
+      return drainBatch();
+    }
+
     // The CURRENT chain, from the header and vector we read before walking
     // back -- not from the as-of-T version, whose successor may since have
     // been split away. next_ was captured at that point for exactly this.
@@ -334,6 +587,28 @@ class RangeOperation {
   size_t cap_ = 0;
   std::vector<Entry> *out_ = nullptr;
   RangeResult res_{};
+
+  static constexpr size_t kNoResume = ~size_t{0};
+
+  bool batched_ = false;
+  RemoteAddr idx_addr_{};
+  RemoteAddr idx_next_{};
+  NodeRecord idx_node_{};
+  VecRecord idx_vec_{};
+  uint32_t idx_i_ = 0;
+  bool idx_past_hi_ = false;
+  /// The backbone: the data nodes the level-0 index names, in key order.
+  RemoteAddr bone_[Ops::walkFanout()]{};
+  NodeRecord bone_node_[Ops::walkFanout()]{};
+  VecOffset bone_off_[Ops::walkFanout()]{};
+  size_t bone_win_[Ops::walkFanout()]{};
+  size_t bone_n_ = 0;    ///< named by the index
+  size_t bone_ok_ = 0;   ///< of those, whose headers resolved to a majority
+  size_t bone_i_ = 0;    ///< cursor while draining
+  size_t batch_resume_ = kNoResume;
+  RemoteAddr orphan_until_{};
+  RemoteAddr tail_succ_{};
+  bool bone_pending_ = false;
 
   RangeStep step_ = RangeStep::Idle;
   RemoteAddr cur_{};

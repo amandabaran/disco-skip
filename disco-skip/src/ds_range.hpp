@@ -130,6 +130,17 @@ struct RangeStats {
   /// range is failed rather than returned, because a silently wrong range is
   /// the exact failure mode A10 exists to rule out.
   uint64_t snapshot_violations = 0;
+
+  /// A10 batched walk (ds_range_future.hpp). Zero on the serial path.
+  uint64_t batches = 0;          ///< index-driven fetches of up to K nodes
+  uint64_t batch_fallbacks = 0;  ///< a contended index or node sent us serial
+  uint64_t batch_misses = 0;     ///< node needed settling or an old_ver walk
+  /// Nodes reached by the next_id chain that the INDEX DOES NOT NAME. Capacity
+  /// splits produce parentless nodes -- 2535 against 16783 height-driven splits
+  /// on a measured workload-E run -- so a walk taking its node list from the
+  /// index alone would drop roughly one node in eight. This counter is the
+  /// evidence that the chain check is doing something.
+  uint64_t orphans_walked = 0;
 };
 
 struct RangeResult {

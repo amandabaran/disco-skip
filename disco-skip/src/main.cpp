@@ -330,6 +330,7 @@ int main(int argc, char** argv) {
     layout.nodes_per_client  = 1 << 16;
     layout.vecs_per_client   = 1 << 18;
     layout.offset_hint       = true;
+    layout.batched_walk      = false;
     layout.consult_cache     = DS_CACHE_ENABLED ? true : false;
     layout.writeback         = DS_REG_WRITEBACK_ENABLED ? true : false;
     layout.ts_mode           = ds::TsMode::Clock;
@@ -391,6 +392,13 @@ int main(int argc, char** argv) {
                 "batch instead of two serialised reads (1 or 0). Saves a round "
                 "trip when right, wastes a vector read when wrong, so it "
                 "favours read-heavy workloads.") |
+        lyra::opt(layout.batched_walk, "batched_walk")
+            .optional()["--batched-walk"](
+                "Take a range's backbone from a level-0 index node and fetch "
+                "up to 16 data nodes per round trip instead of one (1 or 0, "
+                "default 0). Orphaned nodes still cost a serial detour, and "
+                "short ranges pay for the index read, so it favours long "
+                "scans.") |
         lyra::opt(rq_p,  "rq_p" ).optional()["--rq"] |
         lyra::opt(get_p, "get_p").optional()["--get"] |
         lyra::opt(put_p, "put_p").optional()["--put"] |
@@ -542,6 +550,8 @@ int main(int argc, char** argv) {
         std::cout << "timestamps:   " << ds::tsModeName(layout.ts_mode)
                   << std::endl;
         std::cout << "cache:        " << (layout.consult_cache ? "on" : "off")
+                  << "  batched-walk: "
+                  << (layout.batched_walk ? "on" : "off") << "\n"
                   << "  offset-hint: " << (layout.offset_hint ? "on" : "off")
                   << "  async: " << layout.async_parallelism
                   << "  maxrange: " << layout.max_range

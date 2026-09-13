@@ -137,6 +137,67 @@ class FakeAsyncOps {
     return true;
   }
 
+  // ── A10's batched range walk ─────────────────────────────────────────────
+  //
+  // Applied immediately, as everything here is. What this models faithfully is
+  // WHICH nodes the walk asks for and in what order -- which is where the
+  // batching logic can be wrong -- not the round-trip saving, which is the
+  // point of the real one and has no analogue in a fake with no latency.
+
+  static constexpr size_t kFanout = 16;
+  static constexpr size_t walkFanout() { return kFanout; }
+
+  size_t postWalkHeaders(ds::RemoteAddr const *addrs, size_t n) {
+    walk_n_ = n;
+    for (size_t i = 0; i < n; ++i) {
+      walk_addr_[i] = addrs[i];
+      // No speculation on the batched path: the index gave us the node
+      // addresses but not their vector offsets, so there is nothing to guess.
+      // readNodeAll writes through spec_ok unconditionally, so it gets a real
+      // one rather than a null.
+      ds::VecRecord spec{};
+      bool spec_ok = false;
+      set_.readNodeAll(addrs[i], walk_seen_[i], walk_ok_[i], ds::kNullVec,
+                       &spec, &spec_ok);
+    }
+    ++posts_;
+    return n * set_.replicas();
+  }
+
+  bool resolveWalkHeader(size_t i, ds::NodeRecord &node, size_t &winner) {
+    size_t const n = set_.replicas();
+    size_t best = n;
+    uint64_t best_tag = 0;
+    for (size_t r = 0; r < n; ++r) {
+      if (!walk_ok_[i][r]) continue;
+      size_t votes = 0;
+      for (size_t q = 0; q < n; ++q) {
+        if (walk_ok_[i][q] && walk_seen_[i][q].handle == walk_seen_[i][r].handle) {
+          ++votes;
+        }
+      }
+      if (votes < majority()) continue;
+      uint64_t const tag = walk_seen_[i][r].handle.tag();
+      if (best == n || tag > best_tag) { best = r; best_tag = tag; }
+    }
+    if (best == n) return false;
+    node = walk_seen_[i][best];
+    winner = best;
+    return true;
+  }
+
+  size_t postWalkVecs(ds::VecOffset const *offs, size_t const *winners,
+                      size_t n) {
+    walk_n_ = n;
+    for (size_t i = 0; i < n; ++i) {
+      set_.readVecFrom(winners[i], offs[i], walk_vec_[i]);
+    }
+    ++posts_;
+    return n;
+  }
+
+  ds::VecRecord const &walkVec(size_t i) const { return walk_vec_[i]; }
+
   /// Snapshot acquisition: READ the replicated counter, never FAA it.
   ///
   /// One round trip on the wire (one read per replica, all posted before any is
@@ -229,6 +290,11 @@ class FakeAsyncOps {
   ds::BatchResult last_batch_{};
   uint64_t steal_commits_ = 0;
   uint64_t ts_counter_seen_ = 0;
+  size_t walk_n_ = 0;
+  ds::RemoteAddr walk_addr_[kFanout]{};
+  ds::NodeRecord walk_seen_[kFanout][8]{};
+  bool walk_ok_[kFanout][8]{};
+  ds::VecRecord walk_vec_[kFanout]{};
   uint64_t repair_desired_ = 0;
   size_t repair_landed_ = 0;
   uint64_t posts_ = 0;

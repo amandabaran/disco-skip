@@ -190,6 +190,110 @@ class RdmaAsyncOps {
 
   // ── A vector read, from a replica that voted with the winner (L4) ────────
 
+  /// ── A10: the batched range walk ────────────────────────────────────────
+  ///
+  /// Fetch up to Layout::kWalkFanout data nodes in ONE round trip instead of
+  /// one round trip each.
+  ///
+  /// WHY THIS EXISTS. A range walks data nodes left to right by chasing
+  /// next_id, and each hop is a round trip because the next address is not
+  /// known until the current node is read. Measured on workload E: 10.9 nodes
+  /// per range at scan length 100, rising to 26.2 at 255 -- so the walk cost
+  /// grows linearly with scan length and caps our throughput at ~0.41x of a
+  /// local LSM no matter how long the scan (measured 8 through 255; the ratio
+  /// plateaus).
+  ///
+  /// The index breaks the dependency. A level-0 index node's entries name up to
+  /// kNodeCapacity CONSECUTIVE data nodes, so their addresses are all known
+  /// after one vector read and can be fetched together. 26 serial round trips
+  /// become 2. A local LSM has no equivalent because it has no round trips to
+  /// remove.
+  ///
+  /// Headers are grouped BY NODE -- walkNodeBufs + i * replicas is node i's
+  /// replica set -- because a node read is a quorum read and the majority rule
+  /// applies per node over its own replicas.
+  size_t postWalkHeaders(RemoteAddr const *addrs, size_t n) {
+    size_t const r_count = conns_.size();
+    bumped_ = 0;
+    walk_n_ = n;
+    NodeRecord *const bufs = layout_.getWalkNodeBufs(future_id_);
+    size_t completions = 0;
+    for (size_t i = 0; i < n; ++i) {
+      walk_addr_[i] = addrs[i];
+      for (size_t r = 0; r < r_count; ++r) {
+        auto &rc = *conns_[r];
+        if (!rc.postSendSingle(dory::conn::ReliableConnection::RdmaRead,
+                               future_id_, &bufs[i * r_count + r],
+                               kNodeRecordBytes,
+                               Layout::nodeAddrOf(rc.remoteBuf(), addrs[i]))) {
+          throw std::runtime_error("failed to post a batched header read");
+        }
+        bump(r, 1);
+        ++completions;
+      }
+    }
+    stats_.node_reads += n;
+    stats_.replica_reads += completions;
+    return postedExactly(completions, "postWalkHeaders");
+  }
+
+  /// Resolve node /i/ of the batch. Same majority rule as resolveHeaders.
+  ///
+  /// @return false when no handle has majority support for that node -- the
+  ///         caller falls back to the one-at-a-time path for it rather than
+  ///         failing the whole batch, since the others are fine.
+  bool resolveWalkHeader(size_t i, NodeRecord &node, size_t &winner) {
+    size_t const n = conns_.size();
+    NodeRecord const *const hdrs =
+        layout_.getWalkNodeBufs(future_id_) + i * n;
+    size_t best = n;
+    uint64_t best_tag = 0;
+    for (size_t r = 0; r < n; ++r) {
+      size_t votes = 0;
+      for (size_t q = 0; q < n; ++q) {
+        if (hdrs[q].handle == hdrs[r].handle) ++votes;
+      }
+      if (votes < majority()) continue;
+      uint64_t const tag = hdrs[r].handle.tag();
+      if (best == n || tag > best_tag) { best = r; best_tag = tag; }
+    }
+    if (best == n) {
+      ++stats_.read_retries;
+      return false;
+    }
+    node = hdrs[best];
+    winner = best;
+    return true;
+  }
+
+  /// Fetch the vectors for /n/ nodes in one round trip, each from the replica
+  /// that supplied its winning header (L4).
+  size_t postWalkVecs(VecOffset const *offs, size_t const *winners, size_t n) {
+    bumped_ = 0;
+    walk_n_ = n;
+    VecRecord *const bufs = layout_.getWalkVecBufs(future_id_);
+    size_t completions = 0;
+    for (size_t i = 0; i < n; ++i) {
+      auto &rc = *conns_[winners[i]];
+      if (!rc.postSendSingle(dory::conn::ReliableConnection::RdmaRead,
+                             future_id_, &bufs[i], kVecRecordBytes,
+                             layout_.vecAddrOf(rc.remoteBuf(), offs[i]))) {
+        throw std::runtime_error("failed to post a batched vector read");
+      }
+      bump(winners[i], 1);
+      ++completions;
+    }
+    stats_.vec_reads += n;
+    stats_.replica_reads += completions;
+    return postedExactly(completions, "postWalkVecs");
+  }
+
+  VecRecord const &walkVec(size_t i) const {
+    return layout_.getWalkVecBufs(future_id_)[i];
+  }
+
+  static constexpr size_t walkFanout() { return Layout::kWalkFanout; }
+
   /// ── Snapshot acquisition ───────────────────────────────────────────────
   ///
   /// READ the replicated counter on every replica; never fetch-and-add it. A
@@ -490,6 +594,8 @@ class RdmaAsyncOps {
   uint64_t client_idx_ = 0;
   size_t bumped_ = 0;  ///< completions queued by the post in progress
   VecOffset spec_pending_ = kNullVec;
+  size_t walk_n_ = 0;
+  RemoteAddr walk_addr_[Layout::kWalkFanout]{};
   uint64_t repair_desired_ = 0;
   RemoteAddr repair_addr_{};
   size_t repair_posted_ = 0;

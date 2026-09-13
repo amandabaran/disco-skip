@@ -187,8 +187,9 @@ static void checkEmptyAndInvertedRanges() {
 template <class Ops>
 static ds::RangeResult runAsyncRange(Ops &ops, ds::Key lo, ds::Key hi,
                                      size_t cap, ds::RangeStats &rs,
-                                     std::vector<ds::Entry> &out) {
-  ds::RangeOperation<Ops> r(ops, kLayers, rs);
+                                     std::vector<ds::Entry> &out,
+                                     bool batched = false) {
+  ds::RangeOperation<Ops> r(ops, kLayers, rs, batched);
   size_t await = r.start(lo, hi, cap, out);
   uint64_t guard = 0;
   while (!r.finished()) {
@@ -226,6 +227,7 @@ static void checkAsyncRangeAgreesWithTheBlockingOne() {
   }
 
   size_t compared = 0, entries = 0;
+  uint64_t batch_hits = 0, batch_backs = 0, orphans = 0;
   for (int trial = 0; trial < 30; ++trial) {
     ds::Key lo = static_cast<ds::Key>(rng() % 4000);
     ds::Key hi = static_cast<ds::Key>(rng() % 4000);
@@ -248,7 +250,18 @@ static void checkAsyncRangeAgreesWithTheBlockingOne() {
     ds::RangeResult const ares =
         runAsyncRange(aops, lo, hi, 1u << 20, ars, agot);
 
-    CHECK(bres.resolved && ares.resolved, "both paths resolve");
+    // The batched walk is the same state machine with --batched-walk on: it
+    // takes its backbone from a level-0 index node and fetches up to K data
+    // nodes at once. It is an OPTIMISATION, so it is not asserted correct on
+    // its own terms -- it is pinned to the serial path, which is pinned to the
+    // blocking one. Three implementations, one answer, or the build fails.
+    FakeAsyncOps bwops(set, qs, nullptr);
+    ds::RangeStats brs2;
+    std::vector<ds::Entry> bwgot;
+    ds::RangeResult const bwres =
+        runAsyncRange(bwops, lo, hi, 1u << 20, brs2, bwgot, /*batched=*/true);
+
+    CHECK(bres.resolved && ares.resolved && bwres.resolved, "all paths resolve");
     CHECK(bgot.size() == agot.size(), "both return the same number of entries");
     bool same = bgot.size() == agot.size();
     for (size_t i = 0; same && i < bgot.size(); ++i) {
@@ -261,11 +274,48 @@ static void checkAsyncRangeAgreesWithTheBlockingOne() {
                   static_cast<unsigned long long>(hi), bgot.size(), agot.size());
       break;
     }
+
+    bool bsame = bwgot.size() == agot.size();
+    for (size_t i = 0; bsame && i < agot.size(); ++i) {
+      if (bwgot[i].key != agot[i].key || bwgot[i].val != agot[i].val) {
+        bsame = false;
+      }
+    }
+    CHECK(bsame, "and the batched walk returns exactly what the serial one did");
+    if (!bsame) {
+      std::printf("  [%llu,%llu] serial %zu vs batched %zu\n",
+                  static_cast<unsigned long long>(lo),
+                  static_cast<unsigned long long>(hi), agot.size(),
+                  bwgot.size());
+      std::printf("    serial : nodes_walked=%llu vec_reads=%llu\n",
+                  (unsigned long long)ars.nodes_walked,
+                  (unsigned long long)ars.vec_reads);
+      std::printf("    batched: nodes_walked=%llu batches=%llu fallbacks=%llu"
+                  " misses=%llu orphans=%llu resolved=%d\n",
+                  (unsigned long long)brs2.nodes_walked,
+                  (unsigned long long)brs2.batches,
+                  (unsigned long long)brs2.batch_fallbacks,
+                  (unsigned long long)brs2.batch_misses,
+                  (unsigned long long)brs2.orphans_walked,
+                  (int)bwres.resolved);
+      break;
+    }
+    batch_hits += brs2.batches;
+    batch_backs += brs2.batch_fallbacks;
+    orphans += brs2.orphans_walked;
     ++compared;
     entries += agot.size();
   }
   std::printf("  differential: %zu ranges agree, %zu entries\n", compared,
               entries);
+  std::printf("  batched walk: %llu batches, %llu fallbacks, %llu orphans\n",
+              static_cast<unsigned long long>(batch_hits),
+              static_cast<unsigned long long>(batch_backs),
+              static_cast<unsigned long long>(orphans));
+  // A differential test that never took the path it is meant to cover passes
+  // for the wrong reason. If the index walk never fired, the two paths agree
+  // only because they were the same path.
+  CHECK(batch_hits > 0, "and the batched path actually ran");
 }
 
 static void checkAsyncSkipsANodeCreatedAfterTheSnapshot() {
@@ -330,6 +380,41 @@ static void checkAsyncSkipsANodeCreatedAfterTheSnapshot() {
     }
     CHECK(r.finished() && r.result().resolved,
           "the async path resolves at the old snapshot across the split");
+  }
+
+  // And the BATCHED walk, at that same old snapshot. This is the only place the
+  // batch-miss detour runs: the differential test's arena is quiescent, so no
+  // node there is ever newer than T or mid-split, and batch_misses stayed 0.
+  // Here the post-snapshot split makes a backbone node unanswerable from the
+  // batch, which must hand off to the serial path and resume -- not drop it.
+  FakeAsyncOps wops(set, qs, nullptr);
+  ds::RangeStats wrs;
+  std::vector<ds::Entry> wgot;
+  {
+    ds::RangeOperation<FakeAsyncOps> r(wops, kLayers, wrs, /*batched=*/true);
+    size_t await = r.startAt(0, 100, 1u << 20, before, wgot);
+    uint64_t guard = 0;
+    while (!r.finished()) {
+      (void)await;
+      await = r.step();
+      if (++guard > 200000) break;
+    }
+    CHECK(r.finished() && r.result().resolved,
+          "the batched path resolves at the old snapshot across the split");
+  }
+  CHECK(wrs.batches > 0, "the batched path actually ran here");
+  CHECK(wrs.batch_misses > 0,
+        "and the split node fell out of the batch to the serial walk");
+  bool wsame = wgot.size() == agot.size();
+  for (size_t i = 0; wsame && i < agot.size(); ++i) {
+    if (wgot[i].key != agot[i].key || wgot[i].val != agot[i].val) wsame = false;
+  }
+  CHECK(wsame, "and the batched walk agrees with the serial one across a split");
+  if (!wsame) {
+    std::printf("    serial %zu vs batched %zu (misses=%llu skipped=%llu)\n",
+                agot.size(), wgot.size(),
+                (unsigned long long)wrs.batch_misses,
+                (unsigned long long)wrs.nodes_skipped);
   }
 
   CHECK(bgot.size() == 9, "blocking: nine keys, none lost or duplicated");
