@@ -384,7 +384,7 @@ int main(int argc, char* argv[]) {
         layout,          ce,          proc_id,   pointer_cache_size,
         measure_batches, death_point, iter_count};
 
-    std::optional<RangeLock> range_lock;
+    std::optional<RangeLock<Layout>> range_lock;
     if (layout.lock_stripes > 0) {
       if (layout.async_parallelism != 1) {
         throw std::runtime_error(
@@ -398,7 +398,7 @@ int main(int argc, char* argv[]) {
           layout.lock_stripes);
       std::cout << "Range lock ON: " << layout.lock_stripes
                 << (layout.lock_stripes == 1 ? " stripe (global)" : " stripes")
-                << ", " << RangeLock::kKeysPerStripe << " keys each"
+                << ", " << RangeLock<Layout>::kKeysPerStripe << " keys each"
                 << std::endl;
     }
 

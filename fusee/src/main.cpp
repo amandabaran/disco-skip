@@ -1,7 +1,9 @@
 #include "layout.hpp"
+#include "range_lock.hpp"
 #include "client.hpp"
 #include "latency.hpp"
 #include <memory>
+#include <optional>
 #include "race/server_index.hpp"
 #include "race/client_index.hpp"
 
@@ -25,6 +27,22 @@ struct KvsOp {
   int scan_count;    // Used for SCAN
 };
 
+/// The numeric part of a YCSB key ("user0000123" -> 123).
+///
+/// MUST agree with IncrementYcsbKey, which is what a SCAN walks: the stripes a
+/// scan locks come from this, so if the two disagreed about key ordering the
+/// lock would be held and protect the wrong range. Byte-identical to the copy
+/// in swarm-kv/src/main.cpp for the same reason range_lock.hpp is shared --
+/// two competitor arms must lock the same way to be comparable.
+///
+/// strtoull, not stoll: with insertorder=hashed YCSB keys reach ~9.2e18, at the
+/// edge of a signed 64-bit integer.
+inline uint64_t ycsbKeyToInt(const std::string& key) {
+  size_t const digit = key.find_first_of("0123456789");
+  if (digit == std::string::npos) return 0;
+  return std::strtoull(key.c_str() + digit, nullptr, 10);
+}
+
 inline std::string IncrementYcsbKey(const std::string& key) {
     size_t non_digit = key.find_first_of("0123456789");
     if (non_digit == std::string::npos) return key + "0"; 
@@ -45,6 +63,9 @@ int main(int argc, char* argv[]) {
   Layout layout;
   layout.num_clients = 1;
 
+  // 0 = off: the unlocked baseline, whose SCAN is not linearizable. See
+  // range_lock.hpp.
+  layout.lock_stripes = 0;
   layout.num_keys = 100'000;
   layout.key_size = 24;
   layout.value_size = 64;
@@ -71,6 +92,12 @@ int main(int argc, char* argv[]) {
       lyra::opt(layout.proc_id, "proc_id")
           .required()["-i"]["-p"]["--id"]["--process"]
           .help("ID of this process.") |
+      lyra::opt(layout.lock_stripes, "lock_stripes")
+          .optional()["--lock-stripes"](
+              "Make SCAN linearizable by locking (0 = off, the default and the "
+              "non-linearizable baseline; 1 = one global lock; N = the key "
+              "space striped N ways). Writers take the lock too, which they "
+              "must for a scan to be linearizable at all.") |
       lyra::opt(layout.key_size, "key_size").optional()["-k"]["--keysize"] |
       lyra::opt(layout.value_size, "value_size")
           .optional()["-v"]["--valuesize"] |
@@ -236,6 +263,18 @@ int main(int argc, char* argv[]) {
 
     // TODO(zyf): handle multiple servers
     auto client = Client(layout, local_region, ce, layout.num_servers);
+
+    std::optional<RangeLock<Layout>> range_lock;
+    if (layout.lock_stripes > 0) {
+      range_lock.emplace(
+          layout, ce.connections().at(1), static_cast<uint64_t>(layout.proc_id),
+          reinterpret_cast<uint64_t*>(layout.getLockScratchAddress(local_region)),
+          layout.lock_stripes);
+      std::cout << "Range lock ON: " << layout.lock_stripes
+                << (layout.lock_stripes == 1 ? " stripe (global)" : " stripes")
+                << ", " << RangeLock<Layout>::kKeysPerStripe << " keys each"
+                << std::endl;
+    }
     auto pointer_cache = LRUCache<HashedKey, uint64_t>(pointer_cache_size);
 
     ProcId first_client = layout.num_servers + 1;
@@ -571,6 +610,22 @@ int main(int argc, char* argv[]) {
       };
 
       // Handle the distinct execution flows
+      // Taken at operation boundaries: casBlocking drains the send CQ, so it
+      // must not run with other RDMA outstanding. execute_point_op is
+      // synchronous here, so these points are quiescent.
+      //
+      // READ does not lock -- a single point read is already atomic, and making
+      // it lock would serialise the read-only workloads against nothing, which
+      // overstates the cost rather than measuring it.
+      if (range_lock) {
+        if (operation.type == OpType::SCAN) {
+          range_lock->acquireRange(ycsbKeyToInt(operation.key),
+                                   static_cast<uint64_t>(operation.scan_count));
+        } else if (operation.type == OpType::UPDATE) {
+          range_lock->acquireKey(ycsbKeyToInt(operation.key));
+        }
+      }
+
       if (operation.type == OpType::UPDATE) {
         execute_point_op(operation.key, OpType::UPDATE, operation.value);
       } 
@@ -584,6 +639,7 @@ int main(int argc, char* argv[]) {
           scan_key = IncrementYcsbKey(scan_key);
         }
       }
+      if (range_lock) range_lock->release();
       now = std::chrono::steady_clock::now();
     }
 
