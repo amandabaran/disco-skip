@@ -193,8 +193,25 @@ class RangeOperation {
   /// back. Asking from last_kmin+1 instead would be wrong for a key type where
   /// +1 is not the next possible key.
   size_t fillFromCache(Key from, bool after) {
-    size_t const max =
-        Ops::walkFanout() < kBoneMax ? Ops::walkFanout() : kBoneMax;
+    size_t max = Ops::walkFanout() < kBoneMax ? Ops::walkFanout() : kBoneMax;
+
+    // BOUND IT BY THE REMAINING ENTRY CAP, not only by hi.
+    //
+    // A YCSB scan is COUNT-bounded and OpScan passes hi = kUnboundedKey, so hi
+    // limits nothing: the cache returns its full width every time. Measured
+    // 15.9 addresses per backbone for a mean 50-key scan that needs ~4 nodes,
+    // and 178073 of 178074 ranges ended on the entry cap rather than on hi.
+    // The batch then reads ~4x the nodes it uses, and the cache walk measured
+    // 201 kops against the serial walk's 320 -- SLOWER, entirely from
+    // over-fetching.
+    //
+    // +1 node because the first contributes only its entries >= lo, so a cap
+    // of exactly one node's worth can still span two.
+    size_t const have = out_->size();
+    size_t const want = have >= cap_ ? 0 : cap_ - have;
+    size_t const need = (want + kNodeCapacity - 1) / kNodeCapacity + 1;
+    if (need < max) max = need;
+    if (max == 0) return 0;
     size_t n = cache_->locateDataRange(from, hi_, bone_kmin_, bone_, max);
 
     size_t first = 0;
