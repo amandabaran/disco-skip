@@ -701,6 +701,58 @@ public:
     }
   }
 
+  /// The remote addresses of up to /max/ consecutive data nodes covering keys
+  /// in [lo, hi], in key order, together with each node's k_min. Returns how
+  /// many were written; 0 is a miss and the caller must traverse remotely.
+  ///
+  /// WHY: a range query otherwise walks the remote next_id chain one node per
+  /// ROUND TRIP, each read depending on the previous one's result -- measured
+  /// at ~11 dependent round trips for a 100-key scan, which caps throughput
+  /// however many clients or queue pairs are added. Every address it needs is
+  /// already here, in a directory this cache maintains. Handing them over lets
+  /// the caller issue ONE batched read instead of a serial chain.
+  ///
+  /// ONE DIRECTORY PER CALL, on purpose. A range spanning two directories would
+  /// need two validated reads, and a split between them would invalidate the
+  /// first -- so rather than hold locks or restart a partial answer, this
+  /// returns what a single directory validates and the caller calls again from
+  /// the next key. That keeps the optimistic protocol below exactly the one
+  /// locate_data() uses: descend, read into locals, confirm, retry on failure.
+  ///
+  /// k_min is returned alongside the address because the caller needs it for
+  /// two things it cannot otherwise do without an RDMA: stop at hi, and check
+  /// each fetched node against what the cache claimed, so a stale entry is
+  /// detected rather than silently walked.
+  ///
+  /// The addresses may be STALE OR NULL. A null address means this local node
+  /// has no known remote counterpart (see node_t::remote_addr) and the caller
+  /// must treat it as a miss for that entry.
+  size_t locate_data_range(K const &lo, K const &hi, K *out_kmin,
+                           REMOTE_ADDR *out_addr, size_t max) {
+    if (max == 0)
+      return 0;
+    init_context(); // hazard pointers
+
+    while (true) {
+      uint64_t curr_lock = 0;
+      directory_t *curr_dl = descend_to_directory(curr_lock, lo);
+
+      // Optimistic, exactly as in locate_data(): read into the caller's
+      // buffers, then confirm. copy_from_lte() is const and never stores, so
+      // a racing writer costs a retry rather than a corrupted vector -- which
+      // is why range() is not used here, since it writes each value back.
+      size_t const n =
+          curr_dl->v.copy_from_lte(lo, hi, out_kmin, out_addr, max);
+
+      bool const ok = curr_dl->lock.confirm_read(curr_lock);
+      HP::drop_curr();
+      if (ok)
+        return n;
+      // Failed validation: the caller's buffers hold values that may be torn,
+      // and are overwritten by the next attempt before anything reads them.
+    }
+  }
+
   /// One level of what a remote descent saw: the node covering the sought key
   /// at that level, and its remote address. The orchestrator already holds this
   /// for every level it descended through -- with passive memory servers the

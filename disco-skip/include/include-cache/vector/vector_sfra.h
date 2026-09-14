@@ -537,6 +537,65 @@ public:
   /// Apply a function f() to all key/value pairs in the intersection of this
   /// vector and the given range [from, to].
   /// Returns true if end of range is reached, false otherwise.
+  /// Copy up to /max/ entries in key order into caller buffers, starting at the
+  /// GREATEST key <= /from/ and continuing while key <= /to/. Returns how many
+  /// were written.
+  ///
+  /// WHY THIS EXISTS ALONGSIDE range(). Two differences, both load-bearing for
+  /// an optimistic reader:
+  ///
+  ///  1. IT NEVER WRITES. range() ends each iteration with
+  ///     `list[i].val.store(v)`, to publish whatever f() did to the value.
+  ///     That is correct for its callers, which hold the node's write lock --
+  ///     skipvector::range() acquires it before descending in. It is NOT safe
+  ///     from a seqlock reader: a concurrent insert shifts entries, and a
+  ///     store-back would then land in a slot now holding a different entry.
+  ///     This method only loads, so a racing writer costs a failed
+  ///     confirm_read() and a retry rather than corruption.
+  ///
+  ///  2. IT STARTS AT find_lte, NOT AT from. range() skips every entry with
+  ///     key < from. In a directory vector the entries are (k_min -> address)
+  ///     of remote nodes, so the node CONTAINING /from/ is the one whose k_min
+  ///     is the greatest key <= from -- exactly the entry range() skips. A
+  ///     range walk that began at the first k_min >= from would omit the node
+  ///     holding its own start key.
+  ///
+  /// const, and deliberately so: it is the property the caller depends on.
+  size_t copy_from_lte(K const &from, K const &to, K *out_k, V *out_v,
+                       size_t max) const {
+    if (max == 0)
+      return 0;
+
+    size_t const n = size;   // one relaxed load; the seqlock validates it
+
+    // The entry to start at: the greatest key <= from. The vector is sorted
+    // (SFRA), so this is the last index whose key <= from.
+    size_t start = n;
+    for (size_t i = 0; i < n; ++i) {
+      if (list[i].key <= from)
+        start = i;
+      else
+        break;             // sorted, so nothing further can qualify
+    }
+    // No entry <= from: fall back to the first entry at or after it, so a
+    // caller asking below the vector's minimum still gets the nodes it needs.
+    if (start == n) {
+      if (n == 0 || list[0].key > to)
+        return 0;
+      start = 0;
+    }
+
+    size_t out = 0;
+    for (size_t i = start; i < n && out < max; ++i) {
+      if (i != start && list[i].key > to)
+        break;             // past the end of the range
+      out_k[out] = list[i].key;
+      out_v[out] = list[i].val.load();
+      ++out;
+    }
+    return out;
+  }
+
   bool range(K const &from, K const &to,
              std::function<void(const K &, V &, bool &)> f, bool &exit_flag) {
 

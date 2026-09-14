@@ -258,6 +258,24 @@ class CacheAdapter {
     return sv_.locate_data(k);
   }
 
+  /// Up to /max/ consecutive data-node addresses covering [lo, hi], in key
+  /// order, with each node's k_min. Returns how many were written; 0 is a miss.
+  ///
+  /// The point of it: a range otherwise walks next_id one node per DEPENDENT
+  /// round trip (~11 for a 100-key scan), which caps throughput regardless of
+  /// clients. These addresses are already local, so the caller can issue one
+  /// batched read instead of a serial chain.
+  ///
+  /// ONE DIRECTORY PER CALL -- see locate_data_range in skipvector_disco.h.
+  /// A short return is normal, not an error: call again from the last k_min
+  /// returned to continue. The addresses may be stale or null, and the caller
+  /// must validate each fetched node's k_min against out_kmin.
+  [[nodiscard]] size_t locateDataRange(Key lo, Key hi, Key *out_kmin,
+                                       RemoteAddr *out_addr, size_t max) {
+    if (!consult_) return 0;   // a miss, so the caller walks serially
+    return sv_.locate_data_range(lo, hi, out_kmin, out_addr, max);
+  }
+
   void reconcile(Key data_k_min, RemoteAddr data_addr, PathStep const *path,
                  uint32_t levels) {
     if (!consult_) return;

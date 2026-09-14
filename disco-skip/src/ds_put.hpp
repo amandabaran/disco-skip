@@ -241,6 +241,14 @@ class Putter {
 struct NullPutCache {
   void mirrorInsert(Key, uint32_t, RemoteAddr,
                     std::array<RemoteAddr, kMaxLayers> const &) {}
+  /// Always a miss, so a range given this cache walks serially. Present so the
+  /// no-cache arm compiles against the same surface as the real adapter -- a
+  /// range path that only compiles with a cache would silently make the
+  /// no-cache baseline unbuildable.
+  [[nodiscard]] size_t locateDataRange(Key, Key, Key *, RemoteAddr *,
+                                       size_t) const {
+    return 0;
+  }
 };
 
 }  // namespace ds

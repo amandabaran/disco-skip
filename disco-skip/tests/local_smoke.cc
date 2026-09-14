@@ -462,6 +462,83 @@ static void checkReconcilePath() {
     CHECK(sv.locate_data(k) == want, "gap key resolves to its predecessor");
   }
 
+  // ── locate_data_range: the batched-walk lookup ──────────────────────────
+  //
+  // A range otherwise walks next_id one node per DEPENDENT round trip, which
+  // caps throughput however many clients are added. locate_data_range hands
+  // back the addresses locally so the caller can issue one batched read. This
+  // pins it to locate_data, the path that is already trusted.
+  //
+  // THE PROPERTY IS "PREFIX", NOT "EQUAL". The lookup validates one directory
+  // per call, so a short return is correct rather than a failure -- the caller
+  // is expected to call again from the last k_min. Asserting equality would
+  // fail on a legitimate answer; asserting nothing about the order or the
+  // contents would pass on a useless one.
+  {
+    size_t constexpr kMax = 32;
+    ds::Key kmins[kMax];
+    ds::RemoteAddr addrs[kMax];
+    size_t calls = 0, total_returned = 0, empty = 0;
+    size_t longest = 0;
+
+    for (int i = 0; i < 2000; ++i) {
+      ds::Key const lo = key_dist(rng);
+      ds::Key const hi = lo + 20000;
+
+      size_t const n = sv.locate_data_range(lo, hi, kmins, addrs, kMax);
+      ++calls;
+      CHECK(n <= kMax, "locate_data_range respects max");
+      if (n == 0) { ++empty; continue; }
+      total_returned += n;
+      if (n > longest) longest = n;
+
+      // Ascending and duplicate-free: the caller walks these in order and a
+      // repeat would read one node twice while skipping another.
+      for (size_t j = 1; j < n; ++j) {
+        CHECK(kmins[j - 1] < kmins[j],
+              "locate_data_range returns strictly ascending k_min");
+      }
+
+      // The first entry must COVER lo -- the node containing lo is the one
+      // whose k_min is the greatest key <= lo. Starting at the first k_min
+      // >= lo instead would omit the node holding the range's own start key.
+      auto after_lo = oracle.upper_bound(lo);
+      if (after_lo != oracle.begin()) {
+        CHECK(kmins[0] <= lo, "the first node returned covers lo");
+      }
+
+      // Every (k_min, addr) must agree with locate_data, and be the oracle's
+      // successive entries from that point -- i.e. a prefix, no node skipped.
+      auto it = oracle.find(kmins[0]);
+      CHECK(it != oracle.end(), "the first k_min is a real boundary");
+      if (it == oracle.end()) break;
+      bool prefix_ok = true;
+      for (size_t j = 0; j < n; ++j) {
+        if (it == oracle.end() || it->first != kmins[j] ||
+            it->second != addrs[j]) {
+          prefix_ok = false;
+          break;
+        }
+        CHECK(sv.locate_data(kmins[j]) == addrs[j],
+              "and agrees with locate_data for that k_min");
+        ++it;
+      }
+      CHECK(prefix_ok,
+            "locate_data_range returns a contiguous prefix of the oracle");
+      if (!prefix_ok) break;
+
+      for (size_t j = 0; j < n; ++j) {
+        CHECK(kmins[j] <= hi || j == 0, "no node past hi except the coverer");
+      }
+    }
+
+    std::printf("  locate_data_range: %zu calls, %zu addrs, longest run %zu, "
+                "%zu empty\n", calls, total_returned, longest, empty);
+    // A lookup that always returned nothing would pass every check above.
+    CHECK(total_returned > 0, "and it actually returned addresses");
+    CHECK(longest > 1, "and returned more than one node per call at least once");
+  }
+
   // The fidelity property: the cache must not have invented a boundary.
   size_t const invented =
       countInventedBoundaries(sv, layers, known_boundaries);
