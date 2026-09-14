@@ -147,6 +147,22 @@ struct RangeStats {
   /// index alone would drop roughly one node in eight. This counter is the
   /// evidence that the chain check is doing something.
   uint64_t orphans_walked = 0;
+
+  // ── The cache-sourced backbone (--cache-walk) ────────────────────────────
+  //
+  // Same batched fetch as above, but the addresses come from the LOCAL cache
+  // instead of a remote index node. That removes the last round trip from the
+  // dependency chain: the index-sourced version still had to read the index
+  // node before it knew what to fetch, and it also could not see
+  // capacity-split orphans, which the cache's directories do hold.
+  uint64_t cache_backbones = 0;   ///< ranges that got a backbone from the cache
+  uint64_t cache_addrs = 0;       ///< addresses it supplied, in total
+  uint64_t cache_misses = 0;      ///< lookups that returned nothing (traversed)
+  /// A cache address whose fetched node did NOT have the k_min the cache
+  /// claimed. The structure moved under us, so the backbone is abandoned and
+  /// the rest of the range walks the next_id chain -- which cannot skip a node.
+  /// A wrong answer here would be silent, so it is counted, not assumed absent.
+  uint64_t cache_stale = 0;
 };
 
 struct RangeResult {

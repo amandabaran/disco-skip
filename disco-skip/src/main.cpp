@@ -331,6 +331,7 @@ int main(int argc, char** argv) {
     layout.vecs_per_client   = 1 << 18;
     layout.offset_hint       = true;
     layout.batched_walk      = false;
+    layout.cache_walk        = false;
     layout.consult_cache     = DS_CACHE_ENABLED ? true : false;
     layout.writeback         = DS_REG_WRITEBACK_ENABLED ? true : false;
     layout.ts_mode           = ds::TsMode::Clock;
@@ -392,6 +393,14 @@ int main(int argc, char** argv) {
                 "batch instead of two serialised reads (1 or 0). Saves a round "
                 "trip when right, wastes a vector read when wrong, so it "
                 "favours read-heavy workloads.") |
+        lyra::opt(layout.cache_walk, "cache_walk")
+            .optional()["--cache-walk"](
+                "Take a range's backbone from the LOCAL CACHE instead of the "
+                "next_id chain, so the data-node addresses cost no round trip "
+                "and their vectors are fetched in one batch (1 or 0, default "
+                "0). Needs the cache compiled in and consulted. Unlike "
+                "--batched-walk it also sees capacity-split orphans, which a "
+                "remote index node does not name.") |
         lyra::opt(layout.batched_walk, "batched_walk")
             .optional()["--batched-walk"](
                 "Take a range's backbone from a level-0 index node and fetch "
@@ -522,6 +531,18 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // A cache walk with no cache to walk is a user error, not a silent no-op.
+    // It would run, fall back to the serial walk on every range, and report a
+    // number labelled --cache-walk that measures the thing --cache-walk exists
+    // to replace.
+    if (layout.cache_walk && (!DS_CACHE_ENABLED || !layout.consult_cache)) {
+        std::cerr << "--cache-walk 1 requires DS_CACHE_ENABLED=1 and --cache 1: "
+                     "the backbone comes from the cache, so without one every "
+                     "range silently falls back to the serial walk"
+                  << std::endl;
+        return 1;
+    }
+
     if(run_ml_workload){
         layout.max_range = layout.num_clients; 
     }
@@ -550,6 +571,8 @@ int main(int argc, char** argv) {
         std::cout << "timestamps:   " << ds::tsModeName(layout.ts_mode)
                   << std::endl;
         std::cout << "cache:        " << (layout.consult_cache ? "on" : "off")
+                  << "  cache-walk: " << (layout.cache_walk ? "on" : "off")
+                  << "\n"
                   << "  batched-walk: "
                   << (layout.batched_walk ? "on" : "off") << "\n"
                   << "  offset-hint: " << (layout.offset_hint ? "on" : "off")

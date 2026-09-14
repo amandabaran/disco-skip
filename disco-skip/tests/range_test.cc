@@ -19,6 +19,9 @@
 #include <random>
 #include <vector>
 
+// For the cache-sourced backbone: a real SkipVec mirroring the fake arena.
+#include "ds_cache.hpp"
+
 #include "ds_put.hpp"
 #include "ds_range.hpp"
 #include "ds_verify.hpp"
@@ -200,6 +203,115 @@ static ds::RangeResult runAsyncRange(Ops &ops, ds::Key lo, ds::Key hi,
   return r.result();
 }
 
+/// Drive the CACHE-sourced walk to completion.
+template <class Ops, class Cache>
+static ds::RangeResult runCacheRange(Ops &ops, Cache &cache, ds::Key lo,
+                                     ds::Key hi, size_t cap,
+                                     ds::RangeStats &rs,
+                                     std::vector<ds::Entry> &out) {
+  ds::RangeOperation<Ops, Cache> r(ops, kLayers, rs, /*batched=*/false, &cache,
+                                   /*cache_walk=*/true);
+  size_t await = r.start(lo, hi, cap, out);
+  uint64_t guard = 0;
+  while (!r.finished()) {
+    (void)await;
+    await = r.step();
+    if (++guard > 200000) break;
+  }
+  return r.result();
+}
+
+static void checkCacheWalkAgreesWithTheSerialWalk() {
+  // The cache-sourced backbone: locateDataRange hands over the data-node
+  // addresses from LOCAL memory, so the walk issues one batched read instead of
+  // ~11 dependent round trips. It is an optimisation, so it is not asserted
+  // correct on its own terms -- it is pinned to the serial walk, which the
+  // differential above pins to the blocking oracle.
+  //
+  // The cache is attached to the PUTS, so it mirrors the arena the way it does
+  // in a real run. A cache populated by hand would test a structure the
+  // orchestrator never builds.
+  FakeReplicaSet set(3, kLayers, 16384);
+  set.setTsMode(ds::TsMode::Faa);
+  ds::QuorumStats qs;
+  ds::PutStats ps;
+  ds::WriteStats ws;
+
+  config cfg("disco-skip", "range cache walk", {"normal"}, "");
+  cfg.merge_threshold = 1.0;
+  cfg.layers = static_cast<int>(kLayers);
+  ds::SkipVec sv(&cfg);
+  ds::bootstrapHeads(sv, ds::headAddrs(kLayers));
+  ds::CacheAdapter cache(sv, kLayers);
+
+  std::mt19937_64 rng(0xCA11);
+  {
+    ds::QuorumOps<FakeReplicaSet> ops(set, qs, nullptr);
+    for (int i = 0; i < 400; ++i) {
+      ds::Key const k = static_cast<ds::Key>(rng() % 4000);
+      uint32_t const h = ds::drawHeight(rng, kLayers);
+      ds::Putter<ds::QuorumOps<FakeReplicaSet>, ds::CacheAdapter> p(
+          ops, cache, kLayers, ps, ws);
+      p.put(k, static_cast<ds::Value>(i + 1), h);
+    }
+  }
+
+  size_t compared = 0, entries = 0;
+  uint64_t backbones = 0, addrs = 0, misses = 0, stale = 0;
+  for (int trial = 0; trial < 40; ++trial) {
+    ds::Key lo = static_cast<ds::Key>(rng() % 4000);
+    ds::Key hi = static_cast<ds::Key>(rng() % 4000);
+    if (hi < lo) std::swap(lo, hi);
+
+    FakeAsyncOps aops(set, qs, nullptr);
+    ds::RangeStats ars;
+    std::vector<ds::Entry> agot;
+    ds::RangeResult const ares =
+        runAsyncRange(aops, lo, hi, 1u << 20, ars, agot);
+
+    FakeAsyncOps cops(set, qs, nullptr);
+    ds::RangeStats crs;
+    std::vector<ds::Entry> cgot;
+    ds::RangeResult const cres =
+        runCacheRange(cops, cache, lo, hi, 1u << 20, crs, cgot);
+
+    CHECK(ares.resolved && cres.resolved, "both paths resolve");
+    bool same = agot.size() == cgot.size();
+    for (size_t i = 0; same && i < agot.size(); ++i) {
+      if (agot[i].key != cgot[i].key || agot[i].val != cgot[i].val) same = false;
+    }
+    CHECK(same, "the cache walk returns exactly what the serial walk did");
+    if (!same) {
+      std::printf("  [%llu,%llu] serial %zu vs cache %zu "
+                  "(backbones=%llu addrs=%llu stale=%llu)\n",
+                  static_cast<unsigned long long>(lo),
+                  static_cast<unsigned long long>(hi), agot.size(), cgot.size(),
+                  static_cast<unsigned long long>(crs.cache_backbones),
+                  static_cast<unsigned long long>(crs.cache_addrs),
+                  static_cast<unsigned long long>(crs.cache_stale));
+      break;
+    }
+    backbones += crs.cache_backbones;
+    addrs += crs.cache_addrs;
+    misses += crs.cache_misses;
+    stale += crs.cache_stale;
+    ++compared;
+    entries += cgot.size();
+  }
+
+  std::printf("  cache walk: %zu ranges agree, %zu entries\n", compared,
+              entries);
+  std::printf("  backbones %llu (%llu addrs), %llu misses, %llu stale\n",
+              static_cast<unsigned long long>(backbones),
+              static_cast<unsigned long long>(addrs),
+              static_cast<unsigned long long>(misses),
+              static_cast<unsigned long long>(stale));
+  // A differential that never took the path it covers passes for the wrong
+  // reason: every cache lookup could have missed and the walk been serial.
+  CHECK(backbones > 0, "and the cache actually supplied a backbone");
+  CHECK(addrs > 0, "and supplied addresses");
+}
+
 static void checkAsyncRangeAgreesWithTheBlockingOne() {
   // The differential test, and the reason the state machine is written at all
   // rather than trusted. Two implementations of one algorithm over the same
@@ -316,6 +428,111 @@ static void checkAsyncRangeAgreesWithTheBlockingOne() {
   // for the wrong reason. If the index walk never fired, the two paths agree
   // only because they were the same path.
   CHECK(batch_hits > 0, "and the batched path actually ran");
+}
+
+static void checkAStaleCacheStillGivesTheRightAnswer() {
+  // A STALE CACHE MUST STILL GIVE THE EXACT ANSWER. The cache learns the
+  // structure, then 400 more puts run with a NULL cache, so the arena splits
+  // and grows while the cache keeps its old view -- which is what another
+  // client doing inserts looks like from here.
+  //
+  // WHAT GOING STALE DOES, precisely. A node's k_min never changes
+  // (ds_range.hpp, fact 1), so every address the cache holds still points at
+  // the node it claimed. What it misses is nodes created BETWEEN the entries it
+  // holds. So the protection is not the k_min assertion in drainBatch -- that
+  // cannot fire, and an earlier version of this test wrongly required it to --
+  // but the SUCCESSOR CHECK: a backbone node whose next_id is not the following
+  // backbone address has an orphan chain between them, which gets walked.
+  //
+  // The requirement is therefore the answer itself, plus evidence that the
+  // orphan path carried it.
+  FakeReplicaSet set(3, kLayers, 16384);
+  set.setTsMode(ds::TsMode::Faa);
+  ds::QuorumStats qs;
+  ds::PutStats ps;
+  ds::WriteStats ws;
+
+  config cfg("disco-skip", "stale cache walk", {"normal"}, "");
+  cfg.merge_threshold = 1.0;
+  cfg.layers = static_cast<int>(kLayers);
+  ds::SkipVec sv(&cfg);
+  ds::bootstrapHeads(sv, ds::headAddrs(kLayers));
+  ds::CacheAdapter cache(sv, kLayers);
+
+  std::mt19937_64 rng(0x57A1E);
+  {
+    // Phase 1: the cache learns the structure.
+    ds::QuorumOps<FakeReplicaSet> ops(set, qs, nullptr);
+    for (int i = 0; i < 250; ++i) {
+      ds::Key const k = static_cast<ds::Key>(rng() % 4000);
+      uint32_t const h = ds::drawHeight(rng, kLayers);
+      ds::Putter<ds::QuorumOps<FakeReplicaSet>, ds::CacheAdapter> p(
+          ops, cache, kLayers, ps, ws);
+      p.put(k, static_cast<ds::Value>(i + 1), h);
+    }
+  }
+  {
+    // Phase 2: the arena moves on WITHOUT telling the cache.
+    ds::QuorumOps<FakeReplicaSet> ops(set, qs, nullptr);
+    ds::NullPutCache blind;
+    for (int i = 0; i < 400; ++i) {
+      ds::Key const k = static_cast<ds::Key>(rng() % 4000);
+      uint32_t const h = ds::drawHeight(rng, kLayers);
+      ds::Putter<ds::QuorumOps<FakeReplicaSet>, ds::NullPutCache> p(
+          ops, blind, kLayers, ps, ws);
+      p.put(k, static_cast<ds::Value>(1000 + i), h);
+    }
+  }
+
+  size_t compared = 0;
+  uint64_t stale = 0, backbones = 0, orphans = 0;
+  for (int trial = 0; trial < 40; ++trial) {
+    ds::Key lo = static_cast<ds::Key>(rng() % 4000);
+    ds::Key hi = static_cast<ds::Key>(rng() % 4000);
+    if (hi < lo) std::swap(lo, hi);
+
+    FakeAsyncOps aops(set, qs, nullptr);
+    ds::RangeStats ars;
+    std::vector<ds::Entry> agot;
+    ds::RangeResult const ares =
+        runAsyncRange(aops, lo, hi, 1u << 20, ars, agot);
+
+    FakeAsyncOps cops(set, qs, nullptr);
+    ds::RangeStats crs;
+    std::vector<ds::Entry> cgot;
+    ds::RangeResult const cres =
+        runCacheRange(cops, cache, lo, hi, 1u << 20, crs, cgot);
+
+    CHECK(ares.resolved && cres.resolved, "both paths resolve over a stale cache");
+    bool same = agot.size() == cgot.size();
+    for (size_t i = 0; same && i < agot.size(); ++i) {
+      if (agot[i].key != cgot[i].key || agot[i].val != cgot[i].val) same = false;
+    }
+    CHECK(same, "a stale cache still yields exactly the serial answer");
+    if (!same) {
+      std::printf("  [%llu,%llu] serial %zu vs cache %zu (stale=%llu)\n",
+                  static_cast<unsigned long long>(lo),
+                  static_cast<unsigned long long>(hi), agot.size(), cgot.size(),
+                  static_cast<unsigned long long>(crs.cache_stale));
+      break;
+    }
+    stale += crs.cache_stale;
+    backbones += crs.cache_backbones;
+    orphans += crs.orphans_walked;
+    ++compared;
+  }
+
+  std::printf("  stale cache: %zu ranges agree, %llu backbones, "
+              "%llu orphan detours, %llu k_min mismatches\n", compared,
+              static_cast<unsigned long long>(backbones),
+              static_cast<unsigned long long>(orphans),
+              static_cast<unsigned long long>(stale));
+  // The evidence that the stale case was actually reached: the cache supplied
+  // backbones, and the successor check had to detour around nodes it did not
+  // know about. Without the second, this is the previous differential with
+  // extra puts.
+  CHECK(backbones > 0, "the cache supplied backbones despite being stale");
+  CHECK(orphans > 0, "and the successor check detoured around unknown nodes");
 }
 
 static void checkAsyncSkipsANodeCreatedAfterTheSnapshot() {
@@ -490,6 +707,8 @@ int main() {
   checkTruncationIsReportedNotSilent();
   checkEmptyAndInvertedRanges();
   checkAsyncRangeAgreesWithTheBlockingOne();
+  checkCacheWalkAgreesWithTheSerialWalk();
+  checkAStaleCacheStillGivesTheRightAnswer();
   checkAsyncSkipsANodeCreatedAfterTheSnapshot();
   checkTheViolationCheckerFires();
 

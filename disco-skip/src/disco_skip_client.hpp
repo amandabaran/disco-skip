@@ -266,6 +266,21 @@ public:
             fmt::print("              snapshot violations: {}{}\n",
                        rstats.snapshot_violations,
                        rstats.snapshot_violations == 0 ? " (none)" : "  *** ");
+            if (rstats.cache_backbones != 0 || rstats.cache_misses != 0) {
+                // What the cache actually bought, in the terms that settle it:
+                // addresses per backbone is the batch width, and a miss is a
+                // range (or a refill) that fell back to the serial chain. A
+                // cache-walk arm whose misses dominate its backbones measured
+                // the serial walk with extra lookups.
+                fmt::print("              cache walk: {} backbones, {} addrs "
+                           "({:.1f}/backbone), {} misses, {} k_min mismatches\n",
+                           rstats.cache_backbones, rstats.cache_addrs,
+                           rstats.cache_backbones == 0
+                               ? 0.0
+                               : static_cast<double>(rstats.cache_addrs) /
+                                     static_cast<double>(rstats.cache_backbones),
+                           rstats.cache_misses, rstats.cache_stale);
+            }
             if (rstats.batches != 0) {
                 // What the batched walk actually bought, in the only terms
                 // that settle it: nodes fetched in parallel per batch, against

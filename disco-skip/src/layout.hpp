@@ -62,6 +62,25 @@ struct Layout {
     // so this is a throughput measurement and not an argument.
     bool batched_walk;
 
+    // Whether a range takes its backbone from the LOCAL CACHE rather than a
+    // remote index node, so the addresses cost no round trip at all.
+    //
+    // This is the one that addresses the measured ceiling. A range walks
+    // next_id one node per DEPENDENT round trip -- ~11 for a 100-key scan --
+    // and workload E caps at ~192 kops from 8 clients to 64 regardless. Two
+    // other explanations were tested and eliminated: --ts clock measured
+    // identically, so it is not the timestamp counter, and n=1 replica measured
+    // identically on roughly a quarter of the physical reads, so it is not
+    // bandwidth. What is left is the serial chain, and the cache already holds
+    // every address it walks -- including the capacity-split orphans a remote
+    // index node does not name, which is why the index-sourced --batched-walk
+    // lost at every scan length.
+    //
+    // Requires the cache to be compiled in and consulted. Default off, with the
+    // serial walk as the reference: range_test.cc pins them to byte-identical
+    // results over both a quiescent and a 400-put-stale cache.
+    bool cache_walk;
+
     // Runtime arms of the two toggles. invariants.md §9 specifies
     // DS_CACHE_ENABLED as compile-time, and it has to be: the cache is a member
     // of DsState, so whether it exists at all is decided at build time. But the

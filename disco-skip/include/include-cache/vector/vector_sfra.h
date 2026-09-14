@@ -577,13 +577,20 @@ public:
       else
         break;             // sorted, so nothing further can qualify
     }
-    // No entry <= from: fall back to the first entry at or after it, so a
-    // caller asking below the vector's minimum still gets the nodes it needs.
-    if (start == n) {
-      if (n == 0 || list[0].key > to)
-        return 0;
-      start = 0;
-    }
+    // NO ENTRY <= from: THAT IS A MISS, not a reason to start at the first
+    // entry after it.
+    //
+    // An earlier version fell back to start = 0, reasoning that a caller asking
+    // below the vector's minimum still wants the nodes it can get. That is
+    // wrong for the caller this exists for. The entries are (k_min -> address)
+    // of REMOTE nodes, and this vector is a cache: "no entry <= from" means
+    // either from is below the global minimum, or -- indistinguishably -- this
+    // cache has not learned about the nodes that cover [from, list[0].key).
+    // Starting at list[0] in the second case silently SKIPS those nodes, and a
+    // range walk built on it drops every key they hold. Returning 0 makes the
+    // caller traverse, which is always correct.
+    if (start == n)
+      return 0;
 
     size_t out = 0;
     for (size_t i = start; i < n && out < max; ++i) {

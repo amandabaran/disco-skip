@@ -57,14 +57,20 @@ enum class RangeStep : uint8_t {
   Done,
 };
 
-/// @param Ops  the async operation surface (RdmaAsyncOps, or a fake)
-template <class Ops>
+/// @param Ops    the async operation surface (RdmaAsyncOps, or a fake)
+/// @param Cache  the cache adapter, for --cache-walk. Defaults to NullPutCache
+///               so every existing RangeOperation<Ops> still compiles and
+///               behaves identically: NullPutCache::locateDataRange returns 0,
+///               which is a miss, which traverses.
+template <class Ops, class Cache = NullPutCache>
 class RangeOperation {
  public:
   RangeOperation(Ops &ops, uint32_t layers, RangeStats &stats,
-                 bool batched_walk = false)
+                 bool batched_walk = false, Cache *cache = nullptr,
+                 bool cache_walk = false)
       : ops_(ops), layers_(layers), stats_(stats), trav_(ops),
-        batched_(batched_walk) {}
+        batched_(batched_walk), cache_(cache),
+        cache_walk_(cache_walk && cache != nullptr) {}
 
   /// @return completions to await before the first step()
   size_t start(Key lo, Key hi, size_t cap, std::vector<Entry> &out) {
@@ -134,6 +140,11 @@ class RangeOperation {
     bone_pending_ = false;
     idx_i_ = 0;
     idx_past_hi_ = false;
+    from_cache_ = false;
+    cache_rearm_ = false;
+    walked_any_ = false;
+    last_succ_ = RemoteAddr{};
+    last_kmin_ = Key{};
     ++stats_.ranges;
   }
 
@@ -155,8 +166,53 @@ class RangeOperation {
   }
 
   size_t beginTraversal() {
+    // THE CACHE WALK. Try for a backbone locally first: the remote descent is
+    // ~4 dependent round trips and the next_id walk another ~11, and every
+    // address both of them discover is already in a directory this cache
+    // maintains. A miss falls through to the descent, so this is strictly an
+    // attempt to skip work.
+    if (cache_walk_) {
+      if (fillFromCache(lo_, /*after=*/false) > 0) {
+        ++stats_.cache_backbones;
+        from_cache_ = true;
+        return postBackbone();
+      }
+      ++stats_.cache_misses;
+    }
     step_ = RangeStep::Traversing;
     return trav_.start(lo_, layers_, path_);
+  }
+
+  /// Fill bone_ from the cache. @param after skips a leading entry that repeats
+  /// the last node already walked.
+  ///
+  /// locate_data_range starts at the greatest k_min <= from, which is what a
+  /// range START needs -- the node containing lo. On a REFILL that same rule
+  /// returns the node just finished, because its k_min is still <= the key we
+  /// ask from. Hence /after/: ask from the last k_min and drop it if it comes
+  /// back. Asking from last_kmin+1 instead would be wrong for a key type where
+  /// +1 is not the next possible key.
+  size_t fillFromCache(Key from, bool after) {
+    size_t const max =
+        Ops::walkFanout() < kBoneMax ? Ops::walkFanout() : kBoneMax;
+    size_t n = cache_->locateDataRange(from, hi_, bone_kmin_, bone_, max);
+
+    size_t first = 0;
+    if (after && n > 0 && bone_kmin_[0] <= last_kmin_) first = 1;
+
+    // Truncate at the first NULL address. Null means the local node has no
+    // known remote counterpart (node_t::remote_addr), so it is a miss for that
+    // entry -- and everything after it would be reached by guessing.
+    size_t good = 0;
+    for (size_t i = first; i < n; ++i) {
+      if (bone_[i].isNull()) break;
+      bone_[good] = bone_[i];
+      bone_kmin_[good] = bone_kmin_[i];
+      ++good;
+    }
+    bone_n_ = good;
+    stats_.cache_addrs += good;
+    return good;
   }
 
   size_t onTraversal() {
@@ -341,6 +397,41 @@ class RangeOperation {
       NodeRecord const &nd = bone_node_[i];
       VecRecord const &vc = ops_.walkVec(i);
 
+      // A CONSISTENCY ASSERTION ON THE CACHE, not a staleness guard -- the
+      // distinction matters and I had it wrong.
+      //
+      // A node's k_min NEVER CHANGES (ds_range.hpp, fact 1: a split at key s
+      // creates a NEW node rather than moving one). So an address the cache
+      // hands over always holds the node with the k_min it claimed, however
+      // far behind the cache has fallen. This can only fire on a genuine cache
+      // BUG -- a wrong address for a key -- which is worth catching but is not
+      // what a stale cache does.
+      //
+      // WHAT A STALE CACHE ACTUALLY DOES is miss a node created BETWEEN two
+      // entries it holds. That is caught by the successor check further down:
+      // if this node's next_id is not the following backbone address, an
+      // orphan chain sits between them and is walked. Verified by
+      // checkAStaleCacheStillGivesTheRightAnswer, which lets the cache fall
+      // 400 puts behind and still requires the serial answer exactly.
+      //
+      // Recovery is the next_id chain, which cannot skip a node. If anything
+      // has been walked already, continue from its recorded successor; if not,
+      // nothing is in out_ yet and the remote descent starts over.
+      if (from_cache_ && nd.k_min != bone_kmin_[i]) {
+        ++stats_.cache_stale;
+        from_cache_ = false;
+        cache_walk_ = false;
+        batch_resume_ = kNoResume;
+        orphan_until_ = RemoteAddr{};
+        tail_succ_ = RemoteAddr{};
+        if (walked_any_ && !last_succ_.isNull()) {
+          cur_ = last_succ_;
+          return postHeader();
+        }
+        if (walked_any_) return done(true);   // chain ended here
+        return beginTraversal();
+      }
+
       if (nd.k_min > hi_) return done(true);
 
       if (vc.isPending() || !nd.isStable() || vc.ts > res_.snapshot) {
@@ -377,6 +468,11 @@ class RangeOperation {
       // capacity-split nodes. If this node's successor is not the next backbone
       // node, an orphan chain sits between them and must be walked.
       RemoteAddr const succ = nextNode(nd, vc);
+      // Kept so a later staleness detection can resume from a node that was
+      // definitely walked, rather than re-reading from lo and duplicating.
+      last_succ_ = succ;
+      last_kmin_ = nd.k_min;
+      walked_any_ = true;
       ++bone_i_;
       if (i + 1 >= bone_ok_) {
         // Last node of the backbone: nothing to compare against yet. Defer to
@@ -393,8 +489,40 @@ class RangeOperation {
         return postHeader();
       }
     }
-    // Backbone done. Refill from this index vector if it has more, else step
-    // to the next index node, else finished -- fillBackbone decides which.
+    // Backbone done. A cache-sourced one refills from the cache; an
+    // index-sourced one from the index vector. Both are a miss away from the
+    // serial walk, which is always correct.
+    if (from_cache_) {
+      if (last_kmin_ >= hi_) return done(true);
+      if (fillFromCache(last_kmin_, /*after=*/true) > 0) {
+        ++stats_.cache_backbones;
+        // The tail check still applies: the previous backbone's last successor
+        // must be the new backbone's first node, or an orphan sits between.
+        if (!tail_succ_.isNull() && tail_succ_ != bone_[0]) {
+          ++stats_.orphans_walked;
+          cur_ = tail_succ_;
+          tail_succ_ = RemoteAddr{};
+          orphan_until_ = bone_[0];
+          batch_resume_ = 0;
+          bone_pending_ = true;
+          return postHeader();
+        }
+        tail_succ_ = RemoteAddr{};
+        return postBackbone();
+      }
+      // The cache ran out for THIS directory. Walk the chain, and stepRight
+      // re-arms from the first serial node -- whose k_min lands in the next
+      // directory, which is what locate_data_range needs to advance.
+      ++stats_.cache_misses;
+      from_cache_ = false;
+      cache_rearm_ = true;
+      if (!tail_succ_.isNull()) {
+        cur_ = tail_succ_;
+        tail_succ_ = RemoteAddr{};
+        return postHeader();
+      }
+      return done(true);
+    }
     return fillBackbone();
   }
 
@@ -430,6 +558,10 @@ class RangeOperation {
     // reason; the two must agree or the differential test is comparing
     // different quantities.
     ++stats_.nodes_walked;
+    // Record it for the cache re-arm in stepRight: a serial node is exactly
+    // what tells us a key inside the NEXT directory.
+    last_kmin_ = node_.k_min;
+    walked_any_ = true;
 
     if (!have_vec_) {
       step_ = RangeStep::AwaitVec;
@@ -581,6 +713,36 @@ class RangeOperation {
       return drainBatch();
     }
 
+    // RE-ARM THE CACHE. locate_data_range reads only the directory containing
+    // the key it is asked for, so asking from a key inside the directory just
+    // drained returns that directory again and the refill always misses -- one
+    // batch per range and serial thereafter (measured: 38 backbones over 40
+    // ranges, 40 misses). One serial node breaks that: the node just walked has
+    // a k_min in the NEXT directory, so the cache can be asked from there.
+    //
+    // Costs one round trip per directory boundary instead of one per node.
+    if (cache_rearm_ && cache_walk_ && walked_any_ && last_kmin_ < hi_) {
+      RemoteAddr const serial_succ = nextNode(node_, vec_);
+      if (fillFromCache(last_kmin_, /*after=*/true) > 0) {
+        ++stats_.cache_backbones;
+        from_cache_ = true;
+        if (!serial_succ.isNull() && serial_succ != bone_[0]) {
+          // An orphan sits between the serial node and the new backbone.
+          ++stats_.orphans_walked;
+          cur_ = serial_succ;
+          orphan_until_ = bone_[0];
+          batch_resume_ = 0;
+          bone_pending_ = true;
+          return postHeader();
+        }
+        tail_succ_ = RemoteAddr{};
+        return postBackbone();
+      }
+      // Still nothing: stop trying, so a range whose keys the cache does not
+      // hold does not pay a lookup per node for the rest of the walk.
+      cache_rearm_ = false;
+    }
+
     // The CURRENT chain, from the header and vector we read before walking
     // back -- not from the as-of-T version, whose successor may since have
     // been split away. next_ was captured at that point for exactly this.
@@ -620,6 +782,15 @@ class RangeOperation {
   RemoteAddr orphan_until_{};
   RemoteAddr tail_succ_{};
   bool bone_pending_ = false;
+  Cache *cache_ = nullptr;
+  bool cache_walk_ = false;
+  bool from_cache_ = false;
+  bool cache_rearm_ = false;
+  bool walked_any_ = false;
+  RemoteAddr last_succ_{};
+  Key last_kmin_{};
+  static constexpr size_t kBoneMax = 16;
+  Key bone_kmin_[kBoneMax]{};
 
   RangeStep step_ = RangeStep::Idle;
   RemoteAddr cur_{};

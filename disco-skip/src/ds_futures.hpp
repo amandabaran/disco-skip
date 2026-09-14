@@ -86,7 +86,7 @@ class SvFuture : public BasicFuture {
         put_(ops_, cache, static_cast<uint32_t>(s.layout.cache_layers), pstats,
              wstats),
         range_(ops_, static_cast<uint32_t>(s.layout.cache_layers), rstats,
-               s.layout.batched_walk) {
+               s.layout.batched_walk, &cache, s.layout.cache_walk) {
     // The timestamp source is a per-run decision carried on Layout, not a
     // per-future one -- every future on a client must agree, or the old_ver
     // chains they write interleave two incomparable clocks.
@@ -248,7 +248,7 @@ class SvFuture : public BasicFuture {
   AsyncOps ops_;
   GetOperation<AsyncOps, Cache> get_;
   PutOperation<AsyncOps, Cache> put_;
-  RangeOperation<AsyncOps> range_;
+  RangeOperation<AsyncOps, Cache> range_;
   std::vector<Entry> range_out_;
 
   Kind kind_ = Kind::None;
