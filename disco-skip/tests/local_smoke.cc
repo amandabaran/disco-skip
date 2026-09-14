@@ -532,6 +532,27 @@ static void checkReconcilePath() {
       }
     }
 
+    // A NARROW range, where hi binds before max does. The wide cases above
+    // always fill the buffer first, so they never test that the walk STOPS at
+    // hi -- it could collect every following directory and they would pass.
+    // Over-collecting is not a wrong answer (the caller stops at the first
+    // k_min > hi) but it is a wasted batched fetch of nodes never used.
+    size_t narrow_checked = 0, over = 0;
+    for (int i = 0; i < 2000; ++i) {
+      ds::Key const lo = key_dist(rng);
+      ds::Key const hi = lo + 200;        // far narrower than 32 boundaries
+      size_t const n = sv.locate_data_range(lo, hi, kmins, addrs, kMax);
+      if (n == 0) continue;
+      ++narrow_checked;
+      for (size_t j = 1; j < n; ++j) {
+        if (kmins[j] > hi) ++over;        // j==0 is the coverer, may be <= lo
+      }
+    }
+    std::printf("  narrow ranges: %zu checked, %zu addrs past hi\n",
+                narrow_checked, over);
+    CHECK(over == 0, "locate_data_range stops at hi, not at the buffer");
+    CHECK(narrow_checked > 0, "and the narrow case was actually reached");
+
     std::printf("  locate_data_range: %zu calls, %zu addrs, longest run %zu, "
                 "%zu empty\n", calls, total_returned, longest, empty);
     // A lookup that always returned nothing would pass every check above.

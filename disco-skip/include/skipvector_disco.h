@@ -701,32 +701,40 @@ public:
     }
   }
 
-  /// The remote addresses of up to /max/ consecutive data nodes covering keys
-  /// in [lo, hi], in key order, together with each node's k_min. Returns how
-  /// many were written; 0 is a miss and the caller must traverse remotely.
+  /// The remote addresses of the data nodes covering [lo, hi], in key order,
+  /// with each node's k_min. Returns how many were written; 0 is a miss and the
+  /// caller must traverse remotely.
   ///
-  /// WHY: a range query otherwise walks the remote next_id chain one node per
-  /// ROUND TRIP, each read depending on the previous one's result -- measured
-  /// at ~11 dependent round trips for a 100-key scan, which caps throughput
-  /// however many clients or queue pairs are added. Every address it needs is
-  /// already here, in a directory this cache maintains. Handing them over lets
-  /// the caller issue ONE batched read instead of a serial chain.
+  /// WHY: a range otherwise walks the remote next_id chain one node per
+  /// DEPENDENT round trip -- ~11 for a 100-key scan -- so only a few dozen
+  /// RDMAs are ever outstanding per client and each waits on its predecessor.
+  /// Throughput then caps regardless of clients. Every address the walk
+  /// discovers is already here, so handing the whole list over lets the caller
+  /// issue ONE batched read.
   ///
-  /// ONE DIRECTORY PER CALL, on purpose. A range spanning two directories would
-  /// need two validated reads, and a split between them would invalidate the
-  /// first -- so rather than hold locks or restart a partial answer, this
-  /// returns what a single directory validates and the caller calls again from
-  /// the next key. That keeps the optimistic protocol below exactly the one
-  /// locate_data() uses: descend, read into locals, confirm, retry on failure.
+  /// IT WALKS ACROSS DIRECTORY NODES, because one is not enough. A directory
+  /// holds ~6 entries (measured: 13516 over 2184 level-0 nodes) and a 100-key
+  /// scan needs ~11 data nodes, so the addresses straddle a boundary and a
+  /// single-node answer would leave the caller to rediscover the rest remotely.
   ///
-  /// k_min is returned alongside the address because the caller needs it for
-  /// two things it cannot otherwise do without an RDMA: stop at hi, and check
-  /// each fetched node against what the cache claimed, so a stale entry is
-  /// detected rather than silently walked.
+  /// The walk is hand-over-hand, modelled on check_next() in skipvector.h:
+  /// take a hazard pointer on next, confirm curr has not changed, begin_read on
+  /// next, read it, confirm next, then advance and drop the OLDEST hazard
+  /// pointer -- drop_curr() releases the node just left, leaving the new curr
+  /// protected. Any failed confirmation restarts from the descent; the caller's
+  /// buffers are rewritten before anything reads them.
   ///
-  /// The addresses may be STALE OR NULL. A null address means this local node
-  /// has no known remote counterpart (see node_t::remote_addr) and the caller
-  /// must treat it as a miss for that entry.
+  /// A SHORT RETURN IS NORMAL and the caller must handle it: /max/ can fill,
+  /// and an empty intervening directory stops the walk early rather than being
+  /// skipped past. Truncation is safe -- it costs round trips, not correctness,
+  /// because the caller falls back to the next_id chain, which cannot skip a
+  /// node.
+  ///
+  /// k_min comes back with each address because the caller needs it to stop at
+  /// hi and to check each fetched node against what the cache claimed, neither
+  /// of which it can do without an RDMA. Addresses may be stale or NULL; null
+  /// means this local node has no known remote counterpart
+  /// (node_t::remote_addr) and is a miss for that entry.
   size_t locate_data_range(K const &lo, K const &hi, K *out_kmin,
                            REMOTE_ADDR *out_addr, size_t max) {
     if (max == 0)
@@ -735,21 +743,69 @@ public:
 
     while (true) {
       uint64_t curr_lock = 0;
-      directory_t *curr_dl = descend_to_directory(curr_lock, lo);
+      directory_t *curr = descend_to_directory(curr_lock, lo);
+      // One hazard pointer is held on curr, and curr_lock is a read context on
+      // it -- descend_to_directory's contract.
 
-      // Optimistic, exactly as in locate_data(): read into the caller's
-      // buffers, then confirm. copy_from_lte() is const and never stores, so
-      // a racing writer costs a retry rather than a corrupted vector -- which
-      // is why range() is not used here, since it writes each value back.
-      size_t const n =
-          curr_dl->v.copy_from_lte(lo, hi, out_kmin, out_addr, max);
+      // The first node must COVER lo: the greatest k_min <= lo. copy_from_lte
+      // reports a miss rather than starting later, because starting at the
+      // first k_min >= lo would skip the node holding lo itself.
+      size_t out = curr->v.copy_from_lte(lo, hi, out_kmin, out_addr, max);
+      if (!curr->lock.confirm_read(curr_lock)) {
+        HP::drop_curr();
+        continue;
+      }
+      if (out == 0) {
+        HP::drop_curr();
+        return 0;
+      }
 
-      bool const ok = curr_dl->lock.confirm_read(curr_lock);
+      // HAZARD POINTER BOOKKEEPING. drop_all() asserts BOTH slots are held
+      // despite its name, so the exit path has to know whether it is holding
+      // one or two -- hence holding_next. drop_curr() drops the OLDEST and
+      // rotates, which is what makes the advance below leave the new curr
+      // protected (the same shape as check_next in skipvector.h).
+      directory_t *next = curr->next;
+      bool restart = false;
+      bool holding_next = false;
+      while (out < max && next != nullptr) {
+        HP::take_next(next);
+        holding_next = true;
+        if (!curr->lock.confirm_read(curr_lock)) {
+          HP::drop_all();
+          restart = true;
+          break;
+        }
+        uint64_t const next_lock = next->lock.begin_read();
+
+        // copy_upto, not copy_from_lte: every key here is above the last one
+        // seen, so there is no covering entry to find and the first entry needs
+        // no covering check.
+        size_t const got =
+            next->v.copy_upto(hi, out_kmin + out, out_addr + out, max - out);
+
+        if (!next->lock.confirm_read(next_lock)) {
+          HP::drop_all();
+          restart = true;
+          break;
+        }
+        out += got;
+        if (got == 0)
+          break;   // past hi, or an empty node: stop rather than walk on
+
+        curr = next;
+        curr_lock = next_lock;
+        next = curr->next;
+        HP::drop_curr();   // releases the node just left
+        holding_next = false;
+      }
+      if (restart)
+        continue;          // the failing branch already dropped both
+
+      if (holding_next)
+        HP::drop_next();
       HP::drop_curr();
-      if (ok)
-        return n;
-      // Failed validation: the caller's buffers hold values that may be torn,
-      // and are overwritten by the next attempt before anything reads them.
+      return out;
     }
   }
 

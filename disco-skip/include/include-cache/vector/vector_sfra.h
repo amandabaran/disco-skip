@@ -561,6 +561,27 @@ public:
   ///     holding its own start key.
   ///
   /// const, and deliberately so: it is the property the caller depends on.
+  /// As copy_from_lte, but from the START of the vector: every entry with
+  /// key <= to, in order, up to /max/.
+  ///
+  /// For CONTINUING a range into a following node. copy_from_lte would return
+  /// nothing there: every key in a later node is greater than the key the
+  /// caller last saw, so "the greatest key <= from" does not exist and it
+  /// reports a miss. The first entry of a following node needs no covering
+  /// check -- the preceding node already covered everything below it.
+  size_t copy_upto(K const &to, K *out_k, V *out_v, size_t max) const {
+    size_t const n = size;
+    size_t out = 0;
+    for (size_t i = 0; i < n && out < max; ++i) {
+      if (list[i].key > to)
+        break;             // sorted, so nothing further qualifies
+      out_k[out] = list[i].key;
+      out_v[out] = list[i].val.load();
+      ++out;
+    }
+    return out;
+  }
+
   size_t copy_from_lte(K const &from, K const &to, K *out_k, V *out_v,
                        size_t max) const {
     if (max == 0)
