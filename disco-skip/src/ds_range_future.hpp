@@ -209,7 +209,23 @@ class RangeOperation {
     // of exactly one node's worth can still span two.
     size_t const have = out_->size();
     size_t const want = have >= cap_ ? 0 : cap_ - have;
-    size_t const need = (want + kNodeCapacity - 1) / kNodeCapacity + 1;
+
+    // DIVIDE BY OBSERVED OCCUPANCY, NOT CAPACITY. A level-0 node holds
+    // kNodeCapacity = 16 entries but averages 6.2 in practice (13516 entries
+    // over 2184 nodes, measured), because a split leaves both halves partly
+    // full. Dividing by 16 underestimated the nodes a scan needs by ~2.6x: a
+    // 50-key scan needs ~9 nodes and was asked for 5, so the batch covered half
+    // the range and refilled about four times -- 732332 backbones for 178000
+    // ranges at 2.4 addresses each, which is a round trip per refill and most
+    // of the benefit gone.
+    //
+    // Half capacity is the standard occupancy assumption for a split-on-full
+    // structure and matches the measurement closely enough: ceil(50/8)+1 = 8
+    // against the ~9 actually needed, so a rare refill rather than four.
+    // Over-asking is bounded by the fanout and costs a wasted address, not a
+    // wasted fetch -- drainBatch stops at the cap.
+    size_t const per_node = kNodeCapacity / 2;
+    size_t const need = (want + per_node - 1) / per_node + 1;
     if (need < max) max = need;
     if (max == 0) return 0;
     size_t n = cache_->locateDataRange(from, hi_, bone_kmin_, bone_, max);
