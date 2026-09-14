@@ -183,6 +183,47 @@ class RangeOperation {
     return trav_.start(lo_, layers_, path_);
   }
 
+  // ── ROUND-TRIP ACCOUNTING, which is the whole justification ──────────────
+  //
+  // Measured occupancy: level-0 nodes hold 6.2 entries against a capacity of
+  // 16, so a scan of L keys touches ceil(L/6.2) nodes.
+  //
+  //   SERIAL: 1 round trip per node. The header and a SPECULATED vector read
+  //   are chained on one queue pair (postHeaders + guess), and the offset hint
+  //   hits 96.4% of the time, so a node costs one trip rather than two. That
+  //   makes serial a stronger baseline than a naive count suggests: 9 trips for
+  //   a 50-key scan, 17 for a 100-key one.
+  //
+  //   BATCHED: 2 round trips per batch, and no fewer. The vector offsets are
+  //   not known until the headers come back, so the two volleys are dependent
+  //   and the speculation the serial path enjoys is unavailable. A batch that
+  //   covers the whole scan therefore costs 2, not 1.
+  //
+  // So the ceiling on the win is ~9/2 and ~17/2, and it is realised only if ONE
+  // batch covers the range. Two sizing mistakes each destroyed it:
+  //
+  //   * asking by hi, which OpScan leaves unbounded (a YCSB scan is
+  //     count-bounded; 178073 of 178074 ranges ended on the entry cap). The
+  //     batch then always asked for the full fanout and fetched ~4x the nodes
+  //     it used. Measured 201 kops against serial's 320.
+  //
+  //   * asking by kNodeCapacity, which assumes full nodes. At 6.2 entries a
+  //     50-key scan needs ~9 nodes and was asked for 5, so the batch covered
+  //     half the range and refilled four times -- 8 round trips, against
+  //     serial's 11. Measured 229 against 433.
+  //
+  // Hence sizing by ceil(remaining / (kNodeCapacity/2)) + 1: simulated against
+  // the measured occupancy that is 2 batches, 4 round trips, and 17 nodes
+  // fetched for the 17 a 100-key scan needs.
+  //
+  // NOTE THE OPEN QUESTION. The second round did ~8 round trips against
+  // serial's ~11 and still measured 229 against 433 -- FEWER trips and far
+  // lower throughput. Round-trip count alone does not account for that, so if
+  // the current sizing still loses, the cause is elsewhere: most likely that
+  // two dependent volleys pipeline worse under -a 4 than a stream of
+  // independent single-node reads. That would point at having the cache store
+  // vector offsets too, so the batch could speculate as the serial path does.
+
   /// Fill bone_ from the cache. @param after skips a leading entry that repeats
   /// the last node already walked.
   ///
