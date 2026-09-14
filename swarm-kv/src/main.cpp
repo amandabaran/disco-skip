@@ -559,7 +559,18 @@ int main(int argc, char* argv[]) {
         // a completion belonging to a future would be eaten. finishAllFutures()
         // below and the per-key drain inside SCAN are what make these points
         // quiescent.
-        if (range_lock) {
+        if (range_lock && op.type != OpType::READ) {
+          // DRAIN BEFORE ACQUIRING, not just before releasing.
+          //
+          // casBlocking drains the send CQ, which it shares with the future
+          // machinery, so the lock can only be taken with nothing in flight.
+          // The release side already drained; the ACQUIRE side did not, and the
+          // gap is a READ: a read takes no lock and does not drain, so when the
+          // next operation is an update it acquired while that read was still
+          // outstanding. The guard in RangeLock caught it as
+          // "drained a completion belonging to a future" rather than letting
+          // the CQ quietly desynchronise, but the fix is here.
+          client.finishAllFutures();
           if (op.type == OpType::SCAN) {
             range_lock->acquireRange(ycsbKeyToInt(op.key),
                                      static_cast<uint64_t>(op.scan_count));
