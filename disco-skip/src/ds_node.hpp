@@ -336,13 +336,19 @@ struct VecRecord {
   // inside one cache line. At 64 the keys begin on a cache line and so do the
   // values, since 64 + 8*cap is a multiple of 64 for every supported cap.
   //
-  // CAVEAT, because that sentence overstates it: alignof(VecRecord) is 8. The
-  // claim holds for ARENA-RESIDENT records -- the region base is 64-aligned and
-  // sizeof is a multiple of 64, so every record in it is too -- and NOT for a
-  // stack or heap copy, which is 8-aligned. Vector loads here must therefore be
-  // the UNALIGNED form. Assuming otherwise, by enabling -mavx2 globally, killed
-  // every client silently just after queue-pair setup; see the note in
-  // CMakeLists.txt.
+  // TWO CAVEATS, one of which corrects an earlier wrong note here.
+  //
+  // 1. alignof(VecRecord) is 8, so the cache-line claim holds for
+  //    ARENA-RESIDENT records -- 64-aligned region base, 64-multiple stride --
+  //    and NOT for a stack or heap copy, which is 8-aligned. Vector loads must
+  //    be the unaligned form regardless.
+  //
+  // 2. THE AVX2 PATH BELOW CANNOT RUN ON THIS CLUSTER. The nodes are Xeon
+  //    E5-2450 (Sandy Bridge-EP): `avx` and `sse4_2`, no `avx2`. Compiling AVX2
+  //    in produces an INVALID OPCODE trap, not an alignment fault -- an earlier
+  //    version of this comment blamed under-aligned moves, which was wrong. The
+  //    widest usable 64-bit integer compare here is SSE4.2's pcmpgtq, two lanes
+  //    rather than four. See the note in CMakeLists.txt.
   //
   // `height` from the proposed layout is NOT here: nothing reads a height off a
   // data vector today (it is a doPut argument, and NodeRecord carries `level`),

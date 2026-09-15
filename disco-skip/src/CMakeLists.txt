@@ -48,37 +48,34 @@ if(NOT DS_N_REPLICAS EQUAL 1 AND NOT DS_N_REPLICAS EQUAL 3)
     message(FATAL_ERROR "DS_N_REPLICAS must be 1 or 3 (got ${DS_N_REPLICAS})")
 endif()
 
-# -mavx2 IS LOAD-BEARING. VecRecord::findLte has a SIMD path guarded by
-# __AVX2__; without this flag the macro is undefined, the scalar fallback
-# compiles in, and the deployed binary measures the fallback while the tests
-# (which do pass -mavx2) measure the vector path. All cluster nodes here are
-# AVX2-capable.
-# NO -mavx2 GLOBALLY. IT BREAKS THE CLIENT.
+# NO -mavx2. THESE CPUs DO NOT HAVE AVX2.
 #
-# Measured, same commit otherwise: with `add_compile_options(-mavx2)` every
-# client exits SILENTLY just after queue-pair setup, before `Bootstrap:` -- no
-# throw (those are logged), no message, 0 kops. Without it, 215 kops, which is
-# the established baseline. One flag, the whole difference.
+#   model name : Intel(R) Xeon(R) CPU E5-2450 0 @ 2.10GHz
+#   flags      : ... avx ... sse4_2 ...        <-- no avx2
 #
-# The mechanism is NOT established -- one experiment pins the cause on the flag,
-# not on what it miscompiles. alignof(VecRecord) is 8 while the comment in
-# ds_node.hpp talks about cache lines (true of arena-resident records, whose
-# base is 64-aligned and whose stride is a multiple of 64; NOT true of a stack
-# or heap copy), so under-aligned 32-byte moves are the obvious suspect. It is
-# a suspect, not a finding.
+# E5-2450 (no "v2") is Sandy Bridge-EP. AVX2 arrived with Haswell in 2013, so
+# an AVX2 instruction is an INVALID OPCODE here, and the kernel says so:
 #
-# AND IT IS NOT WORTH CHASING AT THIS SIZE. The SIMD key scan is worth 0.1-0.3%
-# of a range operation: a scan-100 walks ~10.9 nodes of <=16 keys, ~176
-# comparisons, against 63 us uncontended per range. That bought a dead binary.
-# The struct-of-arrays layout is kept because it is the prerequisite for LARGER
-# NODES, which cut round trips -- the part that costs microseconds. findLte's
-# SIMD branch is guarded by __AVX2__, so with this off it compiles to the scalar
-# path and the tests (which do pass -mavx2, and bite-check it) still cover the
-# vector version.
+#   traps: disco-skip-exe[5165] trap invalid opcode ip:56e7f786cc61 ...
 #
-# If SIMD is revisited: confine it with __attribute__((target("avx2"))) on that
-# one function plus a __builtin_cpu_supports dispatch, so codegen for the other
-# ~50k lines is untouched. Do not re-enable this globally.
+# 0 kops with the flag, 215 without. The faulting ip maps into lyra::opt --
+# COMMAND-LINE PARSING -- because the compiler auto-vectorised early setup, so
+# the process died before bootstrap while the log merely stopped after
+# queue-pair setup. That misdirection cost a round of wrong theories: the first
+# diagnosis here blamed under-aligned 32-byte moves, which was wrong. SIGILL,
+# not SIGSEGV. An earlier version of this comment also asserted "all cluster
+# nodes here are AVX2-capable", which was never checked and is false.
+#
+# IF SIMD IS REVISITED, THE CEILING IS SSE4.2, NOT AVX2. pcmpgtq gives TWO
+# 64-bit compares per instruction, not four. Against a binary search over <=16
+# keys that is worth 0.1-0.3% of a range operation (~176 comparisons per
+# scan-100 against 63 us uncontended), so it is not worth a global codegen
+# change. Confine it: __attribute__((target("sse4.2"))) on findLte alone plus a
+# __builtin_cpu_supports dispatch.
+#
+# findLte's vector branch is guarded by __AVX2__, so with no flag here it
+# compiles to the scalar path, while the tests still pass -mavx2 and bite-check
+# the vector version on a build machine that has it.
 
 add_compile_definitions(
     DS_CACHE_ENABLED=${DS_CACHE_ENABLED}
