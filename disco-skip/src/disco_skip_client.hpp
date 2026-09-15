@@ -381,8 +381,22 @@ public:
         // At a measured ~3.7 us per round trip, trips/op times 3.7 should
         // account for the operation's latency; where it does not, the cost is
         // NOT round trips and looking for it there is wasted effort.
-        uint64_t const ops_resolved =
-            gstats.traversals + pstats.puts + rstats.ranges;
+        // THE DENOMINATOR IS THE WHOLE POINT OF THIS LINE, AND IT WAS WRONG.
+        //
+        // It used gstats.traversals, which is NOT the number of gets -- it
+        // counts gets the cache could NOT answer, so it is a small fraction of
+        // them. On workload C at -I 1200000 that was 101,914 against 2,450,000
+        // actual gets, and the printed ratio came out 31.34 round trips per
+        // "op" when the truth is 1.30. A ratio computed over 4% of the
+        // operations is worse than no ratio, because it looks like a finding.
+        //
+        // A get is counted the same way the `gets:` line above counts it:
+        // cache_hits + traversals, the hits plus the ones that went remote.
+        // Ranges subtract failures to match the `ranges:` line, so a failed
+        // range does not inflate the per-op cost of the ones that resolved.
+        uint64_t const ops_resolved = (gstats.cache_hits + gstats.traversals) +
+                                      pstats.puts +
+                                      (rstats.ranges - rstats.failures);
         fmt::print("              {} round trips ({:.2f} per resolved op, "
                    "over {} gets+puts+ranges)\n",
                    qstats.round_trips,
