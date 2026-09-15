@@ -153,6 +153,17 @@ class ReliableConnection {
 
   bool pollCqIsOk(Cq cq, std::vector<struct ibv_wc> &entries) const;
 
+  /// Poll into a caller-owned buffer. Returns false on a poll error; otherwise
+  /// writes the completion count to /num/.
+  ///
+  /// The vector form uses entries.size() as BOTH the input capacity and the
+  /// output count, so it shrinks the vector to the number polled and the caller
+  /// must regrow it before the next poll. std::vector::resize
+  /// value-initialises, so a client polling in a loop re-zeroes ibv_wc structs
+  /// continuously -- measured at 9.6% of a disco-skip client's CPU on workload
+  /// E (_M_default_append). This form touches no vector.
+  bool pollCqIsOk(Cq cq, struct ibv_wc *entries, int max, int &num) const;
+
   RemoteConnection remoteInfo() const;
 
   uintptr_t remoteBuf() const { return rconn.rci.buf_addr; }

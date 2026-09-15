@@ -218,19 +218,37 @@ class RdmaAsyncOps {
     walk_n_ = n;
     NodeRecord *const bufs = layout_.getWalkNodeBufs(future_id_);
     size_t completions = 0;
-    for (size_t i = 0; i < n; ++i) {
-      walk_addr_[i] = addrs[i];
-      for (size_t r = 0; r < r_count; ++r) {
-        auto &rc = *conns_[r];
-        if (!rc.postSendSingle(dory::conn::ReliableConnection::RdmaRead,
-                               future_id_, &bufs[i * r_count + r],
-                               kNodeRecordBytes,
-                               Layout::nodeAddrOf(rc.remoteBuf(), addrs[i]))) {
-          throw std::runtime_error("failed to post a batched header read");
-        }
-        bump(r, 1);
-        ++completions;
+    for (size_t i = 0; i < n; ++i) walk_addr_[i] = addrs[i];
+    if (n == 0) return postedExactly(0, "postWalkHeaders");
+
+    // ONE ibv_post_send PER REPLICA, not one per node per replica.
+    //
+    // This used to call postSendSingle n * replicas times -- 24 verbs calls for
+    // an 8-node backbone across 3 replicas. Every ibv_post_send takes a
+    // per-queue-pair spinlock, and perf put pthread_spin_lock at 15.9% of this
+    // client's CPU on workload E: the cost scales with the NUMBER OF CALLS, not
+    // with bytes or round trips. That is why batching reads into fewer round
+    // trips measured flat -- it left the call count alone.
+    //
+    // Chaining through wr.next posts the whole backbone for one replica in a
+    // single call, so 24 becomes 3.
+    for (size_t r = 0; r < r_count; ++r) {
+      auto &rc = *conns_[r];
+      struct ibv_send_wr wr[Layout::kWalkFanout];
+      struct ibv_sge sg[Layout::kWalkFanout];
+      for (size_t i = 0; i < n; ++i) {
+        rc.prepareSingle(wr[i], sg[i],
+                         dory::conn::ReliableConnection::RdmaRead, future_id_,
+                         &bufs[i * r_count + r], kNodeRecordBytes,
+                         Layout::nodeAddrOf(rc.remoteBuf(), addrs[i]),
+                         /*signaled=*/true);
+        wr[i].next = (i + 1 < n) ? &wr[i + 1] : nullptr;
       }
+      if (!rc.postSend(wr[0])) {
+        throw std::runtime_error("failed to post a batched header read");
+      }
+      bump(r, n);
+      completions += n;
     }
     stats_.node_reads += n;
     stats_.replica_reads += completions;
@@ -273,15 +291,36 @@ class RdmaAsyncOps {
     walk_n_ = n;
     VecRecord *const bufs = layout_.getWalkVecBufs(future_id_);
     size_t completions = 0;
-    for (size_t i = 0; i < n; ++i) {
-      auto &rc = *conns_[winners[i]];
-      if (!rc.postSendSingle(dory::conn::ReliableConnection::RdmaRead,
-                             future_id_, &bufs[i], kVecRecordBytes,
-                             layout_.vecAddrOf(rc.remoteBuf(), offs[i]))) {
+    if (n == 0) return postedExactly(0, "postWalkVecs");
+
+    // GROUPED BY REPLICA, one ibv_post_send each. Same reasoning as
+    // postWalkHeaders: the per-call spinlock is the cost, so n calls become at
+    // most one per replica. Unlike the headers, the vectors come from whichever
+    // replica won each node's quorum, so the chain is built per replica over
+    // the nodes that chose it.
+    size_t const r_count = conns_.size();
+    for (size_t r = 0; r < r_count; ++r) {
+      struct ibv_send_wr wr[Layout::kWalkFanout];
+      struct ibv_sge sg[Layout::kWalkFanout];
+      size_t k = 0;
+      auto &rc = *conns_[r];
+      for (size_t i = 0; i < n; ++i) {
+        if (winners[i] != r) continue;
+        rc.prepareSingle(wr[k], sg[k],
+                         dory::conn::ReliableConnection::RdmaRead, future_id_,
+                         &bufs[i], kVecRecordBytes,
+                         layout_.vecAddrOf(rc.remoteBuf(), offs[i]),
+                         /*signaled=*/true);
+        if (k > 0) wr[k - 1].next = &wr[k];
+        ++k;
+      }
+      if (k == 0) continue;
+      wr[k - 1].next = nullptr;
+      if (!rc.postSend(wr[0])) {
         throw std::runtime_error("failed to post a batched vector read");
       }
-      bump(winners[i], 1);
-      ++completions;
+      bump(r, k);
+      completions += k;
     }
     stats_.vec_reads += n;
     stats_.replica_reads += completions;

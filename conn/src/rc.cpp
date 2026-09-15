@@ -421,6 +421,21 @@ void ReliableConnection::prepareSingleCas(ibv_send_wr &wr, ibv_sge &sg,
 
 void ReliableConnection::reconnect() { connect(rconn, proc_id); }
 
+bool ReliableConnection::pollCqIsOk(Cq cq, struct ibv_wc *entries, int max,
+                                    int &num) const {
+  switch (cq) {
+    case RecvCq:
+      num = ibv_poll_cq(create_attr.recv_cq, max, entries);
+      break;
+    case SendCq:
+      num = ibv_poll_cq(create_attr.send_cq, max, entries);
+      break;
+    default:
+      throw std::runtime_error("Invalid Cq");
+  }
+  return num >= 0;
+}
+
 bool ReliableConnection::pollCqIsOk(Cq cq,
                                     std::vector<struct ibv_wc> &entries) const {
   int num = 0;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -71,6 +72,13 @@ public:
     // Drain the send CQs across all server connections. Routes each completion
     // to its owning future via wr_id, and flips `progress[i]` so the user loop
     // knows to call tryStepForward on it.
+    // Where the last getFreeFuture search stopped; see the note there.
+    uint64_t next_future_ = 0;
+
+    // Completion scratch, allocated once. See the note in tickRdma.
+    static constexpr size_t kWcBufMax = 256;
+    std::array<struct ibv_wc, kWcBufMax> wc_buf_{};
+
     bool tickRdma() {
         bool any_progress = false;
         for (size_t s = 0; s < state.layout.num_servers; ++s) {
@@ -78,21 +86,30 @@ public:
             auto& tp = state.to_poll_per_server[s];
             if (tp <= 0) continue;
 
-            // Poll at most as many completions as we actually have outstanding on
-            // this server. Resizing to a blind 128 lets one poll reap more CQEs
-            // than `tp` accounted for, and the decrement below then drives `tp`
-            // negative -- after which `tp == 0` is never true again and this
-            // server stops being polled. swarm-kv bounds it the same way
-            // (oops_client.hpp: wces.resize(to_poll)).
-            state.wces.resize(static_cast<size_t>(tp));
-
-            // Dory shrinks state.wces.size() inside this function to match the real event count
-            if (!rc.pollCqIsOk(dory::conn::ReliableConnection::SendCq, state.wces)) {
+            // Poll at most as many completions as we actually have outstanding
+            // on this server. The bound matters: polling a blind 128 lets one
+            // call reap more CQEs than `tp` accounted for, the decrement below
+            // then drives `tp` negative, and `tp == 0` is never true again so
+            // this server stops being polled.
+            //
+            // INTO A FIXED BUFFER, NOT A RESIZED VECTOR. The vector form uses
+            // size() as both the input capacity and the output count, so it
+            // shrinks to the number polled and has to be regrown before the
+            // next tick -- and std::vector::resize value-initialises, zeroing
+            // 48-byte ibv_wc structs on every poll of every server. perf put
+            // _M_default_append at 9.6% of this client's CPU on workload E.
+            int const want = tp < static_cast<int64_t>(kWcBufMax)
+                                 ? static_cast<int>(tp)
+                                 : static_cast<int>(kWcBufMax);
+            int polled = 0;
+            if (!rc.pollCqIsOk(dory::conn::ReliableConnection::SendCq,
+                               wc_buf_.data(), want, polled)) {
                 throw std::runtime_error("Error polling CQ");
             }
 
-            // Loop strictly over entries reaped by Dory
-            for (auto const& wc : state.wces) {
+            // Loop strictly over entries actually reaped
+            for (int wi = 0; wi < polled; ++wi) {
+                auto const& wc = wc_buf_[static_cast<size_t>(wi)];
                 if (wc.status != IBV_WC_SUCCESS) {
                     throw std::runtime_error("WC unsuccessful");
                 }
@@ -137,8 +154,8 @@ public:
                 any_progress = true;
             }
             
-            // Safe decrement using Dory's clean post-poll vector size
-            tp -= static_cast<int64_t>(state.wces.size());
+            // Decrement by what was actually reaped.
+            tp -= static_cast<int64_t>(polled);
         }
         return any_progress;
     }
@@ -151,8 +168,24 @@ public:
     // caller must NOT drain between operations -- see the note on
     // finishAllFutures.
     SvFuture<ClientCache>& getFreeFuture() {
+        // ROUND-ROBIN, not restart-from-zero.
+        //
+        // perf put this at 13.0% of client CPU on workload E, with tickRdma at
+        // a further 12.3%. Most of that is the WAIT itself: when every future is
+        // awaiting completions the loop spins, and spinning is how an RDMA
+        // client waits -- there is nothing else for it to do. So this is not a
+        // 13% saving, and the real reductions are elsewhere (the completion
+        // buffer, and chaining work requests so fewer verbs calls are made).
+        //
+        // What it does remove is the redundant re-scan: starting at 0 every
+        // iteration re-tests the same busy futures before reaching the one that
+        // finished. Resuming where the last search stopped checks the likely
+        // candidate first.
+        uint64_t const n = state.layout.async_parallelism;
         while (true) {
-            for (uint64_t i = 0; i < state.layout.async_parallelism; ++i) {
+            for (uint64_t k = 0; k < n; ++k) {
+                uint64_t const i = next_future_ % n;
+                next_future_ = i + 1;
                 auto& f = futures[i];
                 if (progress[i]) {
                     f.tryStepForward();
