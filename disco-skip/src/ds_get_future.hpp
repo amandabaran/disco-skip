@@ -144,9 +144,9 @@ class GetOperation {
     ++stats_.cache_hits;
     int const idx = findLte(vec_, k_);
     out_.resolved = true;
-    if (idx >= 0 && vec_.e[idx].key == k_) {
+    if (idx >= 0 && vec_.keyAt(idx) == k_) {
       out_.found = true;
-      out_.value = vec_.e[idx].val;
+      out_.value = vec_.valAt(idx);
     } else {
       ++stats_.not_found;
     }

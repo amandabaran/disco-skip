@@ -36,7 +36,7 @@ int main() {
   ds::VecRecord v;
   ds::initVec(v, /*is_orphan=*/false, /*ts=*/1);
   v.size = 1;
-  v.e[0] = ds::Entry{42, 7};
+  v.setAt(0, 42, 7);
 
   ds::Layout l{};
   l.num_clients = 1;

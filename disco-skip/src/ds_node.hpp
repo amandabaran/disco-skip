@@ -1,5 +1,11 @@
 #pragma once
 
+// For the SIMD key scan in VecRecord::findKey. Guarded at the use site by
+// __AVX2__, but the header is safe to include unconditionally on x86-64.
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
+
 // The remote node layout: what actually lives in memory-server memory.
 //
 // Memory servers run no logic (invariants.md §8 / interface doc §0), so this
@@ -316,9 +322,81 @@ struct VecRecord {
   uint64_t next_id;
   Key k_min_next;
 
-  Entry e[kNodeCapacity];
+  // ── STRUCT OF ARRAYS: ALL KEYS, THEN ALL VALUES ───────────────────────
+  //
+  // This was `Entry e[kNodeCapacity]` -- key and value interleaved on a 16-byte
+  // stride. Splitting them is what lets a key scan load 4 (AVX2) or 8 (AVX-512)
+  // keys per instruction; with the interleaved layout every other 8 bytes in a
+  // vector register is a value, so a 256-bit load carried only 2 useful keys.
+  //
+  // THE HEADER IS PADDED TO EXACTLY 64 BYTES ON PURPOSE. The fields above come
+  // to 48 (four uint32 then four 8-byte fields), and packing keys[] straight
+  // after them would start the array at offset 48 -- 8-byte aligned but NOT
+  // 32-byte aligned, so every AVX2 load would straddle and none would sit
+  // inside one cache line. At 64 the keys begin on a cache line and so do the
+  // values, since 64 + 8*cap is a multiple of 64 for every supported cap.
+  // That is the whole point of the split.
+  //
+  // `height` from the proposed layout is NOT here: nothing reads a height off a
+  // data vector today (it is a doPut argument, and NodeRecord carries `level`),
+  // and there are 16 spare bytes below to add it in without moving anything.
+  //
+  // SIZE IS UNCHANGED AT CAPACITY 16: 64 + 128 + 128 = 320, the same as the
+  // interleaved layout, and still a multiple of 64 at 32 / 64 / 128 entries.
+  //
+  // ACCESS THESE THROUGH keyAt / valAt / setAt / moveEntry, never directly.
+  // Those are what make the layout swappable -- the 37 call sites that used to
+  // read `.e[i].key` do not need to know which layout is compiled in.
+  uint8_t _pad_to_64[64 - 48];
 
-  uint64_t _pad[2];
+  Key keys[kNodeCapacity];
+  Value vals[kNodeCapacity];
+
+  // ── Entry accessors ───────────────────────────────────────────────────
+
+  [[nodiscard]] Key keyAt(size_t i) const noexcept { return keys[i]; }
+  [[nodiscard]] Value valAt(size_t i) const noexcept { return vals[i]; }
+  [[nodiscard]] Entry entryAt(size_t i) const noexcept {
+    return Entry{keys[i], vals[i]};
+  }
+  void setAt(size_t i, Key k, Value v) noexcept { keys[i] = k; vals[i] = v; }
+  void setAt(size_t i, Entry const &e) noexcept { setAt(i, e.key, e.val); }
+  void setValAt(size_t i, Value v) noexcept { vals[i] = v; }
+  /// Shift one entry, for the insert's make-room loop. Both arrays move
+  /// together; doing it as two memmoves would be faster but the loops run over
+  /// at most `size` entries and are not on the measured hot path.
+  void moveEntry(size_t to, size_t from) noexcept {
+    keys[to] = keys[from];
+    vals[to] = vals[from];
+  }
+  void clearAt(size_t i) noexcept { keys[i] = Key{}; vals[i] = Value{}; }
+  /// Copy one entry ACROSS vectors, for a split moving entries to a new node.
+  /// Distinct from moveEntry, which shifts within one vector -- conflating the
+  /// two silently made a split read from its own empty destination and drop
+  /// every moved entry.
+  void copyEntryFrom(size_t to, VecRecord const &src, size_t from) noexcept {
+    keys[to] = src.keys[from];
+    vals[to] = src.vals[from];
+  }
+
+  // NO findKey() / lowerBound() HERE, DELIBERATELY.
+  //
+  // Both were written and both were dead: every caller needs the FLOOR of k
+  // (the last key <= k), not an exact match. That is what routes the descent --
+  // index entries are node boundaries, so the child covering k sits at the
+  // largest key <= k, and an exact-match search misses on every interior key.
+  // Presence is then `idx >= 0 && keyAt(idx) == k`, and the insert position is
+  // `idx + 1`, both derived from the same floor.
+  //
+  // See findLte below, which is the vectorised one because it is the one the
+  // hot paths call.
+
+  // The old layout's trailing _pad[2] is GONE. It existed to round the
+  // interleaved form (48 B header + 256 B of entries = 304) up to 320. The
+  // header is now padded to 64 up front instead -- which is what aligns keys[]
+  // and vals[] to cache lines -- so 64 + 8*cap + 8*cap is already a multiple of
+  // 64 and a trailing pad would only push it past the boundary. Leaving it in
+  // made sizeof 336, which is exactly what the asserts below caught.
 
   [[nodiscard]] bool isPending() const noexcept { return ts == kNullTs; }
 
@@ -341,7 +419,12 @@ static_assert(sizeof(NodeRecord) == kNodeHeaderSize,
               "a node must be exactly one 64B cache line so F4 applies");
 static_assert(sizeof(VecRecord) % 64 == 0,
               "vectors must be 64B multiples so each starts 64B-aligned");
-static_assert(sizeof(VecRecord) == 320);
+static_assert(sizeof(VecRecord) == 64 + 16 * kNodeCapacity,
+              "64-byte header, then cap keys, then cap values");
+static_assert(offsetof(VecRecord, keys) == 64,
+              "keys[] must start on a cache line or the SIMD loads straddle");
+static_assert(offsetof(VecRecord, vals) % 64 == 0,
+              "vals[] must also start on a cache line");
 static_assert(std::is_trivially_copyable_v<NodeRecord>);
 static_assert(std::is_trivially_copyable_v<VecRecord>);
 
@@ -408,12 +491,52 @@ inline constexpr RemoteAddr headAddr(uint32_t level) {
 /// the way `hi = mid - 1` can, so this formulation sidesteps it rather than
 /// suppressing it. Costs one cluster build; see the gate note in tests/Makefile.
 [[nodiscard]] inline int findLte(VecRecord const &v, Key k) noexcept {
+  // SIMD OVER THE KEY ARRAY. This is the function the hot paths actually call
+  // -- get, put, traverse and the range walk all route through it, 8 files in
+  // total -- so it is where the struct-of-arrays layout has to pay off. A
+  // standalone SIMD findKey() would have been dead code.
+  //
+  // THE TRICK FOR A PREDECESSOR SEARCH. Entries are sorted ascending, so the
+  // index of the last key <= k is simply (count of keys <= k) - 1. That turns a
+  // search into a COUNT, which vectorises cleanly: compare 4 keys per AVX2
+  // instruction, movemask, popcount. No branches, so a miss costs a hit, and
+  // there is no mispredict on the binary search's unpredictable middle.
+  //
+  // Keys are unsigned but _mm256_cmpgt_epi64 is SIGNED, so both sides are
+  // biased by 2^63 to map unsigned order onto signed order. Skipping that
+  // makes every key above 2^63 compare as negative -- which the differential
+  // test catches, since kReservedKey is (Key)-1.
+#if defined(__AVX2__)
+  uint32_t const n = v.size;
+  __m256i const bias = _mm256_set1_epi64x(static_cast<long long>(1ULL << 63));
+  __m256i const needle =
+      _mm256_xor_si256(_mm256_set1_epi64x(static_cast<long long>(k)), bias);
+  uint32_t count = 0;
+  uint32_t i = 0;
+  for (; i + 4 <= n; i += 4) {
+    __m256i const block =
+        _mm256_loadu_si256(reinterpret_cast<__m256i const *>(v.keys + i));
+    // keys[j] <= k  ==  !(keys[j] > k)
+    __m256i const gt = _mm256_cmpgt_epi64(_mm256_xor_si256(block, bias), needle);
+    int const gt_mask = _mm256_movemask_pd(_mm256_castsi256_pd(gt));
+    count += static_cast<uint32_t>(__builtin_popcount(
+        static_cast<unsigned>((~gt_mask) & 0xF)));
+    if (gt_mask != 0) {
+      // Sorted, so once any lane exceeds k nothing later can be <= k.
+      return static_cast<int>(count) - 1;
+    }
+  }
+  for (; i < n; ++i) {
+    if (v.keyAt(i) <= k) ++count; else break;
+  }
+  return static_cast<int>(count) - 1;
+#else
   uint32_t lo = 0;
   uint32_t hi = v.size; // candidates live in [lo, hi)
   int found = -1;
   while (lo < hi) {
     uint32_t const mid = lo + (hi - lo) / 2;
-    if (v.e[mid].key <= k) {
+    if (v.keyAt(mid) <= k) {
       found = static_cast<int>(mid);
       lo = mid + 1;
     } else {
@@ -421,6 +544,7 @@ inline constexpr RemoteAddr headAddr(uint32_t level) {
     }
   }
   return found;
+#endif
 }
 
 /// Where does this node's range end, as best the reader can tell?

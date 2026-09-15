@@ -347,6 +347,34 @@ public:
         fmt::print("quorum:       {} node reads -> {} replica reads, {} re-polls\n",
                    qstats.node_reads, qstats.replica_reads,
                    qstats.read_retries);
+        // ts_partial: FAA ROUNDS THAT DID NOT REACH EVERY REPLICA.
+        //
+        // This was counted and never printed, which meant no run in this repo
+        // could substantiate its own linearizability claim. Faa's real-time
+        // order between non-overlapping writers holds ONLY if the writer FAA'd
+        // all replicas (ds_ts.hpp): quorum intersection guarantees a later
+        // writer sees some replica the earlier one touched, but not the one
+        // that DECIDED its maximum, so a partial round can hand a later write a
+        // smaller timestamp. A partial FAA still gives a unique stamp that is
+        // monotone for its own writer -- it loses only the cross-writer
+        // guarantee -- so it degrades rather than corrupts, and it must be
+        // visible to be reported honestly.
+        //
+        // NON-ZERO HERE MEANS THE FAA LINEARIZABILITY CLAIM IS WEAKER THAN
+        // STATED FOR THAT RUN, and the figure needs the caveat.
+        fmt::print("              {} partial FAA rounds (did NOT reach all "
+                   "replicas){}\n",
+                   qstats.ts_partial,
+                   qstats.ts_partial == 0 ? " (none)" : "  *** real-time order "
+                                                        "NOT guaranteed ***");
+        // Below a quorum there is no ordering property at all, so these rounds
+        // are REFUSED a timestamp and left pending rather than stamped. A
+        // non-zero count means writes are completing without an order until a
+        // reader settles them -- a liveness/latency story, not a correctness
+        // one, but it must not be invisible.
+        fmt::print("              {} FAA rounds refused (short of quorum){}\n",
+                   qstats.ts_short_of_quorum,
+                   qstats.ts_short_of_quorum == 0 ? " (none)" : "  ***");
         fmt::print("              {} stale votes, {} tag ties, {} writebacks\n",
                    qstats.stale_votes, qstats.tag_ties, qstats.writebacks);
         // The L2 read repair. Printed unconditionally because "did the repair

@@ -256,7 +256,13 @@ int main(int argc, char* argv[]) {
   if(warmup == UINT64_MAX) {
     warmup = iter_count < default_warmup ? iter_count : default_warmup;
   }
-  const uint64_t keepwarm = (iter_count + warmup) / 4;
+  // KEEPWARM MUST OUTLAST THE SLOWEST CLIENT'S WINDOW. See the long note in
+  // disco-skip/src/main.cpp: every client runs the same fixed iter_count, so a
+  // fast client finishes early and, once keepwarm runs out, stops issuing --
+  // and the slow clients then measure a system carrying less than the intended
+  // load. A quarter of the window does not cover the per-client speed spread
+  // measured on this cluster (up to 1.7x); iter_count covers a 2x spread.
+  const uint64_t keepwarm = iter_count;
 
   const uint64_t start_measurements = warmup;
   const uint64_t stop_measurements = start_measurements + iter_count;
@@ -546,6 +552,21 @@ int main(int argc, char* argv[]) {
         }
 
         if (i == start_measurements) {
+          // BARRIER, OR THE PER-CLIENT NUMBERS DO NOT SHARE A WINDOW.
+          // Same defect and same fix as disco-skip/src/main.cpp -- there was a
+          // barrier at "initialized" but none here, so each client began
+          // measuring whenever it personally finished warmup, and the windows
+          // drifted apart until they no longer overlapped.
+          //
+          // THIS HAD TO BE FIXED IN ALL THREE BINARIES, NOT JUST OURS.
+          // swarm-kv and fusee carry the identical pattern, so correcting only
+          // disco-skip would leave the competitors' numbers inflated by the
+          // stagger while ours became honest -- biasing the comparison against
+          // us and invalidating it either way.
+          //
+          // Clients only: the memory servers never enter this loop, so waiting
+          // on them here would hang forever.
+          store.barrier("measure-start", layout.num_clients);
           measuring = true;
           start = std::chrono::steady_clock::now();
           client.startMeasurements(start);

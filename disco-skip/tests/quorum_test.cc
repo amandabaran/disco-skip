@@ -519,7 +519,7 @@ static void checkAStaleGuessNeverServesOldBytes() {
   CHECK(r.qs.vec_reads_served == served_before,
         "NOT served from the stale speculation");
   int const idx = ds::findLte(vec, 100);
-  CHECK(idx >= 0 && vec.e[idx].key == 100 && vec.e[idx].val == 700,
+  CHECK(idx >= 0 && vec.keyAt(idx) == 100 && vec.valAt(idx) == 700,
         "and it returns the version the write published, not the stale one");
 }
 

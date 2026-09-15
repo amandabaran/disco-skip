@@ -1,5 +1,7 @@
 #pragma once
 
+#include <string>
+
 // The non-blocking traversal: the same decisions, resumable.
 //
 // WHY A STATE MACHINE AT ALL. The blocking Traversal is one function that reads,
@@ -104,6 +106,34 @@ class TraversalFuture {
   }
 
   [[nodiscard]] bool finished() const { return step_ == TraversalStep::Done; }
+
+  /// Traversal state for the non-termination watchdog (ds_futures.hpp).
+  ///
+  /// NEEDED BECAUSE THE BOUNDS HERE CANNOT FIRE. kMaxHopsPerLevel is 1<<20 =
+  /// 1,048,576 right-hops and kMaxReadRepairs is small, but the future
+  /// watchdog aborts at 4,097 STEPS -- and every right-hop, re-poll and repair
+  /// is one step. So the watchdog always wins by ~256x and the graceful
+  /// TooManyHops / NoMajority paths are unreachable, which makes a long-but-
+  /// legitimate descent look identical to a livelock. These counters are what
+  /// tell the two apart: large hops_ means it is walking the level chain,
+  /// large settle_tries_/repairs_ means it is spinning on a contended node.
+  [[nodiscard]] std::string debugState() const {
+    char const *st = "?";
+    switch (step_) {
+      case TraversalStep::Idle:         st = "Idle";         break;
+      case TraversalStep::AwaitHeaders: st = "AwaitHeaders"; break;
+      case TraversalStep::AwaitVec:     st = "AwaitVec";     break;
+      case TraversalStep::AwaitHelp:    st = "AwaitHelp";    break;
+      case TraversalStep::AwaitRepair:  st = "AwaitRepair";  break;
+      case TraversalStep::Done:         st = "Done";         break;
+    }
+    return std::string("trav=") + st +
+           " hops=" + std::to_string(hops_) +
+           " settle_tries=" + std::to_string(settle_tries_) +
+           " repairs=" + std::to_string(repairs_) +
+           " cur.id=" + std::to_string(cur_.id) +
+           " have_vec=" + (have_vec_ ? "1" : "0");
+  }
   [[nodiscard]] TraversalResult const &result() const { return res_; }
 
  private:
@@ -262,9 +292,9 @@ class TraversalFuture {
       res_.data_addr = cur_;
       res_.data_k_min = node_.k_min;
       int const idx = findLte(vec_, k_);
-      if (idx >= 0 && vec_.e[idx].key == k_) {
+      if (idx >= 0 && vec_.keyAt(idx) == k_) {
         res_.found = true;
-        res_.value = vec_.e[idx].val;
+        res_.value = vec_.valAt(idx);
       }
       res_.status = TraversalStatus::Ok;
       step_ = TraversalStep::Done;
@@ -276,13 +306,13 @@ class TraversalFuture {
     path_[L].k_min = node_.k_min;
     path_[L].addr = cur_;
     path_[L].first_down =
-        (L == 0 && vec_.size > 0) ? RemoteAddr{vec_.e[0].val} : RemoteAddr{};
+        (L == 0 && vec_.size > 0) ? RemoteAddr{vec_.valAt(0)} : RemoteAddr{};
     res_.levels = layers_;
 
     int const idx = findLte(vec_, k_);
     if (idx < 0) return fail(TraversalStatus::Miss);
 
-    cur_ = RemoteAddr{vec_.e[idx].val};
+    cur_ = RemoteAddr{vec_.valAt(idx)};
     // Unsigned cursor plus an explicit at-data flag, rather than letting the
     // level go to -1. A signed decrement followed by `level_ < 0` is the
     // `X - C1 cmp C2` shape the dory toolchain rejects at

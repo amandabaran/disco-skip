@@ -145,7 +145,7 @@ static void checkFindLteAndRange() {
     std::vector<ds::Key> keys;
     for (uint32_t i = 0; i < size; ++i) keys.push_back(10 * (i + 1));
     v.size = size;
-    for (uint32_t i = 0; i < size; ++i) v.e[i] = {keys[i], 1000 + keys[i]};
+    for (uint32_t i = 0; i < size; ++i) v.setAt(i, keys[i], 1000 + keys[i]);
     for (ds::Key probe = 0; probe <= 10 * (ds::kNodeCapacity + 2); ++probe) {
       int want = -1;
       for (uint32_t i = 0; i < size; ++i) {
@@ -342,11 +342,20 @@ static void checkAllocator() {
 }
 
 static void checkSharedDefs() {
-  // A4: the two sides' node capacities must match. kNodeCapacity is derived
-  // from DS_IDX_EXP the same way the cache derives its own, so this asserts the
-  // derivation rather than a hardcoded number.
-  CHECK(ds::kNodeCapacity == (size_t{2} << ds::kIdxExp), "capacity derivation");
+  // A4: the two sides' node capacities must match. The DATA capacity now
+  // derives from DS_DATA_EXP and the INDEX fan-out from DS_IDX_EXP -- they used
+  // to be the same knob, which meant sweeping data node size also moved descent
+  // depth. ds_cache.hpp passes kDataExp as the cache's DATA_EXP, so the two
+  // sides still agree by construction.
+  //
+  // Asserting the SEPARATION is the point: a regression that re-coupled them
+  // would pass a check written against kIdxExp alone.
+  CHECK(ds::kNodeCapacity == (size_t{2} << ds::kDataExp), "capacity derivation");
   CHECK(ds::kLevelRatio == (size_t{1} << ds::kIdxExp), "level ratio derivation");
+  CHECK(ds::kLevelRatio == (size_t{1} << ds::kIdxExp) &&
+            (ds::kDataExp != ds::kIdxExp ||
+             ds::kNodeCapacity == (size_t{2} << ds::kIdxExp)),
+        "data and index exponents are independent, and coincide by default");
   CHECK(ds::kNumReplicas == 1 || ds::kNumReplicas == 3, "replica count is 1 or 3");
 
   // The null-address contract the cache depends on (interface doc §4).

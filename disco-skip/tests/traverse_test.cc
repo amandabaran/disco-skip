@@ -245,7 +245,7 @@ static void checkTraversalAgainstAnOracle() {
     v.size = 0;
     for (int j = 0; j < 5; ++j) {
       k = k_min + static_cast<ds::Key>(j * 17);
-      v.e[v.size++] = ds::Entry{k, k * 3};
+      v.setAt(v.size++, k, k * 3);
       oracle[k] = k * 3;
     }
     prev = cur;

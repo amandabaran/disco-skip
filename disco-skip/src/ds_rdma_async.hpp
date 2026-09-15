@@ -98,10 +98,68 @@ class RdmaAsyncOps {
     VecRecord *const spec = layout_.getVecBufs(future_id_);
     size_t completions = 0;
 
+    // WHICH REPLICA THE SPECULATIVE VECTOR READ GOES TO.
+    //
+    // It was hardcoded to replica 0, and that -- not the winner selection --
+    // is where the load imbalance actually lived. The offset hint runs at a
+    // 0.964 hit rate on workload E, so ~96% of vector reads are this
+    // speculative one, issued BEFORE any winner is known; the winner-based
+    // spreading in resolveWalkHeader only decides anything on a spec MISS.
+    //
+    // Measured: with only the winner path spread, w1 still carried 4.07x the
+    // bytes of w2/w3 (down from 4.68) -- just 650 MB of 11,804 MB of vector
+    // traffic moved, 5.5%, which is the miss rate and nothing more.
+    //
+    // Same spread key as the winner path (offset % n) so a walk's consecutive
+    // nodes speculate against different replicas.
+    // ── WHICH REPLICAS TO ASK (--read-quorum) ─────────────────────────────
+    //
+    // CAS-ABD's read phase needs the max tag over a QUORUM, not over every
+    // replica: the CAS that follows is ABD's write-back phase, and it is the
+    // CAS reaching a majority that makes the write durable. So asking all n is
+    // a latency choice, not a correctness one.
+    //
+    // Headers are 45% of this workload's bytes (measured: 3 x 3204 MB of
+    // headers against 11804 MB of vectors), so dropping to a quorum removes
+    // about 15% of all traffic and a third of the header MESSAGES.
+    //
+    // WHICH quorum rotates with the node address, so the header load spreads
+    // instead of every replica serving every header -- the same idea as
+    // vecSourceFor, applied to the read phase.
+    //
+    // THE COST IS REAL. With exactly majority() replicas asked, ALL of them
+    // must agree for a handle to reach a majority. Under write contention they
+    // often do not -- the code already records "under sustained write
+    // contention on one key the replicas are essentially never in agreement",
+    // 76,311 failed reads on workload D at 8 clients -- and each disagreement
+    // then costs a retry that asking all n would have avoided. Expect this to
+    // win on read-heavy workloads and lose on write-contended ones; that is
+    // why it is a toggle and not a default.
+    size_t const fanout =
+        (layout_.read_quorum && !header_retry_) ? majority() : n;
+    // Retry asks EVERYONE: a quorum that disagreed will disagree again, so
+    // repeating the same subset is a livelock.
+    header_retry_ = false;
+    size_t const first = layout_.read_quorum
+                             ? static_cast<size_t>(a.id % n)
+                             : 0;
+    read_mask_ = 0;
+    for (size_t k = 0; k < fanout; ++k) read_mask_ |= 1u << ((first + k) % n);
+
+    // The speculative vector read must go to a replica we ACTUALLY READ THE
+    // HEADER FROM, because resolveHeaders validates it against that header.
+    size_t spec_r = first;
+    if (layout_.spread_reads && speculate != kNullVec) {
+      size_t const want = static_cast<size_t>(speculate % n);
+      spec_r = (read_mask_ & (1u << want)) ? want : first;
+    }
+    spec_replica_ = spec_r;
+
     for (size_t r = 0; r < n; ++r) {
+      if (!(read_mask_ & (1u << r))) continue;   // not asked this round
       auto &rc = *conns_[r];
       uintptr_t const remote = Layout::nodeAddrOf(rc.remoteBuf(), a);
-      if (r == 0 && speculate != kNullVec) {
+      if (r == spec_r && speculate != kNullVec) {
         struct ibv_send_wr wr[2];
         struct ibv_sge sg[2];
         rc.prepareSingle(wr[0], sg[0],
@@ -129,7 +187,7 @@ class RdmaAsyncOps {
       }
     }
     ++stats_.node_reads;
-    stats_.replica_reads += n + (speculate != kNullVec ? 1u : 0u);
+    stats_.replica_reads += fanout + (speculate != kNullVec ? 1u : 0u);
     if (speculate != kNullVec) ++stats_.speculated;
     return postedExactly(completions, "postHeaders");
   }
@@ -148,26 +206,94 @@ class RdmaAsyncOps {
     NodeRecord const *const hdrs = layout_.getNodeBufs(future_id_);
 
     size_t best = n;
-    uint64_t best_tag = 0;
+    uint64_t best_raw = 0;
     for (size_t r = 0; r < n; ++r) {
+      // Skip replicas we did not ask: their slot still holds an EARLIER
+      // operation's header (the node buffers are reused per future), so
+      // counting it would fabricate agreement from stale bytes. read_mask_ is
+      // all-ones except under --read-quorum in postHeaders.
+      if (!(read_mask_ & (1u << r))) continue;
       size_t votes = 0;
       for (size_t q = 0; q < n; ++q) {
+        if (!(read_mask_ & (1u << q))) continue;
         if (hdrs[q].handle == hdrs[r].handle) ++votes;
       }
       if (votes < majority()) continue;
-      uint64_t const tag = hdrs[r].handle.tag();
-      if (best == n || tag > best_tag) {
+      // MAX RAW, NOT MAX TAG -- the same rule the repair paths use.
+      //
+      // The offset occupies the LOW 32 bits, so raw order is tag order refined
+      // by offset: a bigger offset can never let a staler tag win. The offset
+      // is allocated from a per-client stripe by a monotonic bump allocator
+      // (layout.hpp VecAllocator: next_++, no reclamation), so raw sorts as
+      // (struct_ver, content_ver, writer, attempt) -- a total order every
+      // reader computes identically.
+      //
+      // At n=3 this cannot change WHICH handle is chosen, because of the
+      // majority filter above: two distinct handles can never both clear a
+      // majority (2*(n/2+1) > n for every n), so exactly one distinct handle
+      // survives the filter and there is nothing left for the refinement to
+      // order. It matters in repairRead/resolveRepair, which deliberately adopt
+      // a handle NO majority holds. Kept identical here so the two paths cannot
+      // drift apart, and so the next reader does not have to rediscover why one
+      // compares tags and the other compares words.
+      uint64_t const raw = hdrs[r].handle.raw;
+      if (best == n || raw > best_raw) {
         best = r;
-        best_tag = tag;
+        best_raw = raw;
       }
     }
     if (best == n) {
       ++stats_.read_retries;
+      // Ask EVERY replica next time: re-asking the quorum that just disagreed
+      // returns the same answer forever.
+      header_retry_ = true;
       return false;
     }
 
+
+    // ── LOAD-SPREAD THE VECTOR READ (--spread-reads) ──────────────────────
+    //
+    // A node's HEADER is read from every replica to form the quorum, but its
+    // VECTOR -- the 320-byte payload, the expensive half -- is read from one.
+    // Which one was decided by the loop above, and that loop uses a strict `>`:
+    // when the replicas AGREE, which is the normal case, every candidate has an
+    // equal raw handle, so r=0 sets `best` and nothing ever displaces it.
+    //
+    // Replica 0 therefore served EVERY vector read and the other two served
+    // only 64-byte headers. Measured on the cluster with IB port counters
+    // during a workload-E run:
+    //
+    //     w1   179 MB/s   avg packet 213 B   <- headers AND all vectors
+    //     w2    38 MB/s   avg packet  87 B   <- headers only
+    //     w3    38 MB/s   avg packet  87 B   <- headers only
+    //
+    // The average packet sizes are the proof: 87 B is a 64-byte header read and
+    // nothing else, 213 B is that mixed with 320-byte vectors.
+    //
+    // WHY THIS IS SAFE FOR LINEARIZABILITY. The candidates considered here all
+    // satisfy `handle == hdrs[best].handle`, i.e. the SAME 64-bit word: same
+    // (struct_ver, content_ver) and, because the offset is the low 32 bits, the
+    // same vector offset. They are byte-identical copies of one version, and
+    // each voted with the winner (L4). Choosing among them changes WHICH COPY
+    // is fetched, never WHAT is fetched, so no reader can observe a different
+    // value and no order is affected. A replica that merely reached majority
+    // with a DIFFERENT handle is not a candidate.
+    //
+    // WHY offset % n AND NOT round-robin OR client id. It must be stateless and
+    // it must vary WITHIN one range walk -- a walk touches ~10.9 nodes, and the
+    // point is that consecutive nodes land on different replicas. Client id
+    // pins a client to one replica and spreads nothing within a walk;
+    // round-robin needs mutable state on a hot path. The offset is already in
+    // the winning handle, needs no extra argument, and is dense per client
+    // stripe so consecutive allocations spread evenly.
+    //
+    // It does NOT spread the speculative vector read in resolveHeaders, which
+    // is pinned to replica 0 separately; that path serves point gets, not the
+    // range walk this targets.
+    // SPREAD THE VECTOR SOURCE, NOT THE NODE RECORD. Moving `best` itself was
+    // a livelock: see the note above vecSourceFor.
     node = hdrs[best];
-    winner_ = best;
+    winner_ = vecSourceFor(hdrs, best, n);
     VecOffset const truth = node.handle.offset();
 
     have_vec = false;
@@ -175,7 +301,14 @@ class RdmaAsyncOps {
       // L4, strictly: usable only if replica 0 voted with the winner -- which,
       // since a handle carries its offset, means the speculation read the
       // version that won.
-      if (hdrs[0].handle == hdrs[best].handle && spec_pending_ == truth) {
+      // MUST be the replica the speculative read was ISSUED TO, not replica 0.
+      // The speculated bytes are usable iff THAT replica holds the winning
+      // handle -- same version, same offset -- and the guessed offset is the
+      // winner's. Testing replica 0 while having read from another would
+      // accept bytes from a replica that never voted with the winner, which is
+      // a linearizability violation, not an optimisation.
+      if (hdrs[spec_replica_].handle == hdrs[best].handle &&
+          spec_pending_ == truth) {
         vec = layout_.getVecBufs(future_id_)[0];
         have_vec = true;
         ++stats_.spec_hits;
@@ -213,6 +346,11 @@ class RdmaAsyncOps {
   /// replica set -- because a node read is a quorum read and the majority rule
   /// applies per node over its own replicas.
   size_t postWalkHeaders(RemoteAddr const *addrs, size_t n) {
+    // This path asks EVERY replica for every node, so the vote loops in
+    // resolveWalkHeader must consider all of them. read_mask_ is shared with
+    // postHeaders, which narrows it under --read-quorum, so it has to be reset
+    // here or a walk would silently ignore replicas it did read.
+    read_mask_ = ~0u;
     size_t const r_count = conns_.size();
     bumped_ = 0;
     walk_n_ = n;
@@ -260,27 +398,80 @@ class RdmaAsyncOps {
   /// @return false when no handle has majority support for that node -- the
   ///         caller falls back to the one-at-a-time path for it rather than
   ///         failing the whole batch, since the others are fine.
+  /// Which replica to FETCH THE VECTOR FROM, given the node's quorum winner.
+  ///
+  /// ── WHY THIS IS SEPARATE FROM `best` ──────────────────────────────────
+  ///
+  /// The first attempt at load-spreading moved `best` itself, so the caller
+  /// then took its whole NodeRecord -- handle, k_min, next_id, next_k_min --
+  /// from whichever replica was chosen. That LIVELOCKED: two clients tripped
+  /// "future N is stuck after 4097 steps without finishing", every cell at 32
+  /// and 64 clients timed out, and 8 clients failed intermittently.
+  ///
+  /// The reason is in ds_node.hpp. `next_id` is "mutated in place by a split
+  /// ... the CAS on the handle and the write of this field are SEPARATE
+  /// operations, so a reader can land between them", and `next_k_min` is "only
+  /// trustworthy while the node is stable". So two replicas can carry the SAME
+  /// handle and DIFFERENT successor fields: the handle CAS has landed on both,
+  /// the next_id write has landed on only one. Taking the node record from an
+  /// arbitrary agreeing replica can therefore hand the walk a stale successor,
+  /// and a range that chases the wrong next_id does not terminate. Contention
+  /// dependent, which is why it barely showed at 8 clients and always at 32.
+  ///
+  /// THE VECTOR HAS NO SUCH HAZARD. Versions are copy-on-write, so an offset
+  /// names one immutable payload; every replica holding the winning handle
+  /// holds the same offset and therefore byte-identical vector contents. There
+  /// is no second write to race with. Spreading the FETCH is safe; spreading
+  /// which record you believe is not.
+  ///
+  /// Candidates are restricted to `handle == hdrs[best].handle` -- the same
+  /// 64-bit word, so the same version AND the same offset (offset is the low
+  /// 32 bits) -- which is also the L4 requirement that the replica voted with
+  /// the winner. Falls back to `best` when the preferred replica disagrees.
+  size_t vecSourceFor(NodeRecord const *hdrs, size_t best, size_t n) const {
+    if (!layout_.spread_reads || best >= n) return best;
+    size_t const pref = static_cast<size_t>(hdrs[best].handle.offset() % n);
+    for (size_t k = 0; k < n; ++k) {
+      size_t const r = (pref + k) % n;
+      // Only a replica whose header we READ can be known to hold the winning
+      // handle; an unasked slot holds an earlier operation's bytes.
+      if (!(read_mask_ & (1u << r))) continue;
+      if (hdrs[r].handle == hdrs[best].handle) return r;
+    }
+    return best;
+  }
+
   bool resolveWalkHeader(size_t i, NodeRecord &node, size_t &winner) {
     size_t const n = conns_.size();
     NodeRecord const *const hdrs =
         layout_.getWalkNodeBufs(future_id_) + i * n;
     size_t best = n;
-    uint64_t best_tag = 0;
+    uint64_t best_raw = 0;
     for (size_t r = 0; r < n; ++r) {
+      // Skip replicas we did not ask: their slot still holds an EARLIER
+      // operation's header (the node buffers are reused per future), so
+      // counting it would fabricate agreement from stale bytes. read_mask_ is
+      // all-ones except under --read-quorum in postHeaders.
+      if (!(read_mask_ & (1u << r))) continue;
       size_t votes = 0;
       for (size_t q = 0; q < n; ++q) {
+        if (!(read_mask_ & (1u << q))) continue;
         if (hdrs[q].handle == hdrs[r].handle) ++votes;
       }
       if (votes < majority()) continue;
-      uint64_t const tag = hdrs[r].handle.tag();
-      if (best == n || tag > best_tag) { best = r; best_tag = tag; }
+      // Max raw, not max tag -- see the note in resolveHeaders.
+      uint64_t const raw = hdrs[r].handle.raw;
+      if (best == n || raw > best_raw) { best = r; best_raw = raw; }
     }
     if (best == n) {
       ++stats_.read_retries;
+      // Ask EVERY replica next time: re-asking the quorum that just disagreed
+      // returns the same answer forever.
+      header_retry_ = true;
       return false;
     }
     node = hdrs[best];
-    winner = best;
+    winner = vecSourceFor(hdrs, best, n);
     return true;
   }
 
@@ -544,6 +735,23 @@ class RdmaAsyncOps {
       if (best == kNoFaa || pre > best) best = pre;
     }
     if (best == kNoFaa) return kNullTs;
+    // A QUORUM IS REQUIRED, NOT "WHOEVER ANSWERED".
+    //
+    // This used to return a stamp whenever at least ONE replica answered. With
+    // one of three, the round has no intersection with any other writer's
+    // quorum, so the stamp carries NO ordering property -- not even the
+    // weakened one ts_partial describes. Two writers landing on disjoint single
+    // replicas could stamp in any order at all.
+    //
+    // Refusing is safe and uses a path that already exists: kNullTs is a
+    // first-class protocol state (ds_node.hpp -- "published but unstamped",
+    // isPending()), and a reader resolves a pending version with a CAS from
+    // kNullTs rather than waiting. So the write stays visible and gets its
+    // order fixed by whoever reads it next.
+    if (answered < majority()) {
+      ++stats_.ts_short_of_quorum;
+      return kNullTs;
+    }
     if (answered < n) ++stats_.ts_partial;
     return tsFromFaa(best, client_idx_);
   }
@@ -633,6 +841,19 @@ class RdmaAsyncOps {
   uint64_t client_idx_ = 0;
   size_t bumped_ = 0;  ///< completions queued by the post in progress
   VecOffset spec_pending_ = kNullVec;
+  /// Bitmask of replicas whose header was actually READ this round.
+  ///
+  /// NOT decoration. getNodeBufs() is a per-future buffer REUSED across
+  /// operations, so a slot belonging to a replica we did not ask still holds
+  /// the PREVIOUS operation's header. Counting it as a vote would manufacture
+  /// agreement out of stale bytes -- a wrong answer, not a slow one. Every
+  /// vote loop must skip replicas outside this mask.
+  uint32_t read_mask_ = ~0u;
+  /// Set when a resolve found no majority, so the next attempt asks everyone.
+  bool header_retry_ = false;
+  /// Replica the pending speculative vector read was issued to. 0 unless
+  /// --spread-reads. resolveHeaders validates against THIS replica's header.
+  size_t spec_replica_ = 0;
   size_t walk_n_ = 0;
   RemoteAddr walk_addr_[Layout::kWalkFanout]{};
   uint64_t repair_desired_ = 0;

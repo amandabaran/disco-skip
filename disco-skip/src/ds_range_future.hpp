@@ -1,5 +1,7 @@
 #pragma once
 
+#include <string>
+
 // A10: the resumable snapshot range.
 //
 // The state-machine form of ds_range.hpp's Ranger, for the pipelined client.
@@ -122,6 +124,38 @@ class RangeOperation {
   }
 
   [[nodiscard]] bool finished() const { return step_ == RangeStep::Done; }
+
+  /// One line of state for the non-termination watchdog in ds_futures.hpp.
+  ///
+  /// The watchdog only said "a state transition is not terminating", which
+  /// names no state -- and two attempts to reason out which one were wrong. A
+  /// stuck range is either revisiting one step forever or advancing its cursor
+  /// in a cycle, and those need different fixes, so print enough to tell them
+  /// apart: the step, the cursor, the boundary key it last accepted, and where
+  /// it is in the backbone.
+  [[nodiscard]] std::string debugState() const {
+    char const *st = "?";
+    switch (step_) {
+      case RangeStep::Idle:           st = "Idle";           break;
+      case RangeStep::AwaitSnapshot:  st = "AwaitSnapshot";  break;
+      case RangeStep::Traversing:     st = "Traversing";     break;
+      case RangeStep::AwaitHeader:    st = "AwaitHeader";    break;
+      case RangeStep::AwaitVec:       st = "AwaitVec";       break;
+      case RangeStep::AwaitSettle:    st = "AwaitSettle";    break;
+      case RangeStep::AwaitOldVer:    st = "AwaitOldVer";    break;
+      case RangeStep::AwaitIdxHeader: st = "AwaitIdxHeader"; break;
+      case RangeStep::AwaitIdxVec:    st = "AwaitIdxVec";    break;
+      case RangeStep::AwaitBatchHdrs: st = "AwaitBatchHdrs"; break;
+      case RangeStep::AwaitBatchVecs: st = "AwaitBatchVecs"; break;
+      case RangeStep::Done:           st = "Done";           break;
+    }
+    return std::string("step=") + st +
+           " lo=" + std::to_string(lo_) + " hi=" + std::to_string(hi_) +
+           " cur.id=" + std::to_string(cur_.id) +
+           " last_kmin=" + std::to_string(static_cast<uint64_t>(last_kmin_)) +
+           " bone_i=" + std::to_string(bone_i_) +
+           "/" + std::to_string(bone_n_);
+  }
   [[nodiscard]] RangeResult const &result() const { return res_; }
 
  private:
@@ -376,8 +410,8 @@ class RangeOperation {
   size_t fillBackbone() {
     bone_n_ = 0;
     for (; idx_i_ < idx_vec_.size && bone_n_ < Ops::walkFanout(); ++idx_i_) {
-      if (idx_vec_.e[idx_i_].key > hi_) { idx_past_hi_ = true; break; }
-      bone_[bone_n_++] = RemoteAddr{idx_vec_.e[idx_i_].val};
+      if (idx_vec_.keyAt(idx_i_) > hi_) { idx_past_hi_ = true; break; }
+      bone_[bone_n_++] = RemoteAddr{idx_vec_.valAt(idx_i_)};
     }
     if (bone_n_ == 0) return nextIndexNode();
 
@@ -525,7 +559,7 @@ class RangeOperation {
         return done(false);
       }
       for (uint32_t e = 0; e < vc.size; ++e) {
-        Key const k = vc.e[e].key;
+        Key const k = vc.keyAt(e);
         if (k < lo_) continue;
         if (k > hi_) break;
         if (out_->size() >= cap_) {
@@ -533,7 +567,7 @@ class RangeOperation {
           ++stats_.capped;
           return done(true);
         }
-        out_->push_back(vc.e[e]);
+        out_->push_back(vc.entryAt(e));
         ++stats_.entries;
       }
       ++stats_.nodes_walked;
@@ -747,7 +781,7 @@ class RangeOperation {
       return done(false);
     }
     for (uint32_t i = 0; i < vec_.size; ++i) {
-      Key const k = vec_.e[i].key;
+      Key const k = vec_.keyAt(i);
       if (k < lo_) continue;
       if (k > hi_) break;            // entries are sorted
       if (out_->size() >= cap_) {
@@ -755,7 +789,7 @@ class RangeOperation {
         ++stats_.capped;
         return done(true);
       }
-      out_->push_back(vec_.e[i]);
+      out_->push_back(vec_.entryAt(i));
       ++stats_.entries;
     }
     return stepRight();

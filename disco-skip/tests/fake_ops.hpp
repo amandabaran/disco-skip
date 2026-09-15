@@ -286,11 +286,11 @@ class FakeOps {
 inline void seedDataKey(FakeOps &ops, ds::Key k, ds::Value v) {
   ds::VecRecord &dv = ops.vecOf(ds::RemoteAddr{ds::kInitialDataId});
   uint32_t i = dv.size;
-  while (i > 0 && dv.e[i - 1].key > k) {
-    dv.e[i] = dv.e[i - 1];
+  while (i > 0 && dv.keyAt(i - 1) > k) {
+    dv.moveEntry(i, i - 1);
     --i;
   }
-  dv.e[i] = ds::Entry{k, v};
+  dv.setAt(i, k, v);
   ++dv.size;
 }
 
@@ -346,16 +346,16 @@ inline SplitFixture stageMidSplitOn(FakeOps &ops, ds::RemoteAddr existing,
   ops.node(f.created).next_k_min = e.next_k_min;
   ds::initVec(ops.vecAt(created_vec), /*is_orphan=*/true, /*ts=*/1000);
   ops.vecAt(created_vec).size = 2;
-  ops.vecAt(created_vec).e[0] = ds::Entry{f.split_key, f.split_key * 7};
-  ops.vecAt(created_vec).e[1] = ds::Entry{f.moved_key, f.moved_key * 7};
+  ops.vecAt(created_vec).setAt(0, f.split_key, f.split_key * 7);
+  ops.vecAt(created_vec).setAt(1, f.moved_key, f.moved_key * 7);
 
   // The existing node's new vector: keys < split_key, plus the descriptor
   // telling a helper what still has to reach the header.
   ds::VecRecord &nv = ops.vecAt(f.new_vec);
   ds::initVec(nv, /*is_orphan=*/false, pending_ts ? ds::kNullTs : 2000);
   nv.size = 2;
-  nv.e[0] = ds::Entry{f.stay_key, f.stay_key * 7};
-  nv.e[1] = ds::Entry{200, 1400};
+  nv.setAt(0, f.stay_key, f.stay_key * 7);
+  nv.setAt(1, 200, 1400);
   nv.next_id = f.created.id;
   nv.k_min_next = f.split_key;
   nv.old_ver = e.handle.offset();

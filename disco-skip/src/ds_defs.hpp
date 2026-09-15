@@ -57,8 +57,37 @@ static_assert(kNumReplicas == 1 || kNumReplicas == 3,
 /// `2 << IDX_EXP` (skipvector_disco.h, node_t::get_vector_size), and A4 settled
 /// that the remote capacity matches. The remote node layout asserts against
 /// this, so the two cannot drift apart silently.
-inline constexpr size_t kNodeCapacity = size_t{2} << kIdxExp;
-static_assert(kNodeCapacity == 16, "IDX_EXP=3 was assumed throughout the docs");
+/// log2 of the DATA node's chunk size, separate from the index's.
+///
+/// WHY THIS IS ITS OWN KNOB. kNodeCapacity used to derive from kIdxExp, which
+/// tied the data vector's entry count to the INDEX fan-out -- two unrelated
+/// concerns. Bigger data nodes cut round trips on a range walk (fewer nodes to
+/// cover the same key span); the index fan-out governs descent depth. Sweeping
+/// one should not move the other.
+///
+/// The cache already separates them: ds_cache.hpp instantiates the skip vector
+/// with IDX_EXP and DATA_EXP as distinct template arguments and we were simply
+/// passing kIdxExp for both, so this needs no change on the cache side.
+///
+/// Defaults to kIdxExp, so an unset DS_DATA_EXP reproduces the old geometry
+/// exactly.
+#ifndef DS_DATA_EXP
+#define DS_DATA_EXP DS_IDX_EXP
+#endif
+inline constexpr int64_t kDataExp = DS_DATA_EXP;
+
+/// Entries per DATA node vector, on both sides.
+///
+/// 2 << kDataExp: 16, 32, 64, 128 at DS_DATA_EXP = 3, 4, 5, 6. VecRecord stays
+/// a multiple of 64 bytes at every one of those (64 B header + cap*8 keys +
+/// cap*8 values), so the cache-line assert below holds without special cases.
+inline constexpr size_t kNodeCapacity = size_t{2} << kDataExp;
+static_assert(kNodeCapacity >= 16 && kNodeCapacity <= 128,
+              "DS_DATA_EXP must be 3..6: below 16 the docs' geometry breaks, "
+              "above 128 a VecRecord stops fitting a sensible RDMA read");
+static_assert((kNodeCapacity & (kNodeCapacity - 1)) == 0,
+              "capacity must be a power of two for the SIMD key scan's tail "
+              "handling to be a whole number of lanes");
 
 /// Expected fan-out between adjacent levels: the cache's private
 /// TARGET_IDX_RATIO. Interface doc §8's staleness analysis is written for

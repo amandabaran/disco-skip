@@ -133,6 +133,15 @@ struct QuorumStats {
   /// See the derivation in ds_ts.hpp. Non-zero means the timestamps in that run
   /// are a linearization but not necessarily a real-time one.
   uint64_t ts_partial = 0;
+  /// FAA rounds REJECTED because fewer than a majority answered.
+  ///
+  /// Distinct from ts_partial, which counts rounds that fell short of ALL
+  /// replicas but still reached a quorum. Below a quorum there is no
+  /// intersection with any other writer's quorum at all, so the stamp carries
+  /// no ordering property whatsoever -- not even the weakened one. Such a round
+  /// must NOT yield a timestamp; the version stays pending (kNullTs) and a
+  /// reader settles it.
+  uint64_t ts_short_of_quorum = 0;
   uint64_t batches = 0;         ///< chained submissions, i.e. round trips
   uint64_t write_shortfalls = 0;///< a batch landed on fewer than a majority
   uint64_t vec_writes = 0;      ///< logical vector writes, summed over batches
@@ -207,7 +216,7 @@ class QuorumOps {
       // was partially applied, which is why votes are counted per value rather
       // than per tag.
       size_t best = n;  // index of the winning replica
-      uint64_t best_tag = 0;
+      uint64_t best_raw = 0;
       size_t best_votes = 0;
       bool tie = false;
       for (size_t r = 0; r < n; ++r) {
@@ -217,12 +226,31 @@ class QuorumOps {
           if (ok[q] && seen[q].handle == seen[r].handle) ++votes;
         }
         if (votes < majority()) continue;
-        uint64_t const tag = seen[r].handle.tag();
-        if (best == n || tag > best_tag) {
+        // Max raw, not max tag -- the rule repairRead already uses, applied
+        // here so the two cannot drift. The offset is in the LOW 32 bits, so
+        // raw is tag order refined by (writer, attempt) and a bigger offset can
+        // never let a staler tag win.
+        uint64_t const raw = seen[r].handle.raw;
+        if (best == n || raw > best_raw) {
           best = r;
-          best_tag = tag;
+          best_raw = raw;
           best_votes = votes;
-        } else if (tag == best_tag && seen[r].handle != seen[best].handle) {
+        } else if (seen[r].handle.tag() == seen[best].handle.tag() &&
+                   seen[r].handle != seen[best].handle) {
+          // UNREACHABLE HERE, AND THAT IS WHY tag_ties READS ZERO.
+          //
+          // Both arms of this comparison have already cleared `votes >=
+          // majority()`, and two DISTINCT handles can never both hold a
+          // majority: 2*(n/2+1) > n for every n. So exactly one distinct handle
+          // survives the filter above and there is never a second one to tie
+          // with.
+          //
+          // The counter therefore does NOT show that distinct handles rarely
+          // share a tag -- it cannot fire at all, so it is evidence of nothing.
+          // Real tag ties are reachable only where a handle NO majority holds
+          // is considered, i.e. repairRead/resolveRepair. Kept so the invariant
+          // is asserted by a live counter rather than a comment; if it ever
+          // becomes non-zero, the majority filter above has been weakened.
           tie = true;
         }
       }

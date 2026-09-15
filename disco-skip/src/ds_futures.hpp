@@ -137,6 +137,19 @@ class SvFuture : public BasicFuture {
     }
   }
 
+  /// What the stuck future was doing, for the non-termination watchdog below.
+  /// The message used to say only "a state transition is not terminating",
+  /// naming no state -- which is why two rounds of guessing at the mechanism
+  /// were needed and both were wrong.
+  [[nodiscard]] std::string stuckState() const {
+    switch (kind_) {
+      case Kind::Range: return "kind=Range " + range_.debugState();
+      case Kind::Get:   return "kind=Get";
+      case Kind::Put:   return "kind=Put " + put_.debugState();
+      default:          return "kind=None";
+    }
+  }
+
   bool tryStepForward() {
     if (kind_ == Kind::None) return true;
     for (int64_t x : ongoing_) {
@@ -146,7 +159,8 @@ class SvFuture : public BasicFuture {
       throw std::runtime_error(
           "future " + std::to_string(future_id) + " is stuck after " +
           std::to_string(steps_) +
-          " steps without finishing: a state transition is not terminating");
+          " steps without finishing: a state transition is not terminating; " +
+          stuckState());
     }
     awaiting_ = stepActive();
     settleIfImmediate();

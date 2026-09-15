@@ -156,17 +156,17 @@ class Writer {
 
       VecRecord staged = vec;
       int const idx = findLte(vec, k);
-      bool const present = idx >= 0 && vec.e[idx].key == k;
+      bool const present = idx >= 0 && vec.keyAt(idx) == k;
 
       if (present) {
-        staged.e[idx].val = v;
+        staged.setValAt(idx, v);
       } else {
         if (vec.size >= kNodeCapacity) return WriteOutcome::Full;
         // Entries are sorted, so the new one lands just after the last key
         // below k. findLte returning -1 means k sorts first.
         uint32_t const at = static_cast<uint32_t>(idx + 1);
-        for (uint32_t i = staged.size; i > at; --i) staged.e[i] = staged.e[i - 1];
-        staged.e[at] = Entry{k, v};
+        for (uint32_t i = staged.size; i > at; --i) staged.moveEntry(i, i - 1);
+        staged.setAt(at, k, v);
         ++staged.size;
       }
 
@@ -311,7 +311,7 @@ class Writer {
       }
 
       uint32_t keep = 0;
-      while (keep < vec.size && vec.e[keep].key < split_key) ++keep;
+      while (keep < vec.size && vec.keyAt(keep) < split_key) ++keep;
 
       RemoteAddr const created = ops_.allocNode();
       VecOffset const created_vec = ops_.allocVec();
@@ -333,7 +333,8 @@ class Writer {
 
       VecRecord cvec;
       initVec(cvec, orphan, kNullTs);
-      for (uint32_t i = keep; i < vec.size; ++i) cvec.e[cvec.size++] = vec.e[i];
+      for (uint32_t i = keep; i < vec.size; ++i)
+        cvec.copyEntryFrom(cvec.size++, vec, i);
       if (seed != nullptr && !insertSorted(cvec, *seed)) return fail(out);
 
       // 2. The existing node's new version: keeps the lower range, and carries
@@ -344,7 +345,7 @@ class Writer {
       //    CASes.
       VecRecord nvec = vec;
       nvec.size = keep;
-      for (uint32_t i = keep; i < kNodeCapacity; ++i) nvec.e[i] = Entry{};
+      for (uint32_t i = keep; i < kNodeCapacity; ++i) nvec.clearAt(i);
       nvec.struct_ver = node.handle.structVer() + 1;
       nvec.content_ver = node.handle.contentVer();  // V3: only one moves
       nvec.ts = kNullTs;
@@ -435,7 +436,7 @@ class Writer {
       if (!settle(addr, node, vec)) return WriteOutcome::Failed;
       if (vec.size < 2) return WriteOutcome::Failed;  // cannot split usefully
 
-      Key const median = vec.e[vec.size / 2].key;
+      Key const median = vec.keyAt(vec.size / 2);
       SplitResult const s = splitAt(addr, median, /*orphan=*/true, nullptr);
       if (s.outcome != WriteOutcome::Published) return s.outcome;
       if (orphan_out != nullptr) *orphan_out = s.created;
@@ -480,13 +481,13 @@ class Writer {
   static bool insertSorted(VecRecord &v, Entry e) {
     if (v.size >= kNodeCapacity) return false;
     uint32_t at = 0;
-    while (at < v.size && v.e[at].key < e.key) ++at;
-    if (at < v.size && v.e[at].key == e.key) {
-      v.e[at].val = e.val;
+    while (at < v.size && v.keyAt(at) < e.key) ++at;
+    if (at < v.size && v.keyAt(at) == e.key) {
+      v.setValAt(at, e.val);
       return true;
     }
-    for (uint32_t i = v.size; i > at; --i) v.e[i] = v.e[i - 1];
-    v.e[at] = e;
+    for (uint32_t i = v.size; i > at; --i) v.moveEntry(i, i - 1);
+    v.setAt(at, e);
     ++v.size;
     return true;
   }

@@ -56,7 +56,7 @@ static std::map<ds::Key, ds::Value> seedChain(FakeOps &ops, int nodes,
     v.size = 0;
     for (int j = 0; j < per_node; ++j) {
       ds::Key const k = k_min + static_cast<ds::Key>(j * 7 + 1);
-      v.e[v.size++] = ds::Entry{k, k * 3};
+      v.setAt(v.size++, k, k * 3);
       oracle[k] = k * 3;
     }
     prev = cur;

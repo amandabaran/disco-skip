@@ -35,7 +35,12 @@ namespace ds {
 
 using SkipVec = skipvector<Key, Value, RemoteAddr,
                            vector_sfra, vector_umfra,
-                           /*IDX_EXP=*/kIdxExp, /*DATA_EXP=*/kIdxExp,
+                           // DATA_EXP is kDataExp, not kIdxExp: the data
+                           // layer's chunk size is its own knob now
+                           // (DS_DATA_EXP), and the cache already took the two
+                           // as separate template arguments -- we were just
+                           // passing the same value for both.
+                           /*IDX_EXP=*/kIdxExp, /*DATA_EXP=*/kDataExp,
                            /*MAX_LAYERS=*/kMaxLayers,
                            /*HP=*/hp_manager<MAX_THREADS>>;
 

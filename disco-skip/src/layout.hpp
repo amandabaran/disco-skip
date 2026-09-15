@@ -80,6 +80,12 @@ struct Layout {
     // serial walk as the reference: range_test.cc pins them to byte-identical
     // results over both a quiescent and a 400-put-stale cache.
     bool cache_walk;
+    /// Spread VECTOR reads across the replicas that agree, instead of always
+    /// taking the first. See resolveWalkHeader in ds_rdma_async.hpp.
+    bool spread_reads;
+    /// Post header reads to `majority()` replicas instead of all of them,
+    /// load-balanced by node address. See postHeaders in ds_rdma_async.hpp.
+    bool read_quorum;
 
     // Runtime arms of the two toggles. invariants.md §9 specifies
     // DS_CACHE_ENABLED as compile-time, and it has to be: the cache is a member

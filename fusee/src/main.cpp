@@ -126,7 +126,13 @@ int main(int argc, char* argv[]) {
   if(warmup == UINT64_MAX) {
     warmup = iter_count < default_warmup ? iter_count : default_warmup;
   }
-  const uint64_t keepwarm = (iter_count + warmup) / 4;
+  // KEEPWARM MUST OUTLAST THE SLOWEST CLIENT'S WINDOW. See the long note in
+  // disco-skip/src/main.cpp: every client runs the same fixed iter_count, so a
+  // fast client finishes early and, once keepwarm runs out, stops issuing --
+  // and the slow clients then measure a system carrying less than the intended
+  // load. A quarter of the window does not cover the per-client speed spread
+  // measured on this cluster (up to 1.7x); iter_count covers a 2x spread.
+  const uint64_t keepwarm = iter_count;
 
   const uint64_t start_measurements = warmup;
   const uint64_t stop_measurements = start_measurements + iter_count;
@@ -469,11 +475,30 @@ int main(int argc, char* argv[]) {
     int32_t total_update_count = 0;
     int32_t total_cache_hit_count = 0;
     int32_t total_true_cache_hit_count = 0;
+    // Run-wide, NOT per-operation: execute_point_op is defined inside the
+    // operation loop, so a counter declared next to it would reset on every
+    // iteration and always report the last scan's misses.
+    uint64_t scan_probe_misses = 0;
 
     // Worklaod Loop
     // WORKLOAD LOOP
     for (size_t i = 0; i < total_iter_count; i++) {
       if (i == start_measurements) {
+        // BARRIER, OR THE PER-CLIENT NUMBERS DO NOT SHARE A WINDOW.
+        // Same defect and same fix as disco-skip/src/main.cpp -- there was a
+        // barrier at "initialized" but none here, so each client began
+        // measuring whenever it personally finished warmup, and the windows
+        // drifted apart until they no longer overlapped.
+        //
+        // THIS HAD TO BE FIXED IN ALL THREE BINARIES, NOT JUST OURS.
+        // swarm-kv and fusee carry the identical pattern, so correcting only
+        // disco-skip would leave the competitors' numbers inflated by the
+        // stagger while ours became honest -- biasing the comparison against
+        // us and invalidating it either way.
+        //
+        // Clients only: the memory servers never enter this loop, so waiting
+        // on them here would hang forever.
+        store.barrier("measure-start", layout.num_clients);
         start = std::chrono::steady_clock::now();
       } else if (i == stop_measurements) {
         end = std::chrono::steady_clock::now();
@@ -483,7 +508,23 @@ int main(int argc, char* argv[]) {
 
       // Native point operation processing lambda for FUSEE
       // Native point operation processing lambda for FUSEE
-      auto execute_point_op = [&](const std::string& target_key, OpType type, const std::string& target_value) {
+      // `scan_probe` = this call is one slot of a SCAN, not a point op.
+      //
+      // WHY IT IS NEEDED. fusee is a HASH store with no ordered iterator, so
+      // workload E's scan is emulated by walking the key space: start at the
+      // scan's key and read `scan_count` lexicographically successive keys,
+      // whether or not they exist. In a uniform YCSB keyspace most of those
+      // slots are empty, and both "absent" paths below used to throw -- so
+      // EVERY fusee workload-E run aborted with `Key not found` partway
+      // through the benchmark. There is no fusee E data in this repo for that
+      // reason, not because it was slow.
+      //
+      // An absent slot is a legitimate outcome of that walk and is counted, not
+      // an error. A point READ or UPDATE of a preloaded key that comes back
+      // missing IS an error and still throws -- that distinction is the whole
+      // point of the flag, and collapsing it would hide real failures in the
+      // read-heavy workloads.
+      auto execute_point_op = [&](const std::string& target_key, OpType type, const std::string& target_value, bool scan_probe = false) {
         auto hkey = hash(target_key);
         auto random_server = (reinterpret_cast<uint64_t const*>(hkey.data())[0] % (layout.num_servers - 1)) + 1;
         auto main_server = 0UL;
@@ -595,7 +636,12 @@ int main(int argc, char* argv[]) {
           total_search_time += measure;
         }
 
-        if (sf.nb_matches == 0) { throw std::runtime_error("Key not found"); }
+        // No index slot for this key. Empty keyspace slot during a scan walk;
+        // a genuinely missing key otherwise.
+        if (sf.nb_matches == 0) {
+          if (scan_probe) { ++scan_probe_misses; last_time = now; return; }
+          throw std::runtime_error("Key not found");
+        }
 
         auto found = false;
         for (size_t j = 0; j < sf.nb_matches; j++) {
@@ -656,7 +702,13 @@ int main(int argc, char* argv[]) {
             break;
           }
         }
-        if (!found) { throw std::runtime_error("Match evaluation logic failed."); }
+        // Candidate slots existed but none held this key -- a hash collision
+        // against some other key. Same story as nb_matches == 0: during a scan
+        // walk that is an empty slot, elsewhere it is a real failure.
+        if (!found) {
+          if (scan_probe) { ++scan_probe_misses; last_time = now; return; }
+          throw std::runtime_error("Match evaluation logic failed.");
+        }
         last_time = now;
       };
 
@@ -693,7 +745,7 @@ int main(int argc, char* argv[]) {
       else if (operation.type == OpType::SCAN) {
         std::string scan_key = operation.key;
         for (int c = 0; c < operation.scan_count; ++c) {
-          execute_point_op(scan_key, OpType::READ, "");
+          execute_point_op(scan_key, OpType::READ, "", /*scan_probe=*/true);
           scan_key = IncrementYcsbKey(scan_key);
         }
       }
@@ -704,6 +756,17 @@ int main(int argc, char* argv[]) {
     std::cout << "Done. Results:" << std::endl;
 
     fmt::print("\n");
+    // SCAN PROBE MISSES -- REQUIRED TO INTERPRET ANY fusee WORKLOAD-E NUMBER.
+    //
+    // fusee's scan walks `scan_count` successive keys in a hash store, and an
+    // absent slot now costs one index search and NO kv read. So a scan that
+    // misses most of its slots is fast precisely because it found nothing, and
+    // quoting its throughput against an ordered range scan without this figure
+    // overstates it. A high miss rate is not a bug -- it is what emulating an
+    // ordered scan on a hash store means -- but it must appear next to the
+    // number.
+    fmt::print("scan probes:  {} misses (empty keyspace slots)\n",
+               scan_probe_misses);
     if (range_lock) {
       // Byte-identical in swarm-kv/src/main.cpp, and the harness greps for this
       // exact text to flag an arm labelled locked that took no locks. Retries

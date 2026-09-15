@@ -4,8 +4,16 @@ project(disco-skip CXX)
 # ─── 1. Compile-time toggles (1 = enable, 0 = disable) ───────────────────────
 #
 # DS_CACHE_ENABLED / DS_N_REPLICAS are the two toggles mandated by
-# docs/invariants.md §9. DS_N_REPLICAS must be 1 or 3: at 1 the quorum is 1 and
-# the single-replica path is taken, which the microbench compares against 3.
+# docs/invariants.md §9.
+#
+# DS_N_REPLICAS DOES NOT SET THE REPLICA COUNT OF THIS BINARY. ds::kNumReplicas
+# appears in exactly two places -- its own definition and a static_assert -- and
+# nowhere in the operational path. The live replica count is conns_.size(), i.e.
+# whatever `-s` says at run time, and majority() derives from that. So this
+# staying at 1 while every experiment runs three servers is not a bug; the
+# previous comment here claimed "at 1 the quorum is 1 and the single-replica
+# path is taken", which is true of the TEST binaries (tests/Makefile builds
+# repl1 and repl3 variants) and false of this one.
 set(DS_CACHE_ENABLED 1)
 set(DS_N_REPLICAS    1)
 
@@ -14,6 +22,17 @@ set(DS_N_REPLICAS    1)
 # the remote node capacity (interface doc A4).
 set(DS_MAX_LAYERS 8)
 set(DS_IDX_EXP    3)
+
+# DATA node capacity, separate from the index fan-out above.
+#
+# 2<<DS_DATA_EXP entries per data vector: 16 / 32 / 64 / 128 at 3 / 4 / 5 / 6.
+# Bigger data nodes cover more keys per node, so a range walk needs fewer of
+# them and fewer round trips; the index fan-out (DS_IDX_EXP) governs descent
+# depth and is a different question. These used to be one knob.
+#
+# VecRecord stays a multiple of 64 bytes at every value, with keys[] and vals[]
+# both cache-line aligned -- see the layout note in ds_node.hpp.
+set(DS_DATA_EXP   3)
 
 # Maximum threads per client process. Currently one client thread per process,
 # but this sizes the cache's hazard-pointer arrays, so it must be >= the real
@@ -29,11 +48,19 @@ if(NOT DS_N_REPLICAS EQUAL 1 AND NOT DS_N_REPLICAS EQUAL 3)
     message(FATAL_ERROR "DS_N_REPLICAS must be 1 or 3 (got ${DS_N_REPLICAS})")
 endif()
 
+# -mavx2 IS LOAD-BEARING. VecRecord::findLte has a SIMD path guarded by
+# __AVX2__; without this flag the macro is undefined, the scalar fallback
+# compiles in, and the deployed binary measures the fallback while the tests
+# (which do pass -mavx2) measure the vector path. All cluster nodes here are
+# AVX2-capable.
+add_compile_options(-mavx2)
+
 add_compile_definitions(
     DS_CACHE_ENABLED=${DS_CACHE_ENABLED}
     DS_N_REPLICAS=${DS_N_REPLICAS}
     DS_MAX_LAYERS=${DS_MAX_LAYERS}
     DS_IDX_EXP=${DS_IDX_EXP}
+    DS_DATA_EXP=${DS_DATA_EXP}
     DS_REG_CACHE_ENABLED=${DS_REG_CACHE_ENABLED}
     DS_REG_WRITEBACK_ENABLED=${DS_REG_WRITEBACK_ENABLED}
 )

@@ -40,7 +40,7 @@ static std::vector<std::pair<ds::Key, ds::Value>> entriesOf(FakeOps &ops,
                                                             ds::RemoteAddr a) {
   std::vector<std::pair<ds::Key, ds::Value>> out;
   ds::VecRecord const &v = ops.vecOf(a);
-  for (uint32_t i = 0; i < v.size; ++i) out.push_back({v.e[i].key, v.e[i].val});
+  for (uint32_t i = 0; i < v.size; ++i) out.push_back({v.keyAt(i), v.valAt(i)});
   return out;
 }
 
@@ -80,7 +80,7 @@ static void checkF1InsertsAndUpdates() {
   CHECK(st.updates == 1, "and is counted as an update");
   ds::VecRecord const &v = ops.vecOf(kData);
   int const idx = ds::findLte(v, 300);
-  CHECK(idx >= 0 && v.e[idx].key == 300 && v.e[idx].val == 999,
+  CHECK(idx >= 0 && v.keyAt(idx) == 300 && v.valAt(idx) == 999,
         "and the new value is the one readable");
 
   CHECK(verifyOk(ops), "I1-I4 hold after F1 writes");

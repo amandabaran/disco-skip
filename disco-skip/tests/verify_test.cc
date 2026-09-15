@@ -193,8 +193,8 @@ static void checkVerifierCatchesBreakage() {
     FakeArena a = buildInitial(layers);
     ds::VecRecord &v = a.vec(ds::headAddr(2));
     v.size = 2;
-    v.e[0] = ds::Entry{50, ds::headAddr(1).id};
-    v.e[1] = ds::Entry{10, ds::headAddr(1).id};
+    v.setAt(0, 50, ds::headAddr(1).id);
+    v.setAt(1, 10, ds::headAddr(1).id);
     rejects(ds::verifyStructure(a, layers), "entries out of order");
   }
 
@@ -203,8 +203,8 @@ static void checkVerifierCatchesBreakage() {
     FakeArena a = buildInitial(layers);
     ds::VecRecord &v = a.vec(ds::headAddr(2));
     v.size = 2;
-    v.e[0] = ds::Entry{0, ds::headAddr(1).id};
-    v.e[1] = ds::Entry{100, ds::headAddr(1).id};
+    v.setAt(0, 0, ds::headAddr(1).id);
+    v.setAt(1, 100, ds::headAddr(1).id);
     rejects(ds::verifyStructure(a, layers), "one child with two parents");
   }
 

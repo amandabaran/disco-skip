@@ -275,7 +275,7 @@ class Ranger {
           return res;                  // resolved stays false
         }
         for (uint32_t i = 0; i < asof.size; ++i) {
-          Key const k = asof.e[i].key;
+          Key const k = asof.keyAt(i);
           if (k < lo) continue;
           if (k > hi) break;           // entries are sorted
           if (out.size() >= cap) {
@@ -284,7 +284,7 @@ class Ranger {
             res.resolved = true;
             return res;
           }
-          out.push_back(asof.e[i]);
+          out.push_back(asof.entryAt(i));
           ++stats_.entries;
         }
       } else {

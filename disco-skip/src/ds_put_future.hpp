@@ -1,5 +1,7 @@
 #pragma once
 
+#include <string>
+
 // A Put as a resumable operation: F1, F2 and the Update_Index climb, yieldable.
 //
 // The state-machine twin of Putter. Harder than the Get side because a put is
@@ -136,6 +138,43 @@ class PutOperation {
         break;
     }
     return 0;
+  }
+
+  /// One line of state for the non-termination watchdog in ds_futures.hpp.
+  ///
+  /// The stuck futures at 32 and 64 clients under --spread-reads all reported
+  /// kind=Put and nothing else, which named no phase -- and the range path had
+  /// been instrumented instead, on a wrong assumption about which operation was
+  /// hanging. AwaitSettle is the suspected state (a put that keeps deciding a
+  /// version is pending and keeps failing to settle it), so print enough to
+  /// confirm or rule that out rather than infer it again.
+  [[nodiscard]] std::string debugState() const {
+    char const *st = "?";
+    switch (step_) {
+      case PutStep::Idle:             st = "Idle";            break;
+      case PutStep::Traversing:       st = "Traversing";      break;
+      case PutStep::AwaitHeader:      st = "AwaitHeader";     break;
+      case PutStep::AwaitVec:         st = "AwaitVec";        break;
+      case PutStep::AwaitSettle:      st = "AwaitSettle";     break;
+      case PutStep::AwaitInsert:      st = "AwaitInsert";     break;
+      case PutStep::AwaitSplitStage:  st = "AwaitSplitStage"; break;
+      case PutStep::AwaitSplitFinish: st = "AwaitSplitFinish";break;
+      case PutStep::AwaitStamp:       st = "AwaitStamp";       break;
+      case PutStep::Done:             st = "Done";            break;
+    }
+    char const *ph = "?";
+    switch (phase_) {
+      case PutPhase::DataInsert:    ph = "DataInsert";    break;
+      case PutPhase::DataSplit:     ph = "DataSplit";     break;
+      case PutPhase::ClimbSplit:    ph = "ClimbSplit";    break;
+      case PutPhase::TopInsert:     ph = "TopInsert";     break;
+      case PutPhase::CapacitySplit: ph = "CapacitySplit"; break;
+      case PutPhase::SeedInsert:    ph = "SeedInsert";    break;
+    }
+    return std::string("step=") + st + " phase=" + ph +
+           " vec_ts=" + std::to_string(vec_.ts) +
+           " handle_off=" + std::to_string(node_.handle.offset()) +
+           (step_ == PutStep::Traversing ? " | " + trav_.debugState() : "");
   }
 
   [[nodiscard]] bool finished() const { return step_ == PutStep::Done; }
@@ -323,7 +362,7 @@ class PutOperation {
     }
 
     int const idx = findLte(vec_, key);
-    bool const present = idx >= 0 && vec_.e[idx].key == key;
+    bool const present = idx >= 0 && vec_.keyAt(idx) == key;
     if (!present && vec_.size >= kNodeCapacity) {
       // Full. Split at the median so both halves keep room, then come back.
       // A capacity split is a SEPARATE mechanism from a height-driven one: it
@@ -331,20 +370,20 @@ class PutOperation {
       if (vec_.size < 2) return done(false);
       resume_phase_ = phase_;
       phase_ = PutPhase::CapacitySplit;
-      split_key_ = vec_.e[vec_.size / 2].key;
+      split_key_ = vec_.keyAt(vec_.size / 2);
       have_seed_ = false;
       return actSplit();
     }
 
     staged_ = vec_;
     if (present) {
-      staged_.e[idx].val = val;
+      staged_.setValAt(idx, val);
     } else {
       uint32_t const at = static_cast<uint32_t>(idx + 1);
       for (uint32_t i = staged_.size; i > at; --i) {
-        staged_.e[i] = staged_.e[i - 1];
+        staged_.moveEntry(i, i - 1);
       }
-      staged_.e[at] = Entry{key, val};
+      staged_.setAt(at, key, val);
       ++staged_.size;
     }
 
@@ -433,7 +472,7 @@ class PutOperation {
     }
 
     uint32_t keep = 0;
-    while (keep < vec_.size && vec_.e[keep].key < split_key_) ++keep;
+    while (keep < vec_.size && vec_.keyAt(keep) < split_key_) ++keep;
 
     created_ = ops_.allocNode();
     VecOffset const cvec_off = ops_.allocVec();
@@ -452,12 +491,13 @@ class PutOperation {
     cnode_.next_k_min = rangeEnd(node_, vec_);
 
     initVec(cvec_, orphan, kNullTs);
-    for (uint32_t i = keep; i < vec_.size; ++i) cvec_.e[cvec_.size++] = vec_.e[i];
+    for (uint32_t i = keep; i < vec_.size; ++i)
+      cvec_.copyEntryFrom(cvec_.size++, vec_, i);
     if (have_seed_ && !insertSorted(cvec_, seed_)) return done(false);
 
     nvec_ = vec_;
     nvec_.size = keep;
-    for (uint32_t i = keep; i < kNodeCapacity; ++i) nvec_.e[i] = Entry{};
+    for (uint32_t i = keep; i < kNodeCapacity; ++i) nvec_.clearAt(i);
     nvec_.struct_ver = node_.handle.structVer() + 1;
     nvec_.content_ver = node_.handle.contentVer();
     nvec_.ts = kNullTs;
@@ -617,13 +657,13 @@ class PutOperation {
   static bool insertSorted(VecRecord &v, Entry e) {
     if (v.size >= kNodeCapacity) return false;
     uint32_t at = 0;
-    while (at < v.size && v.e[at].key < e.key) ++at;
-    if (at < v.size && v.e[at].key == e.key) {
-      v.e[at].val = e.val;
+    while (at < v.size && v.keyAt(at) < e.key) ++at;
+    if (at < v.size && v.keyAt(at) == e.key) {
+      v.setValAt(at, e.val);
       return true;
     }
-    for (uint32_t i = v.size; i > at; --i) v.e[i] = v.e[i - 1];
-    v.e[at] = e;
+    for (uint32_t i = v.size; i > at; --i) v.moveEntry(i, i - 1);
+    v.setAt(at, e);
     ++v.size;
     return true;
   }

@@ -892,7 +892,12 @@ class RdmaReplicaSet {
     // answered plus this writer's index. The index is what makes it unique when
     // two writers compute the same maximum; the maximum is what makes it
     // real-time ordered against writers that finished before this one started.
-    if (max_faa_pre_ == kNoFaa) {
+    // A QUORUM IS REQUIRED, NOT "WHOEVER ANSWERED". Same bug and same fix as
+    // RdmaAsyncOps::faaTimestamp: below a majority the round intersects no
+    // other writer's quorum, so the stamp carries no ordering property at all.
+    // kNullTs leaves the version pending and a reader settles it.
+    if (max_faa_pre_ == kNoFaa || answered_ < layout_.majority) {
+      if (max_faa_pre_ != kNoFaa) ++ts_short_of_quorum_;
       last_ts_ = kNullTs;
     } else {
       last_ts_ = tsFromFaa(max_faa_pre_, client_idx_);
@@ -940,6 +945,7 @@ class RdmaReplicaSet {
   }
   /// Faa stamps taken from fewer than all replicas -- see ds_ts.hpp.
   [[nodiscard]] uint64_t tsPartial() const { return ts_partial_; }
+  [[nodiscard]] uint64_t tsShortOfQuorum() const { return ts_short_of_quorum_; }
 
   // Client-local, so one of each however many replicas there are: a RemoteAddr
   // and a VecOffset mean the same thing on every replica, which is what lets
@@ -984,6 +990,7 @@ class RdmaReplicaSet {
   uint64_t last_ts_ = kNullTs;
   uint64_t max_faa_pre_ = kNoFaa;
   uint64_t ts_partial_ = 0;
+  uint64_t ts_short_of_quorum_ = 0;
   uint64_t client_idx_ = 0;
   uint64_t reads_ = 0, writes_ = 0, cas_ = 0, batches_ = 0;
 };

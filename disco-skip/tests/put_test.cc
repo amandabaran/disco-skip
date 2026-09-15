@@ -132,16 +132,16 @@ static void checkHeight2BuildsTheDownChain() {
   // so the verifier is the real check; these assertions localise a failure.
   ds::VecRecord const &l1 = r.ops.vecOf(ds::headAddr(1));
   int const at = ds::findLte(l1, 25);
-  CHECK(at >= 0 && l1.e[at].key == 25,
+  CHECK(at >= 0 && l1.keyAt(at) == 25,
         "level 1 gained an ordinary entry keyed k (level h-1)");
-  if (at >= 0 && l1.e[at].key == 25) {
-    ds::RemoteAddr const l0{l1.e[at].val};
+  if (at >= 0 && l1.keyAt(at) == 25) {
+    ds::RemoteAddr const l0{l1.valAt(at)};
     CHECK(r.ops.node(l0).k_min == 25, "pointing at a level-0 node whose k_min is k");
     ds::VecRecord const &l0v = r.ops.vecOf(l0);
-    CHECK(l0v.size >= 1 && l0v.e[0].key == 25,
+    CHECK(l0v.size >= 1 && l0v.keyAt(0) == 25,
           "whose first entry is keyed k as well");
     if (l0v.size >= 1) {
-      ds::RemoteAddr const dn{l0v.e[0].val};
+      ds::RemoteAddr const dn{l0v.valAt(0)};
       CHECK(r.ops.node(dn).k_min == 25, "and points at the data node k begins");
       CHECK(dn == res.data_addr, "which is the address reported to the cache");
     }

@@ -184,7 +184,7 @@ class StructureVerifier {
     // unsorted vector does not merely look odd, it silently returns wrong
     // answers.
     for (uint32_t i = 1; i < s.size; ++i) {
-      if (s.e[i].key <= s.e[i - 1].key) {
+      if (s.keyAt(i) <= s.keyAt(i - 1)) {
         err(idStr(id) + ": entries not strictly ascending at index " +
             std::to_string(i));
         break;
@@ -193,16 +193,16 @@ class StructureVerifier {
 
     // I1, in its general form: a node's k_min must not exceed the smallest key
     // it holds, or the node claims a range that starts after its own contents.
-    if (s.size > 0 && n.k_min > s.e[0].key) {
+    if (s.size > 0 && n.k_min > s.keyAt(0)) {
       err(idStr(id) + ": k_min " + std::to_string(n.k_min) +
-          " exceeds first key " + std::to_string(s.e[0].key));
+          " exceeds first key " + std::to_string(s.keyAt(0)));
     }
 
     // Every key must fall inside the range the node advertises, or a traversal
     // that trusts next_k_min would skip it.
     Key const end = rangeEnd(n, s);
-    if (s.size > 0 && s.e[s.size - 1].key >= end) {
-      err(idStr(id) + ": last key " + std::to_string(s.e[s.size - 1].key) +
+    if (s.size > 0 && s.keyAt(s.size - 1) >= end) {
+      err(idStr(id) + ": last key " + std::to_string(s.keyAt(s.size - 1)) +
           " is at or past the end of its range " + std::to_string(end));
     }
 
@@ -298,10 +298,10 @@ class StructureVerifier {
       VecRecord const &s = v;
       uint32_t const capped = s.size <= kNodeCapacity ? s.size : 0;
       for (uint32_t i = 0; i < capped; ++i) {
-        uint64_t const child = s.e[i].val;
+        uint64_t const child = s.valAt(i);
         if (child == kNullId) {
           err(idStr(cur.id) + ": entry " + std::to_string(i) + " (key " +
-              std::to_string(s.e[i].key) + ") points at the null node");
+              std::to_string(s.keyAt(i)) + ") points at the null node");
           continue;
         }
         uint32_t const child_level = (level == 0) ? kDataLevel : level - 1;
@@ -310,7 +310,7 @@ class StructureVerifier {
           err(idStr(child) + ": referenced by both " + idStr(it->second.from) +
               " and " + idStr(cur.id) + ", so the index is not a tree");
         } else {
-          down_.emplace(child, Expect{s.e[i].key, child_level, cur.id});
+          down_.emplace(child, Expect{s.keyAt(i), child_level, cur.id});
         }
       }
 
@@ -390,7 +390,7 @@ class StructureVerifier {
     if (!r_.read(headAddr(0), dir, dir_v)) return;  // already reported
     if (dir_v.size == 0) return;                    // empty structure
 
-    RemoteAddr cur{dir_v.e[0].val};
+    RemoteAddr cur{dir_v.valAt(0)};
     NodeRecord n;
     VecRecord v;
     Key prev_k_min = 0;

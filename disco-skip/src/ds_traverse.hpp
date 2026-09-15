@@ -248,7 +248,7 @@ class Traversal {
       path[level].k_min = node.k_min;
       path[level].addr = cur;
       path[level].first_down =
-          (level == 0 && vec.size > 0) ? RemoteAddr{vec.e[0].val} : RemoteAddr{};
+          (level == 0 && vec.size > 0) ? RemoteAddr{vec.valAt(0)} : RemoteAddr{};
       res.levels = layers;
 
       // We are about to read this node's entries, so its version must be
@@ -267,7 +267,7 @@ class Traversal {
         res.status = TraversalStatus::Miss;
         return res;
       }
-      cur = RemoteAddr{vec.e[idx].val};
+      cur = RemoteAddr{vec.valAt(idx)};
     }
 
     // `cur` now names a data node. Walk right there too: a data-level split
@@ -284,9 +284,9 @@ class Traversal {
     res.data_k_min = node.k_min;
 
     int const idx = findLte(vec, k);
-    if (idx >= 0 && vec.e[idx].key == k) {
+    if (idx >= 0 && vec.keyAt(idx) == k) {
       res.found = true;
-      res.value = vec.e[idx].val;
+      res.value = vec.valAt(idx);
     }
     res.status = TraversalStatus::Ok;
     return res;

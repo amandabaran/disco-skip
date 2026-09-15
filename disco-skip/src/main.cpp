@@ -332,6 +332,8 @@ int main(int argc, char** argv) {
     layout.offset_hint       = true;
     layout.batched_walk      = false;
     layout.cache_walk        = false;
+    layout.spread_reads      = false;
+    layout.read_quorum       = false;
     layout.consult_cache     = DS_CACHE_ENABLED ? true : false;
     layout.writeback         = DS_REG_WRITEBACK_ENABLED ? true : false;
     layout.ts_mode           = ds::TsMode::Clock;
@@ -393,6 +395,16 @@ int main(int argc, char** argv) {
                 "batch instead of two serialised reads (1 or 0). Saves a round "
                 "trip when right, wastes a vector read when wrong, so it "
                 "favours read-heavy workloads.") |
+        lyra::opt(layout.read_quorum, "read_quorum")
+            .optional()["--read-quorum"](
+                "Post header reads to a load-balanced majority() replicas "
+                "instead of all of them. -m sets the quorum size. Falls back "
+                "to all replicas for the retry when the quorum disagrees.") |
+        lyra::opt(layout.spread_reads, "spread_reads")
+            .optional()["--spread-reads"](
+                "Read each vector from replica (offset % n) rather than always "
+                "the first replica that agrees. Off by default so the two arms "
+                "stay comparable.") |
         lyra::opt(layout.cache_walk, "cache_walk")
             .optional()["--cache-walk"](
                 "Take a range's backbone from the LOCAL CACHE instead of the "
@@ -457,7 +469,21 @@ int main(int argc, char** argv) {
     if (warmup == UINT64_MAX) {
         warmup = iter_count < default_warmup ? iter_count : default_warmup;
     }
-    const uint64_t keepwarm           = (iter_count + warmup) / 4;
+    // KEEPWARM MUST OUTLAST THE SLOWEST CLIENT'S WINDOW, not a quarter of it.
+    //
+    // It was (iter_count + warmup) / 4. Every client runs the same fixed
+    // iter_count, so a FAST client finishes its window early and, once keepwarm
+    // runs out, stops issuing entirely -- and the slow clients then measure a
+    // system carrying less than the intended load. Measured per-client spread
+    // on this cluster is up to 1.7x (22 vs 13 kops for the two clients on one
+    // node), so the fast client must keep loading for ~0.7x of its own window
+    // after finishing. A quarter does not cover that; iter_count covers a 2x
+    // spread.
+    //
+    // Costs 33% more wall clock per cell (warmup + iter + keepwarm goes from
+    // 187.5k to 250k ops at -I 100000 -W 50000). That is the price of the sum
+    // over clients meaning anything.
+    const uint64_t keepwarm           = iter_count;
     const uint64_t start_measurements = warmup;
     const uint64_t stop_measurements  = start_measurements + iter_count;
     const uint64_t total_iter_count   = stop_measurements + keepwarm;
@@ -937,6 +963,42 @@ int main(int argc, char** argv) {
                     // issued during warmup complete inside the measured window
                     // and are counted as its throughput.
                     client.finishAllFutures();
+
+                    // BARRIER, OR THE SUM OVER CLIENTS IS MEANINGLESS.
+                    //
+                    // There is a barrier at initialization but there was none
+                    // here, so each client ran `warmup` operations at its own
+                    // pace and began measuring whenever it personally arrived.
+                    // Client start times therefore drifted, and once the drift
+                    // exceeded keepwarm the per-client windows stopped
+                    // overlapping: every client measured a system carrying only
+                    // part of the load, and the sweep summed those rates into a
+                    // total the system never delivered.
+                    //
+                    // OBSERVED, workload E, 16 clients, --cache-walk 1, same
+                    // binary, fixed 100k measured ops each:
+                    //   r1/r2: windows all ~7 s   -> 217, 216 kops
+                    //   r3:    windows 1 s / 3 s / 4 s -> 418 kops
+                    // In r3 one client did its 100k operations in ONE second
+                    // (100 kops) -- faster than a single UNCONTENDED client on
+                    // this cluster (63 kops) -- while its own sibling on the
+                    // same node took three seconds. Both cannot be right about
+                    // a shared system unless they measured different stretches
+                    // of wall-clock time. The excursion is ABOVE the ~216 that
+                    // reproduces whenever the windows are tight, so the error
+                    // flatters us.
+                    //
+                    // memstore::barrier is an atomic increment-and-wait and it
+                    // THROWS if the count passes wait_for, so a counter left
+                    // over from a previous run fails loudly instead of letting
+                    // the barrier through. remote-memc.sh restarts memcached
+                    // per run, so it starts clean. Only clients reach this
+                    // loop (is_client == proc_id > num_servers), hence
+                    // num_clients and not num_clients + num_servers -- waiting
+                    // on the servers here would hang forever, because they
+                    // never enter the benchmark.
+                    store.barrier("measure-start", layout.num_clients);
+
                     measuring = true;
                     start_time = std::chrono::steady_clock::now();
                 } else if (i == stop_measurements) {
@@ -944,6 +1006,14 @@ int main(int argc, char** argv) {
                     // the window are paid for inside it. Without this the tail
                     // of the pipeline is free and the number is inflated by
                     // roughly async_parallelism operations.
+                    //
+                    // NO BARRIER HERE, DELIBERATELY. Every client runs the same
+                    // iter_count, so a barrier before end_time would park the
+                    // fast clients until the slow ones caught up and count that
+                    // idle wait inside their own measured window -- deflating
+                    // exactly the clients that were working hardest. The starts
+                    // are what must coincide; enlarged keepwarm (above) keeps
+                    // the finished clients loading the system through the tail.
                     client.finishAllFutures();
                     measuring = false;
                     end_time = std::chrono::steady_clock::now();

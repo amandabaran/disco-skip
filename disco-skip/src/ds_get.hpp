@@ -101,9 +101,9 @@ class Getter {
           ++stats_.cache_hits;
           int const idx = findLte(vec, k);
           out.resolved = true;
-          if (idx >= 0 && vec.e[idx].key == k) {
+          if (idx >= 0 && vec.keyAt(idx) == k) {
             out.found = true;
-            out.value = vec.e[idx].val;
+            out.value = vec.valAt(idx);
           } else {
             ++stats_.not_found;
           }
@@ -173,6 +173,14 @@ class Getter {
 /// Putter's existing call sites.
 struct NullCache {
   [[nodiscard]] RemoteAddr locateData(Key) const { return RemoteAddr{}; }
+  /// Always a MISS, so a cache-less future falls back to the remote descent.
+  /// Returning 0 is not a degenerate stub: RangeOperation::fillFromCache
+  /// treats 0 as "the cache knows nothing about this range" and walks the
+  /// backbone remotely, which is exactly the no-cache behaviour.
+  [[nodiscard]] size_t locateDataRange(Key, Key, Key *, RemoteAddr *,
+                                       size_t) const {
+    return 0;
+  }
   void reconcile(Key, RemoteAddr, PathStep const *, uint32_t) {}
   void mirrorInsert(Key, uint32_t, RemoteAddr,
                     std::array<RemoteAddr, kMaxLayers> const &) {}

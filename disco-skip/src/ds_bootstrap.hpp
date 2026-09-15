@@ -110,7 +110,7 @@ inline uint32_t buildInitialStructure(uint32_t layers, uint64_t ts,
     uint64_t const child =
         (level == 0) ? kInitialDataId : kHeadIdBase + (level - 1);
     in.vec.size = 1;
-    in.vec.e[0] = Entry{/*key=*/0, /*val=*/child};
+    in.vec.setAt(0, /*key=*/0, /*val=*/child);
   }
 
   return n;

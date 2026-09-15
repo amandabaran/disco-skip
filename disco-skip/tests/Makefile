@@ -14,7 +14,11 @@
 # otherwise editing skipvector_disco.h leaves a stale binary.
 
 CXX      ?= g++
-CXXFLAGS := -std=c++17 -O1 -g -Wall -Wextra -Wpedantic -pthread -Wno-nested-anon-types
+# -mavx2 is REQUIRED for VecRecord::findKey's SIMD path to compile in. Without
+# it __AVX2__ is undefined, the scalar fallback is used, and the tests silently
+# verify only the fallback -- which is how a SIMD key scan gets shipped
+# untested. ConnectX-3 era Xeons on this cluster all have AVX2.
+CXXFLAGS := -std=c++17 -O1 -g -mavx2 -Wall -Wextra -Wpedantic -pthread -Wno-nested-anon-types
 LDFLAGS  := -pthread
 
 SRC_DIR   := ../src
