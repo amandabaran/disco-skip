@@ -53,7 +53,32 @@ endif()
 # compiles in, and the deployed binary measures the fallback while the tests
 # (which do pass -mavx2) measure the vector path. All cluster nodes here are
 # AVX2-capable.
-add_compile_options(-mavx2)
+# NO -mavx2 GLOBALLY. IT BREAKS THE CLIENT.
+#
+# Measured, same commit otherwise: with `add_compile_options(-mavx2)` every
+# client exits SILENTLY just after queue-pair setup, before `Bootstrap:` -- no
+# throw (those are logged), no message, 0 kops. Without it, 215 kops, which is
+# the established baseline. One flag, the whole difference.
+#
+# The mechanism is NOT established -- one experiment pins the cause on the flag,
+# not on what it miscompiles. alignof(VecRecord) is 8 while the comment in
+# ds_node.hpp talks about cache lines (true of arena-resident records, whose
+# base is 64-aligned and whose stride is a multiple of 64; NOT true of a stack
+# or heap copy), so under-aligned 32-byte moves are the obvious suspect. It is
+# a suspect, not a finding.
+#
+# AND IT IS NOT WORTH CHASING AT THIS SIZE. The SIMD key scan is worth 0.1-0.3%
+# of a range operation: a scan-100 walks ~10.9 nodes of <=16 keys, ~176
+# comparisons, against 63 us uncontended per range. That bought a dead binary.
+# The struct-of-arrays layout is kept because it is the prerequisite for LARGER
+# NODES, which cut round trips -- the part that costs microseconds. findLte's
+# SIMD branch is guarded by __AVX2__, so with this off it compiles to the scalar
+# path and the tests (which do pass -mavx2, and bite-check it) still cover the
+# vector version.
+#
+# If SIMD is revisited: confine it with __attribute__((target("avx2"))) on that
+# one function plus a __builtin_cpu_supports dispatch, so codegen for the other
+# ~50k lines is untouched. Do not re-enable this globally.
 
 add_compile_definitions(
     DS_CACHE_ENABLED=${DS_CACHE_ENABLED}

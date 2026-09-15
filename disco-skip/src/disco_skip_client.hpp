@@ -375,6 +375,22 @@ public:
         fmt::print("              {} FAA rounds refused (short of quorum){}\n",
                    qstats.ts_short_of_quorum,
                    qstats.ts_short_of_quorum == 0 ? " (none)" : "  ***");
+        // ROUND TRIPS PER OPERATION -- the comparison that explains a slow
+        // workload. A point get is 1-2; a scan-100 walks ~10.9 data nodes, so
+        // it is one per node unless the batched or cache walk collapses them.
+        // At a measured ~3.7 us per round trip, trips/op times 3.7 should
+        // account for the operation's latency; where it does not, the cost is
+        // NOT round trips and looking for it there is wasted effort.
+        uint64_t const ops_resolved =
+            gstats.traversals + pstats.puts + rstats.ranges;
+        fmt::print("              {} round trips ({:.2f} per resolved op, "
+                   "over {} gets+puts+ranges)\n",
+                   qstats.round_trips,
+                   ops_resolved == 0
+                       ? 0.0
+                       : static_cast<double>(qstats.round_trips) /
+                             static_cast<double>(ops_resolved),
+                   ops_resolved);
         fmt::print("              {} stale votes, {} tag ties, {} writebacks\n",
                    qstats.stale_votes, qstats.tag_ties, qstats.writebacks);
         // The L2 read repair. Printed unconditionally because "did the repair

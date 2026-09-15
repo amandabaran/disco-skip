@@ -142,6 +142,19 @@ struct QuorumStats {
   /// must NOT yield a timestamp; the version stays pending (kNullTs) and a
   /// reader settles it.
   uint64_t ts_short_of_quorum = 0;
+  /// ROUND TRIPS. One per post/resolve pair the future actually waits on.
+  ///
+  /// The number that explains why one workload is slower than another, and it
+  /// did not exist. `batches` counts only write submissions and prints only
+  /// when the batched walk is on; `vec_reads` counts NODES, not trips
+  /// (postWalkVecs does `+= n`), so dividing it by operations overstates the
+  /// trips by the batch width. Neither answers "how many times did this
+  /// operation stop and wait for the network".
+  ///
+  /// Every post* in RdmaAsyncOps posts to all replicas before draining any, so
+  /// a post is ONE round trip regardless of replica count -- which is why this
+  /// is incremented per call and not per replica.
+  uint64_t round_trips = 0;
   uint64_t batches = 0;         ///< chained submissions, i.e. round trips
   uint64_t write_shortfalls = 0;///< a batch landed on fewer than a majority
   uint64_t vec_writes = 0;      ///< logical vector writes, summed over batches

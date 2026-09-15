@@ -91,6 +91,7 @@ class RdmaAsyncOps {
   ///
   /// @return completions the driver will see for this post
   size_t postHeaders(RemoteAddr a, VecOffset speculate) {
+    ++stats_.round_trips;  // one post/resolve pair = one round trip
     size_t const n = conns_.size();
     bumped_ = 0;
     spec_pending_ = speculate;
@@ -346,6 +347,7 @@ class RdmaAsyncOps {
   /// replica set -- because a node read is a quorum read and the majority rule
   /// applies per node over its own replicas.
   size_t postWalkHeaders(RemoteAddr const *addrs, size_t n) {
+    ++stats_.round_trips;  // one post/resolve pair = one round trip
     // This path asks EVERY replica for every node, so the vote loops in
     // resolveWalkHeader must consider all of them. read_mask_ is shared with
     // postHeaders, which narrows it under --read-quorum, so it has to be reset
@@ -478,6 +480,7 @@ class RdmaAsyncOps {
   /// Fetch the vectors for /n/ nodes in one round trip, each from the replica
   /// that supplied its winning header (L4).
   size_t postWalkVecs(VecOffset const *offs, size_t const *winners, size_t n) {
+    ++stats_.round_trips;  // one post/resolve pair = one round trip
     bumped_ = 0;
     walk_n_ = n;
     VecRecord *const bufs = layout_.getWalkVecBufs(future_id_);
@@ -539,6 +542,7 @@ class RdmaAsyncOps {
   /// costs freshness rather than correctness, and is the same trade the write
   /// path makes when it stamps from fewer than all replicas.
   size_t postTsCounter() {
+    ++stats_.round_trips;  // one post/resolve pair = one round trip
     size_t const n = conns_.size();
     bumped_ = 0;
     for (size_t r = 0; r < n; ++r) {
@@ -607,6 +611,7 @@ class RdmaAsyncOps {
   ///
   /// @return completions to await; 0 when nothing needs repairing
   size_t postRepair(RemoteAddr a) {
+    ++stats_.round_trips;  // one post/resolve pair = one round trip
     size_t const n = conns_.size();
     NodeRecord const *const hdrs = layout_.getNodeBufs(future_id_);
     bumped_ = 0;
@@ -667,6 +672,7 @@ class RdmaAsyncOps {
   }
 
   size_t postVec(VecOffset off) {
+    ++stats_.round_trips;  // one post/resolve pair = one round trip
     bumped_ = 0;
     auto &rc = *conns_[winner_];
     if (!rc.postSendSingle(dory::conn::ReliableConnection::RdmaRead, future_id_,
@@ -691,6 +697,7 @@ class RdmaAsyncOps {
   /// replicas' chains overlap -- and the caller's operation stays suspended
   /// rather than spinning, which is the whole point.
   size_t postBatch(Batch const &b) {
+    ++stats_.round_trips;  // one post/resolve pair = one round trip
     if (!b.wellFormed()) return 0;
     bumped_ = 0;
     size_t const n = conns_.size();

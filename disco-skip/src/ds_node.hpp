@@ -335,7 +335,14 @@ struct VecRecord {
   // 32-byte aligned, so every AVX2 load would straddle and none would sit
   // inside one cache line. At 64 the keys begin on a cache line and so do the
   // values, since 64 + 8*cap is a multiple of 64 for every supported cap.
-  // That is the whole point of the split.
+  //
+  // CAVEAT, because that sentence overstates it: alignof(VecRecord) is 8. The
+  // claim holds for ARENA-RESIDENT records -- the region base is 64-aligned and
+  // sizeof is a multiple of 64, so every record in it is too -- and NOT for a
+  // stack or heap copy, which is 8-aligned. Vector loads here must therefore be
+  // the UNALIGNED form. Assuming otherwise, by enabling -mavx2 globally, killed
+  // every client silently just after queue-pair setup; see the note in
+  // CMakeLists.txt.
   //
   // `height` from the proposed layout is NOT here: nothing reads a height off a
   // data vector today (it is a doPut argument, and NodeRecord carries `level`),
