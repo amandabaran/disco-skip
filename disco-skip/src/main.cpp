@@ -517,10 +517,33 @@ int main(int argc, char** argv) {
                   << std::endl;
     }
     if (layout.ts_mode == ds::TsMode::Faa && layout.num_servers > 1) {
-        std::cerr << "WARNING: --ts faa holds the counter on replica 0 only, so "
-                     "this run tolerates one memory node failing UNLESS it is "
-                     "server 0. That is a weaker failure model than the 2-of-"
-                  << layout.num_servers << " commit otherwise gives."
+        // THIS WARNING USED TO SAY THE COUNTER LIVES ON REPLICA 0 ONLY, and
+        // that it therefore tolerated one failure unless it was server 0. That
+        // was wrong, and wrong in the pessimistic direction -- it understated
+        // our own failure model in every run header printed. The counter is
+        // replicated: postTsCounter/faaTs address tsCounterAddrOf(remoteBuf())
+        // per connection and post to every replica, and faaTimestamp() takes
+        // the MAXIMUM over those that answered while refusing below a
+        // majority. Quorum intersection is what makes that ordered: a writer
+        // increments every replica in its quorum, any later writer's quorum
+        // shares one of them, so the later writer observes a strictly larger
+        // maximum. Uniqueness for concurrent writers comes from the 16-bit
+        // client tiebreak in tsFromFaa.
+        //
+        // What IS weaker is the snapshot read, and only for liveness:
+        // postTsCounter posts to all N and postedExactly(N) makes the driver
+        // await all N completions, so one unreachable replica stalls a range's
+        // snapshot rather than being outvoted. Safety is unaffected -- a
+        // maximum over all N is a maximum over a majority -- and point
+        // operations are unaffected, since only ranges take a snapshot.
+        std::cerr << "NOTE: --ts faa replicates the counter on all "
+                  << layout.num_servers
+                  << " servers and stamps from the maximum over a majority, so"
+                     " writes tolerate one failure. Range SNAPSHOTS currently"
+                     " await all "
+                  << layout.num_servers
+                  << " counter reads, so a failed replica stalls ranges"
+                     " (liveness only, not safety)."
                   << std::endl;
     }
 
