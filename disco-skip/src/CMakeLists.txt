@@ -18,10 +18,20 @@ set(DS_CACHE_ENABLED 1)
 set(DS_N_REPLICAS    1)
 
 # Sizing of the local skip-vector cache. MAX_LAYERS is the compile-time level
-# cap; IDX_EXP=3 gives a node capacity of 2<<3 = 16 entries, which must match
+# cap; IDX_EXP governs the index fan-out: target node size 1<<IDX_EXP, max
+# capacity 2<<IDX_EXP, and kLevelRatio = 1<<IDX_EXP (so occupancy ~ 1/p and
+# drawHeight's rng() % kLevelRatio follows from it). The capacity must match
 # the remote node capacity (interface doc A4).
+#
+# 4 is the measured default. idxabcd-20260916T045238Z swept 3/4/5/6 across
+# workloads A-D at 1/8/16/32/64 clients on three servers: 4 wins B, D and A
+# above 16 clients (A at 64 clients doubles, 128 -> 256 kops), is the only
+# value above 3 whose arena still fits 64 clients, and gives up at most 13%
+# on the read-only workload C. 5 is better for A at <=16 clients only.
+# See that run's FINDINGS.md for the mechanism -- larger nodes cut splits,
+# which is what invalidates a cache that caches structure.
 set(DS_MAX_LAYERS 8)
-set(DS_IDX_EXP    3)
+set(DS_IDX_EXP    4)
 
 # DATA node capacity, separate from the index fan-out above.
 #
@@ -32,7 +42,7 @@ set(DS_IDX_EXP    3)
 #
 # VecRecord stays a multiple of 64 bytes at every value, with keys[] and vals[]
 # both cache-line aligned -- see the layout note in ds_node.hpp.
-set(DS_DATA_EXP   3)
+set(DS_DATA_EXP   4)
 
 # Maximum threads per client process. Currently one client thread per process,
 # but this sizes the cache's hazard-pointer arrays, so it must be >= the real

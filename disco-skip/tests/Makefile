@@ -35,6 +35,14 @@ HDRS := $(wildcard $(SRC_DIR)/ds_*.hpp) $(SRC_DIR)/layout.hpp \
         $(wildcard $(CACHE_DIR)/include-cache/*/*.h)
 
 # Every combination of the two toggles that invariants.md §9 defines.
+# Index fan-out under test. MUST track src/CMakeLists.txt's DS_IDX_EXP, which
+# is what the deployed binary uses -- these tests hardcoded 3 and so stopped
+# covering the shipped geometry the moment that default moved to 4.
+# DS_DATA_EXP defaults to DS_IDX_EXP in ds_defs.hpp, so setting this one knob
+# reproduces the deployed node capacity (2 << DS_IDX_EXP).
+# Override to check another value:  make DS_IDX_EXP=3
+DS_IDX_EXP ?= 4
+
 CONFIGS := cache1-repl1 cache1-repl3 cache0-repl1 cache0-repl3
 BINS    := $(addprefix obj/smoke-,$(CONFIGS))
 
@@ -111,7 +119,7 @@ obj/smoke-cache$(1)-repl$(2): local_smoke.cc $$(HDRS) $$(MACHINE_DEFINES) | obj
 	@echo "[CXX] cache=$(1) replicas=$(2)"
 	@$$(CXX) $$(CXXFLAGS) $$(INCLUDES) \
 	  -DDS_CACHE_ENABLED=$(1) -DDS_N_REPLICAS=$(2) \
-	  -DDS_MAX_LAYERS=8 -DDS_IDX_EXP=3 \
+	  -DDS_MAX_LAYERS=8 -DDS_IDX_EXP=$(DS_IDX_EXP) \
 	  $$< -o $$@ $$(LDFLAGS)
 endef
 
@@ -123,52 +131,52 @@ $(eval $(call SMOKE_RULE,0,3))
 $(VERIFY): verify_test.cc $(HDRS) $(MACHINE_DEFINES) | obj
 	@echo "[CXX] verify"
 	@$(CXX) $(CXXFLAGS) $(INCLUDES) -DDS_CACHE_ENABLED=0 -DDS_N_REPLICAS=1 \
-	  -DDS_MAX_LAYERS=8 -DDS_IDX_EXP=3 $< -o $@ $(LDFLAGS)
+	  -DDS_MAX_LAYERS=8 -DDS_IDX_EXP=$(DS_IDX_EXP) $< -o $@ $(LDFLAGS)
 
 $(TRAVERSE): traverse_test.cc $(HDRS) $(MACHINE_DEFINES) | obj
 	@echo "[CXX] traverse"
 	@$(CXX) $(CXXFLAGS) $(INCLUDES) -DDS_CACHE_ENABLED=0 -DDS_N_REPLICAS=1 \
-	  -DDS_MAX_LAYERS=8 -DDS_IDX_EXP=3 $< -o $@ $(LDFLAGS)
+	  -DDS_MAX_LAYERS=8 -DDS_IDX_EXP=$(DS_IDX_EXP) $< -o $@ $(LDFLAGS)
 
 $(GET): get_test.cc $(HDRS) fake_ops.hpp $(MACHINE_DEFINES) | obj
 	@echo "[CXX] get"
 	@$(CXX) $(CXXFLAGS) $(INCLUDES) -DDS_CACHE_ENABLED=1 -DDS_N_REPLICAS=1 \
-	  -DDS_MAX_LAYERS=8 -DDS_IDX_EXP=3 $< -o $@ $(LDFLAGS)
+	  -DDS_MAX_LAYERS=8 -DDS_IDX_EXP=$(DS_IDX_EXP) $< -o $@ $(LDFLAGS)
 
 $(INSERT): insert_test.cc $(HDRS) fake_ops.hpp $(MACHINE_DEFINES) | obj
 	@echo "[CXX] insert"
 	@$(CXX) $(CXXFLAGS) $(INCLUDES) -DDS_CACHE_ENABLED=0 -DDS_N_REPLICAS=1 \
-	  -DDS_MAX_LAYERS=8 -DDS_IDX_EXP=3 $< -o $@ $(LDFLAGS)
+	  -DDS_MAX_LAYERS=8 -DDS_IDX_EXP=$(DS_IDX_EXP) $< -o $@ $(LDFLAGS)
 
 $(PUT): put_test.cc $(HDRS) fake_ops.hpp $(MACHINE_DEFINES) | obj
 	@echo "[CXX] put"
 	@$(CXX) $(CXXFLAGS) $(INCLUDES) -DDS_CACHE_ENABLED=0 -DDS_N_REPLICAS=1 \
-	  -DDS_MAX_LAYERS=8 -DDS_IDX_EXP=3 $< -o $@ $(LDFLAGS)
+	  -DDS_MAX_LAYERS=8 -DDS_IDX_EXP=$(DS_IDX_EXP) $< -o $@ $(LDFLAGS)
 
 $(SELFTEST): selftest_test.cc $(HDRS) fake_ops.hpp $(MACHINE_DEFINES) | obj
 	@echo "[CXX] selftest"
 	@$(CXX) $(CXXFLAGS) $(INCLUDES) -DDS_CACHE_ENABLED=0 -DDS_N_REPLICAS=1 \
-	  -DDS_MAX_LAYERS=8 -DDS_IDX_EXP=3 $< -o $@ $(LDFLAGS)
+	  -DDS_MAX_LAYERS=8 -DDS_IDX_EXP=$(DS_IDX_EXP) $< -o $@ $(LDFLAGS)
 
 $(QUORUM): quorum_test.cc $(HDRS) fake_ops.hpp fake_replicas.hpp $(MACHINE_DEFINES) | obj
 	@echo "[CXX] quorum"
 	@$(CXX) $(CXXFLAGS) $(INCLUDES) -DDS_CACHE_ENABLED=0 -DDS_N_REPLICAS=3 \
-	  -DDS_MAX_LAYERS=8 -DDS_IDX_EXP=3 $< -o $@ $(LDFLAGS)
+	  -DDS_MAX_LAYERS=8 -DDS_IDX_EXP=$(DS_IDX_EXP) $< -o $@ $(LDFLAGS)
 
 $(RANGE): range_test.cc $(HDRS) fake_ops.hpp $(MACHINE_DEFINES) | obj
 	@echo "[CXX] range"
 	@$(CXX) $(CXXFLAGS) $(INCLUDES) -DDS_CACHE_ENABLED=0 -DDS_N_REPLICAS=1 \
-	  -DDS_MAX_LAYERS=8 -DDS_IDX_EXP=3 $< -o $@ $(LDFLAGS)
+	  -DDS_MAX_LAYERS=8 -DDS_IDX_EXP=$(DS_IDX_EXP) $< -o $@ $(LDFLAGS)
 
 $(TS): ts_test.cc $(HDRS) fake_ops.hpp $(MACHINE_DEFINES) | obj
 	@echo "[CXX] ts"
 	@$(CXX) $(CXXFLAGS) $(INCLUDES) -DDS_CACHE_ENABLED=0 -DDS_N_REPLICAS=1 \
-	  -DDS_MAX_LAYERS=8 -DDS_IDX_EXP=3 $< -o $@ $(LDFLAGS)
+	  -DDS_MAX_LAYERS=8 -DDS_IDX_EXP=$(DS_IDX_EXP) $< -o $@ $(LDFLAGS)
 
 $(ASYNC): async_test.cc $(HDRS) fake_ops.hpp fake_replicas.hpp fake_async.hpp $(MACHINE_DEFINES) | obj
 	@echo "[CXX] async"
 	@$(CXX) $(CXXFLAGS) $(INCLUDES) -DDS_CACHE_ENABLED=0 -DDS_N_REPLICAS=3 \
-	  -DDS_MAX_LAYERS=8 -DDS_IDX_EXP=3 $< -o $@ $(LDFLAGS)
+	  -DDS_MAX_LAYERS=8 -DDS_IDX_EXP=$(DS_IDX_EXP) $< -o $@ $(LDFLAGS)
 
 check: $(BINS) $(VERIFY) $(TRAVERSE) $(GET) $(INSERT) $(PUT) $(SELFTEST) $(QUORUM) $(ASYNC) $(TS) $(RANGE)
 	@echo "---- $(VERIFY) ----"; $(VERIFY) || exit 1
@@ -192,7 +200,7 @@ debug: clean check
 strict: | obj
 	@echo "[CXX] strict warning set"
 	@$(CXX) $(STRICTFLAGS) $(INCLUDES) -DDS_CACHE_ENABLED=0 -DDS_N_REPLICAS=1 \
-	  -DDS_MAX_LAYERS=8 -DDS_IDX_EXP=3 strict_headers.cc -o obj/strict $(LDFLAGS)
+	  -DDS_MAX_LAYERS=8 -DDS_IDX_EXP=$(DS_IDX_EXP) strict_headers.cc -o obj/strict $(LDFLAGS)
 	@obj/strict > /dev/null; echo "==== headers clean under the strict warning set ===="
 
 # The cache half is written for a laxer warning set, so the real build marks its
@@ -204,7 +212,7 @@ SYSINCLUDES := -I$(SRC_DIR) -isystem $(CACHE_DIR) -isystem $(CACHE_DIR)/include-
 rdma: | obj
 	@echo "[CXX] ds_rdma.hpp against the dory stub"
 	@$(CXX) $(STRICTFLAGS) $(INCLUDES) $(STUBFLAGS) \
-	  -DDS_CACHE_ENABLED=0 -DDS_N_REPLICAS=1 -DDS_MAX_LAYERS=8 -DDS_IDX_EXP=3 \
+	  -DDS_CACHE_ENABLED=0 -DDS_N_REPLICAS=1 -DDS_MAX_LAYERS=8 -DDS_IDX_EXP=$(DS_IDX_EXP) \
 	  -c rdma_compile.cc -o obj/rdma_compile.o
 	@echo "==== ds_rdma.hpp compiles clean against the dory surface ===="
 	@echo "[CXX] the same, with the cache compiled in"
@@ -215,7 +223,7 @@ rdma: | obj
 	@# CMakeLists. The arm above keeps it fatal, and that arm is all of src/
 	@# with none of the cache, so our own code is still covered.
 	@$(CXX) $(STRICTFLAGS) -Wno-error=strict-overflow $(SYSINCLUDES) $(STUBFLAGS) \
-	  -DDS_CACHE_ENABLED=1 -DDS_N_REPLICAS=3 -DDS_MAX_LAYERS=8 -DDS_IDX_EXP=3 \
+	  -DDS_CACHE_ENABLED=1 -DDS_N_REPLICAS=3 -DDS_MAX_LAYERS=8 -DDS_IDX_EXP=$(DS_IDX_EXP) \
 	  -c rdma_compile.cc -o obj/rdma_compile_cache.o
 	@echo "==== and clean with DS_CACHE_ENABLED=1, which is what the build uses ===="
 
