@@ -391,6 +391,25 @@ public:
         fmt::print("              helped: {} on gets, {} on puts, {} on "
                    "ranges (pending versions settled for a stalled writer)\n",
                    gstats.helped, pstats.helped, rstats.helped);
+        // SPECULATION, and specifically the L4 CHECK -- also never printed
+        // before, which is how the cost of --spread-reads stayed hidden.
+        //
+        // The offset hint's own hit rate is reported above and answers a
+        // DIFFERENT question: was the guessed OFFSET right. This one answers
+        // whether the replica the speculation was issued to turned out to hold
+        // the winning handle, because L4 accepts the bytes only then. On
+        // workload C at 32 clients the offset hint read 0.987 with and without
+        // spreading while server bytes out went 7.1 -> 10.5 GB: the whole
+        // difference was here, and invisible.
+        {
+            uint64_t const sp = qstats.spec_hits + qstats.spec_misses;
+            fmt::print("              speculation: {} hit / {} rejected by L4"
+                       " ({:.3f}) -- a rejection wastes one vector read\n",
+                       qstats.spec_hits, qstats.spec_misses,
+                       sp == 0 ? 0.0
+                               : static_cast<double>(qstats.spec_hits) /
+                                     static_cast<double>(sp));
+        }
         // ROUND TRIPS PER OPERATION -- the comparison that explains a slow
         // workload. A point get is 1-2; a scan-100 walks ~10.9 data nodes, so
         // it is one per node unless the batched or cache walk collapses them.

@@ -151,7 +151,19 @@ class RdmaAsyncOps {
     // HEADER FROM, because resolveHeaders validates it against that header.
     size_t spec_r = first;
     if (layout_.spread_reads && speculate != kNullVec) {
-      size_t const want = static_cast<size_t>(speculate % n);
+      // Prefer the replica that actually held the winning handle for this node
+      // last time -- see VecOffsetHint::src_. Rotating by `offset % n` spreads
+      // the load but aims at replicas that lag by a commit-chain position, and
+      // every L4 rejection is a wasted vector read. Falls back to the rotation
+      // until the node has been read once.
+      size_t want = static_cast<size_t>(speculate % n);
+      if (hint_ != nullptr) {
+        uint8_t const last = hint_->guessSrc(a);
+        if (last != VecOffsetHint::kUnknownSrc &&
+            static_cast<size_t>(last) < n) {
+          want = static_cast<size_t>(last);
+        }
+      }
       spec_r = (read_mask_ & (1u << want)) ? want : first;
     }
     spec_replica_ = spec_r;
@@ -317,7 +329,11 @@ class RdmaAsyncOps {
         ++stats_.spec_misses;
       }
     }
-    if (hint_ != nullptr) hint_->record(a, truth, spec_pending_);
+    // Record WHO WON, not just the offset: winner_ came from vecSourceFor, so
+    // it is by construction a replica holding the winning handle.
+    if (hint_ != nullptr) {
+      hint_->record(a, truth, spec_pending_, static_cast<uint8_t>(winner_));
+    }
     spec_pending_ = kNullVec;
     return true;
   }

@@ -511,16 +511,50 @@ public:
 /// hitRate() is instrumented so the crossover is measured rather than assumed.
 class VecOffsetHint {
     std::vector<VecOffset> hint_;
+    /// Which replica last held the WINNING handle for this node.
+    ///
+    /// WHY THIS IS HERE. The speculative vector read is posted before any
+    /// header comes back, so it cannot be aimed at "the winner" -- nothing
+    /// knows who that is yet. But L4 accepts the speculated bytes only if the
+    /// replica they came from turns out to hold the winning handle, so aiming
+    /// blindly wastes the read whenever it does not.
+    ///
+    /// Spreading exposed exactly that. With spreading off, the speculation
+    /// always went to replica 0, which is FIRST in every commit chain
+    /// (postBatch and submitAll both loop r = 0..n-1) and therefore the most
+    /// likely to already hold the newest handle -- so it hit. Rotating the
+    /// target by `offset % n` sends it to replicas that systematically lag by
+    /// one chain position, and each rejection costs a wasted vector read.
+    /// Measured on workload C at 32 clients: the offset hint stayed at 0.987
+    /// either way, yet total server bytes out rose 7.1 -> 10.5 GB, which is
+    /// ~5.9 M extra vector reads and nothing else.
+    ///
+    /// So remember the replica that actually won last time and aim there. It
+    /// is still spread -- vecSourceFor picks from the winners starting at
+    /// `offset % n`, so different nodes learn different replicas -- and it is
+    /// self-correcting: if that replica falls behind, the speculation misses
+    /// once and the next winner is recorded in its place.
+    std::vector<uint8_t> src_;
     bool enabled_ = false;
     uint64_t hits_ = 0;
     uint64_t misses_ = 0;
 
 public:
+    /// "No replica recorded yet." Not a valid index for any replica count.
+    static constexpr uint8_t kUnknownSrc = 0xFF;
+
     VecOffsetHint() = default;
     VecOffsetHint(size_t arena_nodes, bool enabled)
-        : hint_(enabled ? arena_nodes : 0, kNullVec), enabled_(enabled) {}
+        : hint_(enabled ? arena_nodes : 0, kNullVec),
+          src_(enabled ? arena_nodes : 0, kUnknownSrc), enabled_(enabled) {}
 
     [[nodiscard]] bool enabled() const { return enabled_; }
+
+    /// The replica to speculate against for /a/, or kUnknownSrc for "no idea".
+    [[nodiscard]] uint8_t guessSrc(RemoteAddr a) const {
+        if (!enabled_ || a.id >= src_.size()) return kUnknownSrc;
+        return src_[a.id];
+    }
 
     /// The offset to speculate for /a/, or kNullVec for "no guess" -- in which
     /// case the caller must serialise the two reads.
@@ -531,12 +565,16 @@ public:
 
     /// Record the true offset, learned from a header read. Also scores the
     /// guess that preceded it, which is what hitRate() reports.
-    void record(RemoteAddr a, VecOffset truth, VecOffset guessed) {
+    /// @param src  the replica that held the winning handle, if the caller
+    ///             knows it -- kUnknownSrc leaves the recorded source alone
+    void record(RemoteAddr a, VecOffset truth, VecOffset guessed,
+                uint8_t src = kUnknownSrc) {
         if (!enabled_ || a.id >= hint_.size()) return;
         if (guessed != kNullVec) {
             if (guessed == truth) ++hits_; else ++misses_;
         }
         hint_[a.id] = truth;
+        if (src != kUnknownSrc && a.id < src_.size()) src_[a.id] = src;
     }
 
     [[nodiscard]] uint64_t hits() const { return hits_; }
