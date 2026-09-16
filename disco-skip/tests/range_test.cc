@@ -22,10 +22,12 @@
 // For the cache-sourced backbone: a real SkipVec mirroring the fake arena.
 #include "ds_cache.hpp"
 
+#include "ds_get.hpp"
 #include "ds_put.hpp"
 #include "ds_range.hpp"
 #include "ds_verify.hpp"
 #include "ds_range_future.hpp"
+#include "ds_put_future.hpp"
 #include "fake_async.hpp"
 #include "fake_ops.hpp"
 #include "fake_replicas.hpp"
@@ -699,6 +701,295 @@ static void checkTheViolationCheckerFires() {
         "an unstamped version is a violation whatever the snapshot");
 }
 
+
+/// Manufacture a writer that published a version and died before stamping it.
+///
+/// Uses only the wire operations a real writer uses -- writeVec plus the
+/// handle CAS, with NO casTs/faaTs -- so the arena is left in exactly the
+/// state a crash between publish and stamp produces. Returns the offset of
+/// the pending version and the value it carries.
+static ds::VecOffset publishWithoutStamping(FakeReplicaSet &set,
+                                            ds::QuorumStats &qs,
+                                            ds::Key k, ds::Value v) {
+  ds::QuorumOps<FakeReplicaSet> ops(set, qs, nullptr);
+  ds::TraversalResult tres;
+  {
+    ds::RangeStats throwaway;
+    (void)throwaway;
+    ds::PathStep path[kLayers];
+    ds::Traversal<ds::QuorumOps<FakeReplicaSet>> t(ops);
+    tres = t.traverse(k, kLayers, path);
+  }
+  if (tres.status != ds::TraversalStatus::Ok) return ds::kNullVec;
+
+  ds::NodeRecord node{};
+  if (!ops.readNode(tres.data_addr, node)) return ds::kNullVec;
+  ds::VecRecord cur{};
+  if (!ops.readVec(node.handle.offset(), cur)) return ds::kNullVec;
+
+  ds::VecOffset const off = set.allocVec();
+  if (off == ds::kNullVec) return ds::kNullVec;
+
+  ds::VecRecord staged = cur;
+  staged.struct_ver = node.handle.structVer();
+  staged.content_ver = node.handle.contentVer() + 1;
+  staged.ts = ds::kNullTs;              // published, not yet stamped
+  staged.old_ver = node.handle.offset();
+  staged.next_id = ds::kNullId;
+  staged.k_min_next = ds::kReservedKey;
+  int const idx = ds::findLte(staged, k);
+  if (idx >= 0 && staged.keyAt(idx) == k) {
+    staged.setValAt(static_cast<uint32_t>(idx), v);
+  } else {
+    return ds::kNullVec;                // want an update, not a structural put
+  }
+
+  ds::Batch b;
+  b.writeVec(off, staged);
+  b.casHandle(tres.data_addr, node.handle.raw,
+              node.handle.withContent(off).raw);
+  ds::BatchResult const r = ops.submit(b);
+  if (!r.submitted || !r.committed) return ds::kNullVec;
+  return off;
+}
+
+static void checkFaaHelpersClaimACounterValueNotAClockReading() {
+  // THE HELPING PROPERTY, which is what makes reads and ranges lock-free: a
+  // reader that finds a published-but-unstamped version fixes the timestamp
+  // itself rather than waiting for the writer, so a writer that stalls or dies
+  // between its publish and its stamp blocks nobody.
+  //
+  // In Faa mode a helper MUST claim its value from the counter. It cannot be
+  // read locally -- that is the whole shape of Faa mode -- so the help batch
+  // carries an faaTs() and a second submission writes back what it claimed.
+  // settleNode() (the blocking path) always did this. The three ASYNC helping
+  // sites did not: they called ops_.now() in every mode, which in Faa mode is
+  // clockNow(), i.e. CLOCK_REALTIME nanoseconds written into a field the
+  // snapshot walk compares against counter values.
+  //
+  // TWO CASES, because the range's own help site is SHADOWED for the first
+  // node: RangeOperation routes to `lo` through the traversal, which helps the
+  // node it lands on. A node reached by walking RIGHT is handled by
+  // RangeOperation::useVersion() instead, and that is the only way to reach
+  // the range's copy. Finding this cost one wrong version of this test, which
+  // passed against a deliberately broken range site.
+  //
+  // THE ASSERTION IS THE CHAIN, not the stamp's absolute value: a counter
+  // value claimed now exceeds every value claimed before it, so the helped
+  // version must outrank the version it supersedes. The fake's now() is
+  // `clock_ += 10`, so a clock reading lands around 1e3 while real stamps sit
+  // around 1.4e7 -- a clock-stamped helper INVERTS the chain, which is the
+  // corruption, and is what this catches.
+  for (int site = 0; site < 2; ++site) {
+    bool const walk_right = (site == 1);
+    char const *what = walk_right ? "range's own site (walked right)"
+                                  : "traversal site (node under lo)";
+    FakeReplicaSet set(3, kLayers, 16384);
+    set.setTsMode(ds::TsMode::Faa);
+    ds::QuorumStats qs;
+    ds::PutStats ps;
+    ds::WriteStats ws;
+    ds::NullPutCache cache;
+
+    {
+      ds::QuorumOps<FakeReplicaSet> ops(set, qs, nullptr);
+      std::mt19937_64 rng(0xBE1F0);
+      for (int i = 0; i < 400; ++i) {
+        ds::Key const kk = static_cast<ds::Key>(rng() % 2000);
+        ds::Putter<ds::QuorumOps<FakeReplicaSet>, ds::NullPutCache> p(
+            ops, cache, kLayers, ps, ws);
+        p.put(kk, static_cast<ds::Value>(i + 1), ds::drawHeight(rng, kLayers));
+      }
+      for (ds::Key kk = 100; kk <= 1900; kk += 100) {
+        ds::Putter<ds::QuorumOps<FakeReplicaSet>, ds::NullPutCache> p(
+            ops, cache, kLayers, ps, ws);
+        p.put(kk, kk, 0);
+      }
+    }
+
+    ds::Key const lo = walk_right ? 100 : 1500;
+    ds::Key const target = 1500;
+    ds::Value const marooned = 777777;
+
+    // For the walk-right case, require that `lo` and `target` really are in
+    // different data nodes -- otherwise the traversal shadows this site again
+    // and the test silently stops testing anything.
+    if (walk_right) {
+      ds::QuorumOps<FakeReplicaSet> ops(set, qs, nullptr);
+      ds::PathStep pa[kLayers];
+      ds::PathStep pb[kLayers];
+      ds::Traversal<ds::QuorumOps<FakeReplicaSet>> t(ops);
+      ds::TraversalResult const ra = t.traverse(lo, kLayers, pa);
+      ds::TraversalResult const rb = t.traverse(target, kLayers, pb);
+      CHECK(ra.status == ds::TraversalStatus::Ok &&
+            rb.status == ds::TraversalStatus::Ok,
+            "both traversals resolved");
+      CHECK(ra.data_addr != rb.data_addr,
+            "lo and the pending node are different data nodes");
+    }
+
+    ds::VecOffset const pending =
+        publishWithoutStamping(set, qs, target, marooned);
+    CHECK(pending != ds::kNullVec, "the pending version was published");
+    if (pending == ds::kNullVec) continue;
+
+    ds::VecRecord before{};
+    CHECK(set.readVecFrom(0, pending, before) && before.isPending(),
+          "and really is unstamped");
+    uint64_t predecessor_ts = 0;
+    {
+      ds::VecRecord ov{};
+      CHECK(before.old_ver != ds::kNullVec &&
+            set.readVecFrom(0, static_cast<ds::VecOffset>(before.old_ver), ov),
+            "the pending version supersedes a stamped one");
+      predecessor_ts = ov.ts;
+    }
+
+    FakeAsyncOps aops(set, qs, nullptr);
+    ds::RangeStats ars;
+    std::vector<ds::Entry> got;
+    ds::RangeResult const res =
+        runAsyncRange(aops, lo, target, 1u << 20, ars, got);
+    CHECK(res.resolved, "the range resolved");
+    CHECK(ars.helped > 0, "and helped the pending version");
+
+    ds::VecRecord after{};
+    CHECK(set.readVecFrom(0, pending, after), "the helped version reads back");
+    CHECK(!after.isPending(), "the helper fixed the timestamp");
+    std::printf("  %s:\n"
+                "    ts %llu -> %llu   predecessor %llu   counter %llu\n",
+                what,
+                static_cast<unsigned long long>(before.ts),
+                static_cast<unsigned long long>(after.ts),
+                static_cast<unsigned long long>(predecessor_ts),
+                static_cast<unsigned long long>(set.readTsCounter()));
+
+    // The corruption, stated as the invariant it breaks.
+    CHECK(after.ts > predecessor_ts,
+          "a helper's stamp outranks the version it supersedes");
+    // And it must be a value the counter could have produced.
+    CHECK(after.ts <= ds::tsFromFaa(set.readTsCounter(), ds::kFaaClientMask),
+          "a Faa helper's stamp is within the counter's reach");
+
+    // The write was in limbo and its writer never came back. Helping must take
+    // it out of limbo: a LATER snapshot sees it. The range that did the helping
+    // is NOT required to -- it fixed its snapshot before the value was claimed,
+    // so ordering the write after that reader is correct. Asserting otherwise
+    // was this test's other wrong version.
+    {
+      FakeAsyncOps later(set, qs, nullptr);
+      ds::RangeStats lrs;
+      std::vector<ds::Entry> lgot;
+      ds::RangeResult const lres =
+          runAsyncRange(later, target, target, 1u << 20, lrs, lgot);
+      CHECK(lres.resolved, "a later range resolved");
+      CHECK(lrs.helped == 0, "and had nothing left to help");
+      bool found = false;
+      for (auto const &e : lgot) {
+        if (e.key == target) {
+          found = true;
+          CHECK(e.val == marooned,
+                "a range after the help sees the abandoned writer's value");
+        }
+      }
+      CHECK(found, "the helped key is visible to a later range");
+    }
+  }
+}
+
+
+/// Drive an async put to completion, as async_test.cc's runAsyncPut does.
+template <class Ops, class Cache>
+static ds::PutResult runAsyncPutHere(Ops &ops, Cache &cache, ds::Key k,
+                                     ds::Value v, uint32_t h,
+                                     ds::PutStats &ps, ds::WriteStats &ws) {
+  ds::PutOperation<Ops, Cache> p(ops, cache, kLayers, ps, ws);
+  size_t await = p.start(k, v, h);
+  uint64_t guard = 0;
+  while (!p.finished()) {
+    (void)await;
+    await = p.step();
+    if (++guard > 200000) break;
+  }
+  return p.result();
+}
+
+/// The put path has its OWN copy of the helping code (ds_put_future.hpp's
+/// afterFetch), and it is reached when a write targets a node some other
+/// writer left pending. Covered separately because breaking it was caught by
+/// nothing: the range test above never drives a put.
+static void checkAFaaPutHelpsWithACounterValue() {
+  FakeReplicaSet set(3, kLayers, 16384);
+  set.setTsMode(ds::TsMode::Faa);
+  ds::QuorumStats qs;
+  ds::PutStats ps;
+  ds::WriteStats ws;
+  ds::NullPutCache cache;
+
+  {
+    ds::QuorumOps<FakeReplicaSet> ops(set, qs, nullptr);
+    std::mt19937_64 rng(0xC0FFEE);
+    for (int i = 0; i < 300; ++i) {
+      ds::Key const kk = static_cast<ds::Key>(rng() % 2000);
+      ds::Putter<ds::QuorumOps<FakeReplicaSet>, ds::NullPutCache> p(
+          ops, cache, kLayers, ps, ws);
+      p.put(kk, static_cast<ds::Value>(i + 1), ds::drawHeight(rng, kLayers));
+    }
+    for (ds::Key kk = 100; kk <= 1900; kk += 100) {
+      ds::Putter<ds::QuorumOps<FakeReplicaSet>, ds::NullPutCache> p(
+          ops, cache, kLayers, ps, ws);
+      p.put(kk, kk, 0);
+    }
+  }
+
+  ds::Key const target = 1500;
+  ds::VecOffset const pending = publishWithoutStamping(set, qs, target, 555555);
+  CHECK(pending != ds::kNullVec, "the pending version was published");
+  if (pending == ds::kNullVec) return;
+
+  ds::VecRecord before{};
+  CHECK(set.readVecFrom(0, pending, before) && before.isPending(),
+        "and really is unstamped");
+  uint64_t predecessor_ts = 0;
+  {
+    ds::VecRecord ov{};
+    CHECK(before.old_ver != ds::kNullVec &&
+          set.readVecFrom(0, static_cast<ds::VecOffset>(before.old_ver), ov),
+          "it supersedes a stamped version");
+    predecessor_ts = ov.ts;
+  }
+
+  FakeAsyncOps aops(set, qs, nullptr);
+  ds::PutStats aps;
+  ds::WriteStats aws;
+  ds::NullCache apc;  // PutOperation needs locateData, which NullPutCache lacks
+  ds::PutResult const r =
+      runAsyncPutHere(aops, apc, target, 4242, 0, aps, aws);
+  CHECK(r.resolved, "the put resolved over a pending version");
+  // NOT asserting that the PUT's own site did the helping. Like the range's,
+  // ds_put_future.hpp's afterFetch() site is shadowed whenever the put
+  // traverses: PutStep::Traversing runs the same TraversalFuture, which helps
+  // the node it lands on, so afterFetch() finds it already settled. The put's
+  // copy is reached when the put skips the traversal -- the cache-hint path,
+  // which is ON in every deployed run (0.487 hint hit rate measured) -- or on
+  // a cas_lost retry. Driving the hint path needs a populated SkipVec cache
+  // rather than NullCache, so this test pins the stamp invariant for whichever
+  // site helps and the put's own site is covered only by inspection.
+  (void)aws;
+
+  ds::VecRecord after{};
+  CHECK(set.readVecFrom(0, pending, after), "the helped version reads back");
+  CHECK(!after.isPending(), "the helper fixed the timestamp");
+  std::printf("  async put help: ts %llu -> %llu   predecessor %llu\n",
+              static_cast<unsigned long long>(before.ts),
+              static_cast<unsigned long long>(after.ts),
+              static_cast<unsigned long long>(predecessor_ts));
+  CHECK(after.ts > predecessor_ts,
+        "a put helper's stamp outranks the version it supersedes");
+  CHECK(after.ts <= ds::tsFromFaa(set.readTsCounter(), ds::kFaaClientMask),
+        "and is within the counter's reach");
+}
+
 int main() {
   std::printf("range_test: layers=%u\n", kLayers);
   checkRangeMatchesAnOracle();
@@ -711,6 +1002,8 @@ int main() {
   checkAStaleCacheStillGivesTheRightAnswer();
   checkAsyncSkipsANodeCreatedAfterTheSnapshot();
   checkTheViolationCheckerFires();
+  checkFaaHelpersClaimACounterValueNotAClockReading();
+  checkAFaaPutHelpsWithACounterValue();
 
   if (g_failures != 0) {
     std::printf("%d FAILURE(S)\n", g_failures);

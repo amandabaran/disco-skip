@@ -375,6 +375,22 @@ public:
         fmt::print("              {} FAA rounds refused (short of quorum){}\n",
                    qstats.ts_short_of_quorum,
                    qstats.ts_short_of_quorum == 0 ? " (none)" : "  ***");
+        // HELPING, which is what makes reads and ranges lock-free: a reader
+        // that finds a published-but-unstamped version fixes the timestamp
+        // itself instead of waiting, so a writer stalled between its publish
+        // and its stamp blocks nobody.
+        //
+        // Printed because it was invisible. These counters have always been
+        // accumulated and never reported, which meant there was no way to tell
+        // from a run whether the helping path executed at all -- and that is
+        // exactly how a Faa-mode bug in three of the async helping sites
+        // survived every sweep: they stamped a local clock reading instead of
+        // claiming a counter value, and nothing in the output would have shown
+        // it. Zero here means the path is untested by this run, not that it
+        // works.
+        fmt::print("              helped: {} on gets, {} on puts, {} on "
+                   "ranges (pending versions settled for a stalled writer)\n",
+                   gstats.helped, pstats.helped, rstats.helped);
         // ROUND TRIPS PER OPERATION -- the comparison that explains a slow
         // workload. A point get is 1-2; a scan-100 walks ~10.9 data nodes, so
         // it is one per node unless the batched or cache walk collapses them.

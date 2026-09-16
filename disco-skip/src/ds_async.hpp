@@ -55,6 +55,7 @@ enum class TraversalStep : uint8_t {
   AwaitHeaders,   ///< a quorum header read is outstanding
   AwaitVec,       ///< a vector read is outstanding
   AwaitHelp,      ///< a helping batch is outstanding
+  AwaitHelpStamp, ///< Faa mode only: writing the ts that batch claimed
   AwaitRepair,    ///< an L2 read repair is outstanding
   Done,
 };
@@ -97,6 +98,7 @@ class TraversalFuture {
       case TraversalStep::AwaitHeaders: return onHeaders();
       case TraversalStep::AwaitVec:     return onVec();
       case TraversalStep::AwaitHelp:    return onHelp();
+      case TraversalStep::AwaitHelpStamp: return onHelpStamp();
       case TraversalStep::AwaitRepair:  return onRepair();
       case TraversalStep::Idle:
       case TraversalStep::Done:
@@ -124,6 +126,7 @@ class TraversalFuture {
       case TraversalStep::AwaitHeaders: st = "AwaitHeaders"; break;
       case TraversalStep::AwaitVec:     st = "AwaitVec";     break;
       case TraversalStep::AwaitHelp:    st = "AwaitHelp";    break;
+      case TraversalStep::AwaitHelpStamp: st = "AwaitHelpStamp"; break;
       case TraversalStep::AwaitRepair:  st = "AwaitRepair";  break;
       case TraversalStep::Done:         st = "Done";         break;
     }
@@ -201,8 +204,31 @@ class TraversalFuture {
   }
 
   size_t onHelp() {
+    if (helped_ts_ && ops_.tsMode() == TsMode::Faa) {
+      BatchResult const r = ops_.resolveBatch(help_batch_);
+      helped_ts_ = false;
+      if (r.ts != kNullTs) {
+        // Raw claimed value. The offset is the one captured before the help
+        // batch: that is the version found pending, and stamping it stays
+        // correct even if a writer has published over it since.
+        Batch stamp;
+        stamp.casTs(helped_off_, kNullTs, r.ts);
+        help_batch_ = stamp;
+        step_ = TraversalStep::AwaitHelpStamp;
+        return ops_.postBatch(help_batch_);
+      }
+    }
+    helped_ts_ = false;
     // A helping batch changes the node, so re-read rather than trusting what we
     // had. Same as the blocking settleNode's loop.
+    have_vec_ = false;
+    return postHeaders();
+  }
+
+  /// The Faa stamp landed. Re-read, as onHelp() would have.
+  size_t onHelpStamp() {
+    // Result ignored on purpose: a lost CAS means another helper got there.
+    (void)ops_.resolveBatch(help_batch_);
     have_vec_ = false;
     return postHeaders();
   }
@@ -265,8 +291,21 @@ class TraversalFuture {
       // The same batch settleNode() would build, in the same order -- the tail
       // word last, which the chain then delivers last.
       Batch b;
+      helped_ts_ = pending;
+      helped_off_ = node_.handle.offset();
       if (pending) {
-        b.casTs(node_.handle.offset(), kNullTs, ops_.now());
+        // Faa's value cannot be read locally, so the batch CLAIMS one and a
+        // second submission writes it -- what settleNode() does, and what this
+        // path failed to do. ops_.now() in Faa mode stamps CLOCK_REALTIME
+        // nanoseconds into a field that is compared against counter values,
+        // which leaves the version chain non-monotonic and puts it out of
+        // reach of every range snapshot. See ds_range_future.hpp's copy of
+        // this comment for the worked numbers.
+        if (ops_.tsMode() == TsMode::Faa) {
+          b.faaTs();
+        } else {
+          b.casTs(helped_off_, kNullTs, ops_.now());
+        }
         ++res_.helped_ts;
       }
       if (unstable && vec_.hasSplitDescriptor()) {
@@ -282,8 +321,9 @@ class TraversalFuture {
                       packTailWord(node_.level, node_.handle.structVer()));
         ++res_.helped_splits;
       }
+      help_batch_ = b;  // resolveBatch needs the batch that was posted
       step_ = TraversalStep::AwaitHelp;
-      return ops_.postBatch(b);
+      return ops_.postBatch(help_batch_);
     }
     settle_tries_ = 0;
 
@@ -343,6 +383,9 @@ class TraversalFuture {
   uint32_t hops_ = 0;
   uint32_t repairs_ = 0;       ///< L2 read repairs attempted this traversal
   uint32_t repairs_landed_ = 0;
+  Batch help_batch_{};               ///< the batch AwaitHelp is waiting on
+  VecOffset helped_off_ = kNullVec;  ///< the pending version it targeted
+  bool helped_ts_ = false;           ///< it carried a Faa claim to write back
   uint32_t settle_tries_ = 0;  ///< unsigned: `++x > C` on an int is the
                               ///< shape -Wstrict-overflow=5 rejects
   TraversalResult res_{};

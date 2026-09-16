@@ -51,6 +51,7 @@ enum class RangeStep : uint8_t {
   AwaitHeader,    ///< reading the current node's header, maybe with its vector
   AwaitVec,       ///< that header did not carry its vector
   AwaitSettle,    ///< helping a pending or mid-split node
+  AwaitSettleStamp, ///< Faa mode only: writing the ts the help batch claimed
   AwaitOldVer,    ///< chasing old_ver back towards the snapshot
   AwaitIdxHeader, ///< batched walk: reading the level-0 index node
   AwaitIdxVec,    ///< batched walk: its vector, which names the backbone
@@ -111,6 +112,7 @@ class RangeOperation {
       case RangeStep::AwaitHeader:   return onHeader();
       case RangeStep::AwaitVec:      return onVec();
       case RangeStep::AwaitSettle:   return onSettle();
+      case RangeStep::AwaitSettleStamp: return onSettleStamp();
       case RangeStep::AwaitOldVer:   return onOldVer();
       case RangeStep::AwaitIdxHeader: return onIdxHeader();
       case RangeStep::AwaitIdxVec:    return onIdxVec();
@@ -142,6 +144,7 @@ class RangeOperation {
       case RangeStep::AwaitHeader:    st = "AwaitHeader";    break;
       case RangeStep::AwaitVec:       st = "AwaitVec";       break;
       case RangeStep::AwaitSettle:    st = "AwaitSettle";    break;
+      case RangeStep::AwaitSettleStamp: st = "AwaitSettleStamp"; break;
       case RangeStep::AwaitOldVer:    st = "AwaitOldVer";    break;
       case RangeStep::AwaitIdxHeader: st = "AwaitIdxHeader"; break;
       case RangeStep::AwaitIdxVec:    st = "AwaitIdxVec";    break;
@@ -698,8 +701,29 @@ class RangeOperation {
       // would drop a committed write from the snapshot -- its eventual stamp
       // may well be <= T. So complete it, exactly as the traversal does.
       Batch b;
+      helped_ts_ = pending;
+      helped_off_ = node_.handle.offset();
       if (pending) {
-        b.casTs(node_.handle.offset(), kNullTs, ops_.now());
+        // IN FAA MODE THE VALUE IS NOT AVAILABLE LOCALLY. The batch claims one
+        // and a SECOND submission writes it, exactly as settleNode() and the
+        // write path do -- a timestamp may not be allocated before the version
+        // it stamps is visible.
+        //
+        // Using ops_.now() here regardless of mode was a silent correctness
+        // bug, and this is the path where it bit hardest. localNow() returns
+        // CLOCK_REALTIME nanoseconds (~1.79e18) in Faa mode, while a Faa
+        // snapshot is (counter << 16 | 0xffff) -- about 6.6e10 after a million
+        // writes. So the helped version compared as newer than every possible
+        // snapshot, walkToSnapshot() chased old_ver past it, and a COMMITTED
+        // write became permanently invisible to range queries: the counter
+        // would need ~2.7e13 more values to catch up, which is centuries at
+        // the measured 2.70 Mops/s. Point reads never noticed, because they do
+        // not compare ts.
+        if (ops_.tsMode() == TsMode::Faa) {
+          b.faaTs();
+        } else {
+          b.casTs(helped_off_, kNullTs, ops_.now());
+        }
         ++stats_.helped;
       }
       if (unstable && vec_.hasSplitDescriptor()) {
@@ -744,8 +768,30 @@ class RangeOperation {
   }
 
   size_t onSettle() {
-    (void)ops_.resolveBatch(last_batch_);
+    BatchResult const r = ops_.resolveBatch(last_batch_);
+    if (helped_ts_ && ops_.tsMode() == TsMode::Faa && r.ts != kNullTs) {
+      helped_ts_ = false;
+      // The claimed counter value, raw: stampFor() is the identity in Faa mode
+      // and a helper has not read the predecessor anyway. Targets the offset
+      // captured BEFORE the help batch, which is the version we found pending;
+      // if a writer has since published over it, stamping the older version is
+      // still correct and still what the chain needs.
+      Batch stamp;
+      stamp.casTs(helped_off_, kNullTs, r.ts);
+      last_batch_ = stamp;
+      step_ = RangeStep::AwaitSettleStamp;
+      return ops_.postBatch(last_batch_);
+    }
+    helped_ts_ = false;
     // Re-read: the settle told us the node is complete, not what it now holds.
+    return postHeader();
+  }
+
+  /// The Faa stamp landed. Re-read, as onSettle() would have.
+  size_t onSettleStamp() {
+    // The CAS result is deliberately ignored: a failure means somebody else
+    // stamped this version first, which is the helping protocol working.
+    (void)ops_.resolveBatch(last_batch_);
     return postHeader();
   }
 
@@ -909,6 +955,8 @@ class RangeOperation {
   uint32_t hops_ = 0;
   uint32_t settle_tries_ = 0;
   Batch last_batch_{};
+  VecOffset helped_off_ = kNullVec;  ///< the pending version a help batch targeted
+  bool helped_ts_ = false;           ///< that batch carried a Faa claim to write back
   PathStep path_[kMaxLayers]{};
 };
 

@@ -47,6 +47,7 @@ enum class PutStep : uint8_t {
   AwaitHeader,       ///< fetching the target node's header
   AwaitVec,          ///< fetching its vector
   AwaitSettle,       ///< helping an operation outstanding on it
+  AwaitSettleStamp,  ///< Faa mode only: writing the ts that help claimed
   AwaitInsert,       ///< F1's single chained batch
   AwaitSplitStage,   ///< F2's stage-and-publish chain
   AwaitSplitFinish,  ///< F2's completion chain
@@ -128,7 +129,8 @@ class PutOperation {
       case PutStep::Traversing:       return onTraversal();
       case PutStep::AwaitHeader:      return onHeader();
       case PutStep::AwaitVec:         return onVec();
-      case PutStep::AwaitSettle:      return fetch();  // re-read after helping
+      case PutStep::AwaitSettle:      return onSettle();
+      case PutStep::AwaitSettleStamp: return fetch();  // re-read after helping
       case PutStep::AwaitInsert:      return onInsert();
       case PutStep::AwaitSplitStage:  return onSplitStage();
       case PutStep::AwaitSplitFinish: return onSplitFinish();
@@ -156,6 +158,7 @@ class PutOperation {
       case PutStep::AwaitHeader:      st = "AwaitHeader";     break;
       case PutStep::AwaitVec:         st = "AwaitVec";        break;
       case PutStep::AwaitSettle:      st = "AwaitSettle";     break;
+      case PutStep::AwaitSettleStamp: st = "AwaitSettleStamp"; break;
       case PutStep::AwaitInsert:      st = "AwaitInsert";     break;
       case PutStep::AwaitSplitStage:  st = "AwaitSplitStage"; break;
       case PutStep::AwaitSplitFinish: st = "AwaitSplitFinish";break;
@@ -296,6 +299,24 @@ class PutOperation {
     return afterFetch();
   }
 
+  /// A help batch landed. In Faa mode write back the value it claimed, then
+  /// re-read; otherwise re-read straight away.
+  size_t onSettle() {
+    if (helped_ts_ && ops_.tsMode() == TsMode::Faa) {
+      BatchResult const r = ops_.resolveBatch(help_batch_);
+      helped_ts_ = false;
+      if (r.ts != kNullTs) {
+        Batch stamp;
+        stamp.casTs(helped_off_, kNullTs, r.ts);
+        help_batch_ = stamp;
+        step_ = PutStep::AwaitSettleStamp;
+        return ops_.postBatch(help_batch_);
+      }
+    }
+    helped_ts_ = false;
+    return fetch();
+  }
+
   size_t afterFetch() {
     // A write must find the node STABLE at the handle it is about to CAS from,
     // not merely readable. A stable node has had any split descriptor
@@ -306,8 +327,19 @@ class PutOperation {
     bool const unstable = !node_.isStable();
     if (pending || unstable) {
       Batch b;
+      helped_ts_ = pending;
+      helped_off_ = node_.handle.offset();
       if (pending) {
-        b.casTs(node_.handle.offset(), kNullTs, ops_.now());
+        // Faa claims the value in this batch and writes it in the next, the
+        // same two-submission shape act() uses below for this put's OWN stamp.
+        // It was ops_.now() unconditionally, which in Faa mode writes
+        // CLOCK_REALTIME nanoseconds into a counter-valued field -- see
+        // ds_range_future.hpp for what that does to a snapshot walk.
+        if (ops_.tsMode() == TsMode::Faa) {
+          b.faaTs();
+        } else {
+          b.casTs(helped_off_, kNullTs, ops_.now());
+        }
         ++wstats_.helped_ts;
       }
       if (unstable && vec_.hasSplitDescriptor()) {
@@ -324,8 +356,9 @@ class PutOperation {
                       packTailWord(node_.level, node_.handle.structVer()));
         ++wstats_.helped_splits;
       }
+      help_batch_ = b;  // resolveBatch needs the batch that was posted
       step_ = PutStep::AwaitSettle;
-      return ops_.postBatch(b);
+      return ops_.postBatch(help_batch_);
     }
     return act();
   }
@@ -694,6 +727,9 @@ class PutOperation {
   bool was_present_ = false;
   bool from_hint_ = false;  ///< this attempt's target came from the cache
   uint64_t pred_ts_ = kNullTs;      ///< ts of the version being superseded
+  Batch help_batch_{};              ///< the batch AwaitSettle is waiting on
+  VecOffset helped_off_ = kNullVec; ///< the pending version help targeted
+  bool helped_ts_ = false;          ///< it carried a Faa claim to write back
   VecOffset staged_off_ = kNullVec; ///< the offset awaiting its stamp
 
   NodeRecord node_{}, cnode_{}, pre_split_{};
