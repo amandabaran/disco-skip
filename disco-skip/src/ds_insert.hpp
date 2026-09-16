@@ -244,6 +244,10 @@ class Writer {
         // order, which is the one thing this mode exists to provide -- see
         // stampFor() in ds_ts.hpp for the worked counterexample.
         stamp.casTs(off, kNullTs, stampFor(ops_.tsMode(), r.ts, vec.ts));
+        // See ds_ts.hpp: a majority FAA does not order writers on its own, so
+        // a round that found the counters diverged owes the laggards a
+        // write-back before this write may return. Rides this same batch.
+        if (ops_.tsNeedsWriteBack()) stamp.faaTsCatchUp();
         if (!ops_.submit(stamp).submitted) return WriteOutcome::Failed;
         ++stats_.batches;
         ++stats_.faa_stamps;

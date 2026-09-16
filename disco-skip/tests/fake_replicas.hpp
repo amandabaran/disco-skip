@@ -80,13 +80,24 @@ class FakeReplicaSet {
     ++batches_;
     uint64_t best = ds::kNullTs;
     size_t answered = 0;
+    // Per-replica addends for a FaaTsCatchUp, from the PRECEDING claiming FAA
+    // round. The target is the maximum over its replies, so it cannot be known
+    // until that round has been drained -- hence members, and hence the
+    // write-back riding the batch that follows.
+    uint64_t addends[8] = {};
+    if (b.hasFaaCatchUp()) {
+      (void)ds::faaCatchUpAddends(faa_pre_, faa_answered_, arenas_.size(),
+                                  prev_max_faa_pre_, addends);
+      ++ts_write_backs_;
+    }
     for (size_t r = 0; r < arenas_.size(); ++r) {
       if (down_[r]) {
         submitted[r] = false;
         committed[r] = false;
+        faa_answered_[r] = false;
         continue;
       }
-      ds::BatchResult const res = arenas_[r].submit(b);
+      ds::BatchResult const res = arenas_[r].submit(b, addends[r]);
       submitted[r] = res.submitted;
       committed[r] = res.committed;
       // THE COUNTER IS REPLICATED, so the stamp is the maximum over the
@@ -99,13 +110,37 @@ class FakeReplicaSet {
       if (res.ts != ds::kNullTs) {
         ++answered;
         if (best == ds::kNullTs || res.ts > best) best = res.ts;
+        faa_answered_[r] = true;
+        faa_pre_[r] = res.pre_faa;
+      } else {
+        faa_answered_[r] = false;
       }
     }
     if (best != ds::kNullTs) {
       last_ts_ = best;
       if (answered < arenas_.size()) ++ts_partial_;
     }
+    if (b.hasFaa()) {
+      // The maximum PRE-VALUE, which is what the write-back targets. best is a
+      // packed timestamp; unpacking it is exact because tsFromFaa shifts the
+      // pre-value up by kFaaClientBits and ORs the client index in below.
+      prev_max_faa_pre_ = ds::kNullTs;
+      for (size_t r = 0; r < arenas_.size(); ++r) {
+        if (!faa_answered_[r]) continue;
+        if (prev_max_faa_pre_ == ds::kNullTs || faa_pre_[r] > prev_max_faa_pre_) {
+          prev_max_faa_pre_ = faa_pre_[r];
+        }
+      }
+    }
   }
+
+  /// Did the last claiming FAA round diverge, so a write-back is owed?
+  [[nodiscard]] bool tsNeedsWriteBack() const {
+    uint64_t addends[8] = {};
+    return ds::faaCatchUpAddends(faa_pre_, faa_answered_, arenas_.size(),
+                                 prev_max_faa_pre_, addends);
+  }
+  [[nodiscard]] uint64_t tsWriteBacks() const { return ts_write_backs_; }
 
   // Client-local, so one of each rather than one per replica.
   uint64_t now() { return clock_ += 10; }
@@ -150,6 +185,15 @@ class FakeReplicaSet {
   /// memory node does (§8).
   void setDown(size_t r, bool down) { down_[r] = down; }
   bool isDown(size_t r) const { return down_[r]; }
+  /// TEST HOOK: diverge one replica's counter only. See
+  /// FakeOps::advanceTsCounterForTest for why this is injected rather than
+  /// produced by downing a replica.
+  void advanceCounterForTest(size_t r, uint64_t by) {
+    arenas_[r].advanceTsCounterForTest(by);
+  }
+  [[nodiscard]] uint64_t counterOf(size_t r) const {
+    return arenas_[r].readTsCounter();
+  }
 
   /// Apply a handle to one replica only, which is how a lagged replica or a
   /// partially applied commit is staged.
@@ -197,5 +241,11 @@ class FakeReplicaSet {
   uint64_t clock_ = 1000;
   uint64_t last_ts_ = ds::kNullTs;
   uint64_t ts_partial_ = 0;
+  /// What the last claiming FAA round observed, per replica, and its maximum
+  /// PRE-VALUE (not timestamp) -- the write-back's target.
+  uint64_t faa_pre_[8] = {};
+  bool faa_answered_[8] = {};
+  uint64_t prev_max_faa_pre_ = ds::kNullTs;
+  uint64_t ts_write_backs_ = 0;
   uint64_t batches_ = 0;
 };

@@ -178,7 +178,8 @@ void writeVecAllReplicas(Conns &conns, Layout const &layout, VecRecord *staging,
 template <class Conn>
 size_t postBatchChain(Conn &rc, Layout const &layout, Batch const &b,
                       NodeRecord *stage_nodes, VecRecord *stage_vecs,
-                      uint64_t *cas_bufs, bool doorbell, uint64_t wr_id) {
+                      uint64_t *cas_bufs, bool doorbell, uint64_t wr_id,
+                      uint64_t catchup_addend = 0) {
   if (b.size() == 0 || !b.wellFormed()) return 0;
 
   struct ibv_send_wr wr[kMaxBatchOps];
@@ -245,6 +246,22 @@ size_t postBatchChain(Conn &rc, Layout const &layout, Batch const &b,
                             /*expected=*/0, /*swap=*/0, signaled);
         wr[i].opcode = IBV_WR_ATOMIC_FETCH_AND_ADD;
         wr[i].wr.atomic.compare_add = 1;
+        break;
+      case BatchKind::FaaTsCatchUp:
+        // The counter write-back of BatchKind::FaaTsCatchUp. Same repurposed
+        // atomic as FaaTs, but the addend is THIS REPLICA'S shortfall against
+        // the target rather than 1 -- so unlike every other op in a batch, the
+        // work differs per replica. The caller supplies it because only the
+        // backend knows what the preceding FAA round observed where.
+        //
+        // An addend of 0 is never posted: the caller drops the op for every
+        // replica when the round showed no divergence, which keeps the chain
+        // length uniform across replicas and costs nothing in the common case.
+        rc.prepareSingleCas(wr[i], sg[i], wr_id, &cas_bufs[i],
+                            layout.tsCounterAddrOf(rc.remoteBuf()),
+                            /*expected=*/0, /*swap=*/0, signaled);
+        wr[i].opcode = IBV_WR_ATOMIC_FETCH_AND_ADD;
+        wr[i].wr.atomic.compare_add = catchup_addend;
         break;
     }
   }
@@ -600,6 +617,10 @@ class RdmaOps : public RdmaNodeReader<Conns> {
   /// there is one implementation of "a batch on the wire" rather than two to
   /// keep in step -- the difference between N=1 and N=3 is how many chains get
   /// posted before anything is drained, not how a chain is built.
+  /// The N=1 path writes one counter, so it cannot diverge from itself and no
+  /// write-back is ever owed. See faaCatchUpAddends in ds_ts.hpp.
+  [[nodiscard]] bool tsNeedsWriteBack() const { return false; }
+
   BatchResult submit(Batch const &b) {
     BatchResult out;
     if (!b.wellFormed()) return out;
@@ -849,13 +870,24 @@ class RdmaReplicaSet {
     // chain per replica.
     stageBatchPayloads(b, stage_node_, stage_vec_);
 
+    // Per-replica addends for a FaaTsCatchUp, from the PRECEDING round's
+    // pre-values -- which is why they are members. A catch-up cannot ride the
+    // same batch as the claiming FAA: the target is the maximum over the
+    // replies, and phase 1 posts before phase 2 has read any of them.
+    uint64_t addends[kMaxReplicaFanout] = {};
+    if (b.hasFaaCatchUp()) {
+      (void)faaCatchUpAddends(faa_pre_, faa_answered_, n, prev_max_faa_pre_,
+                              addends);
+      ++ts_write_backs_;
+    }
+
     // Phase 1: post everywhere. Nothing is awaited yet.
     for (size_t r = 0; r < n; ++r) {
       submitted[r] = false;
       committed[r] = false;
       to_drain[r] = postBatchChain(*conns_[r], layout_, b, stage_node_,
                                    stage_vec_, &cas_bufs_[r * kMaxBatchOps],
-                                   doorbell_, kBlockingWrId);
+                                   doorbell_, kBlockingWrId, addends[r]);
       if (to_drain[r] > 0) {
         writes_ += b.vecWrites() + b.nodeWrites();
         cas_ += b.size() - b.vecWrites() - b.nodeWrites();
@@ -882,11 +914,16 @@ class RdmaReplicaSet {
       // decided another writer's maximum may not be in the intersection. See
       // the derivation in ds_ts.hpp; ts_partial below counts when that held.
       uint64_t const pre = batchPreFaa(b, &cas_bufs_[r * kMaxBatchOps]);
+      // Recorded per replica as well as reduced, so the write-back that
+      // follows can compute each replica's own shortfall.
+      faa_answered_[r] = (pre != kNoFaa);
+      faa_pre_[r] = faa_answered_[r] ? pre : 0;
       if (pre != kNoFaa) {
         ++answered_;
         if (max_faa_pre_ == kNoFaa || pre > max_faa_pre_) max_faa_pre_ = pre;
       }
     }
+    if (b.hasFaa()) prev_max_faa_pre_ = max_faa_pre_;
 
     // One timestamp for the batch, from the maximum over the replicas that
     // answered plus this writer's index. The index is what makes it unique when
@@ -955,6 +992,15 @@ class RdmaReplicaSet {
     return nodes_ == nullptr ? RemoteAddr{} : nodes_->allocate();
   }
 
+  /// Did the last claiming FAA round diverge, so a write-back is owed?
+  /// See RdmaAsyncOps::tsNeedsWriteBack and faaCatchUpAddends in ds_ts.hpp.
+  [[nodiscard]] bool tsNeedsWriteBack() const {
+    uint64_t addends[kMaxReplicaFanout] = {};
+    return faaCatchUpAddends(faa_pre_, faa_answered_, conns_.size(),
+                             prev_max_faa_pre_, addends);
+  }
+  [[nodiscard]] uint64_t tsWriteBacks() const { return ts_write_backs_; }
+
   [[nodiscard]] uint64_t lastTs() const { return last_ts_; }
   [[nodiscard]] uint64_t replicaReads() const { return reads_; }
   [[nodiscard]] uint64_t replicaWrites() const { return writes_; }
@@ -970,7 +1016,6 @@ class RdmaReplicaSet {
  private:
   /// Bound on the per-replica scratch arrays. invariants.md §9 restricts the
   /// toggle to 1 or 3.
-  static constexpr size_t kMaxReplicaFanout = 8;
 
   Conns &conns_;
   Layout const &layout_;
@@ -989,6 +1034,14 @@ class RdmaReplicaSet {
   TsMode ts_mode_ = TsMode::Clock;
   uint64_t last_ts_ = kNullTs;
   uint64_t max_faa_pre_ = kNoFaa;
+  /// What the last CLAIMING FAA round observed, per replica, plus its maximum.
+  /// Separate from max_faa_pre_ (which is overwritten by every submit, catch-up
+  /// batches included) because the write-back's target is the maximum of the
+  /// round that claimed the timestamp, not of the batch carrying the write-back.
+  uint64_t faa_pre_[kMaxReplicaFanout] = {};
+  bool faa_answered_[kMaxReplicaFanout] = {};
+  uint64_t prev_max_faa_pre_ = kNoFaa;
+  uint64_t ts_write_backs_ = 0;
   uint64_t ts_partial_ = 0;
   uint64_t ts_short_of_quorum_ = 0;
   uint64_t client_idx_ = 0;

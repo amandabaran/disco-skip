@@ -308,6 +308,14 @@ class PutOperation {
       if (r.ts != kNullTs) {
         Batch stamp;
         stamp.casTs(helped_off_, kNullTs, r.ts);
+        // ABD's write-back, applied to the counter: if this FAA round found
+        // the replicas' counters disagreeing, raise the laggards to the
+        // maximum BEFORE the operation returns. Without it a later writer can
+        // claim a smaller timestamp than one that already finished -- the
+        // "with only a majority it breaks" case derived in ds_ts.hpp. Rides
+        // this batch, so it costs no extra round trip, and is omitted entirely
+        // when the round was in agreement.
+        if (ops_.tsNeedsWriteBack()) stamp.faaTsCatchUp();
         help_batch_ = stamp;
         step_ = PutStep::AwaitSettleStamp;
         return ops_.postBatch(help_batch_);
@@ -473,6 +481,10 @@ class PutOperation {
       // Raw counter value in Faa mode -- see stampFor() in ds_ts.hpp.
       stamp.casTs(staged_off_, kNullTs,
                   stampFor(ops_.tsMode(), r.ts, pred_ts_));
+      // See ds_ts.hpp: a majority FAA does not order writers on its own, so a
+      // round that found the counters diverged owes the laggards a write-back
+      // before this write may return. Rides this same batch.
+      if (ops_.tsNeedsWriteBack()) stamp.faaTsCatchUp();
       if (!ops_.postBatch(stamp)) return done(false);
       ++wstats_.faa_stamps;
       ++wstats_.batches;

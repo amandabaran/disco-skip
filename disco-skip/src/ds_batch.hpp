@@ -55,6 +55,30 @@ enum class BatchKind : uint8_t {
   /// chained with the CAS that writes `ts`: that CAS's value is this one's
   /// result, and is not known until the chain completes.
   FaaTs,
+  /// Push every replica's counter up to the maximum the PRECEDING FaaTs round
+  /// observed -- ABD's write-back, applied to the counter.
+  ///
+  /// WHY IT IS NEEDED. ds_ts.hpp derives that real-time order across writers
+  /// holds only if a writer's FAA reaches ALL replicas: with a majority, W1's
+  /// maximum can come from a replica outside W2's quorum, so W2 can claim a
+  /// SMALLER timestamp than a write that finished before it began. Quorum
+  /// intersection guarantees W2 sees some replica W1 touched; it does not
+  /// guarantee W2 sees the one that decided W1's maximum.
+  ///
+  /// The write-back closes exactly that gap. Once W1 has raised every replica
+  /// in its quorum to M1 + 1, any later quorum intersects that set and so
+  /// observes at least M1 + 1. FAA rather than a plain write because a write
+  /// can move a counter BACKWARDS if it raced ahead, which would lose an
+  /// ordering another writer already relied on; addition can only move it
+  /// forward, and a concurrent increment simply lands on top.
+  ///
+  /// The addend is PER REPLICA -- target minus that replica's own pre-value --
+  /// so unlike every other BatchKind this one does not describe identical work
+  /// on each replica. Both the target and the per-replica pre-values come from
+  /// the backend's record of the immediately preceding FaaTs round, which is
+  /// why this carries no operand. That couples it to "the last FAA round" in
+  /// the same way the stamping CAS is already coupled to it via BatchResult::ts.
+  FaaTsCatchUp,
 };
 
 /// One operation in a batch.
@@ -145,6 +169,12 @@ class Batch {
   void faaTs() {
     if (push(BatchKind::FaaTs) != nullptr) ++faas_;
   }
+  /// Ride the counter write-back on this batch. See BatchKind::FaaTsCatchUp.
+  ///
+  /// Deliberately NOT counted in faas_: batchPreFaa() and the FaaTs accounting
+  /// look for the claiming FAA, and a catch-up is not one -- its pre-value is
+  /// not a candidate timestamp.
+  void faaTsCatchUp() { (void)push(BatchKind::FaaTsCatchUp); }
 
   [[nodiscard]] size_t size() const { return n_; }
   [[nodiscard]] BatchOp const &operator[](size_t i) const { return ops_[i]; }
@@ -159,6 +189,12 @@ class Batch {
   [[nodiscard]] size_t vecWrites() const { return vec_writes_; }
   [[nodiscard]] size_t nodeWrites() const { return node_writes_; }
   [[nodiscard]] bool hasFaa() const { return faas_ > 0; }
+  [[nodiscard]] bool hasFaaCatchUp() const {
+    for (size_t i = 0; i < n_; ++i) {
+      if (ops_[i].kind == BatchKind::FaaTsCatchUp) return true;
+    }
+    return false;
+  }
 
   /// Is this batch issuable as written?
   ///
@@ -196,6 +232,10 @@ class Batch {
 struct BatchResult {
   /// The timestamp the batch's FaaTs claimed, or kNullTs if it carried none.
   uint64_t ts = kNullTs;
+  /// The RAW pre-value behind `ts` -- the maximum over the replicas that
+  /// answered. Exposed because the counter write-back targets pre + 1, and
+  /// reconstructing it from `ts` would mean inverting tsFromFaa's packing.
+  uint64_t pre_faa = 0;
   /// Did the batch reach the fabric at all? False means a malformed batch or a
   /// write that missed its quorum -- the caller cannot assume anything landed.
   bool submitted = false;

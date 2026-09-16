@@ -30,7 +30,14 @@ INCLUDES  := -I$(SRC_DIR) -I$(CACHE_DIR) -I$(CACHE_DIR)/include-cache
 # the checked-in template, which is what its own instructions say to do.
 MACHINE_DEFINES := $(CACHE_DIR)/include-cache/common/machine_defines.h
 
+# THE FAKES BELONG HERE TOO. They were omitted, so editing fake_replicas.hpp
+# or fake_ops.hpp did not rebuild anything -- a test binary would silently keep
+# running against the previous version of the harness. That is not a slow
+# build, it is a wrong answer: a deliberately broken fake produced byte-
+# identical passing output, which read as "the test does not catch this" when
+# the truth was "the test never ran".
 HDRS := $(wildcard $(SRC_DIR)/ds_*.hpp) $(SRC_DIR)/layout.hpp \
+        $(wildcard fake_*.hpp) \
         $(wildcard $(CACHE_DIR)/*.h) \
         $(wildcard $(CACHE_DIR)/include-cache/*/*.h)
 

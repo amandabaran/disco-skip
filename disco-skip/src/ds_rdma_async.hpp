@@ -704,13 +704,28 @@ class RdmaAsyncOps {
     batch_ = &b;
     stageBatchPayloads(b, layout_.getStageNode(future_id_),
                        layout_.getStageVec(future_id_));
+    // Per-replica addends for a FaaTsCatchUp, if this batch carries one.
+    //
+    // WHETHER TO CARRY ONE IS THE CALLER'S DECISION, via tsNeedsWriteBack().
+    // Substituting a stripped copy of the batch here would have been the
+    // obvious alternative and is wrong: resolveBatch() locates the pre-FAA and
+    // the commit swapback by OP POSITION in the batch it is handed, so
+    // dropping an op would leave it reading the wrong scratch slots. The batch
+    // posted is always exactly the batch the caller built and will resolve.
+    uint64_t addends[kMaxReplicaFanout] = {};
+    if (b.hasFaaCatchUp()) {
+      (void)faaCatchUpAddends(faa_pre_, faa_answered_, n, faa_max_pre_,
+                              addends);
+      ++stats_.ts_write_backs;
+    }
+
     size_t completions = 0;
     for (size_t r = 0; r < n; ++r) {
       size_t const c = postBatchChain(
           *conns_[r], layout_, b, layout_.getStageNode(future_id_),
           layout_.getStageVec(future_id_),
           layout_.casBufsFor(future_id_, r), /*doorbell=*/true,
-          /*wr_id=*/future_id_);
+          /*wr_id=*/future_id_, addends[r]);
       completions += c;
       bump(r, static_cast<int64_t>(c));
     }
@@ -735,13 +750,26 @@ class RdmaAsyncOps {
     uint64_t best = kNoFaa;
     size_t answered = 0;
     size_t const n = conns_.size();
+    // Recorded per replica, not just reduced to a maximum: the counter
+    // write-back needs each replica's own shortfall, and this is the only
+    // point at which those values are still in scope. Cleared first so a
+    // batch carrying no FaaTs cannot leave a previous round's values looking
+    // current to faaCatchUpAddends().
+    for (size_t r = 0; r < kMaxReplicaFanout; ++r) {
+      faa_answered_[r] = false;
+      faa_pre_[r] = 0;
+    }
+    faa_max_pre_ = kNoFaa;
     for (size_t r = 0; r < n; ++r) {
       uint64_t const pre = batchPreFaa(b, layout_.casBufsFor(future_id_, r));
       if (pre == kNoFaa) continue;
+      faa_answered_[r] = true;
+      faa_pre_[r] = pre;
       ++answered;
       if (best == kNoFaa || pre > best) best = pre;
     }
     if (best == kNoFaa) return kNullTs;
+    faa_max_pre_ = best;
     // A QUORUM IS REQUIRED, NOT "WHOEVER ANSWERED".
     //
     // This used to return a stamp whenever at least ONE replica answered. With
@@ -784,6 +812,18 @@ class RdmaAsyncOps {
       if (took > 0) ++stats_.partial_commits;
     }
     return out;
+  }
+
+  /// Did the last claiming FAA round diverge, so that a write-back is owed?
+  ///
+  /// False in the failure-free case -- every replica answers with the same
+  /// pre-value, nothing lags, and the stamping batch stays one CAS. True only
+  /// when some replica missed increments, which is when ds_ts.hpp's
+  /// "with only a majority it breaks" case is live.
+  [[nodiscard]] bool tsNeedsWriteBack() const {
+    uint64_t addends[kMaxReplicaFanout] = {};
+    return faaCatchUpAddends(faa_pre_, faa_answered_, conns_.size(),
+                             faa_max_pre_, addends);
   }
 
   [[nodiscard]] TsMode tsMode() const { return ts_mode_; }
@@ -846,6 +886,12 @@ class RdmaAsyncOps {
 
   TsMode ts_mode_ = TsMode::Clock;
   uint64_t client_idx_ = 0;
+  /// What the last claiming FAA round observed, per replica. Kept so the
+  /// counter write-back can compute each replica's shortfall; see
+  /// faaCatchUpAddends() in ds_ts.hpp.
+  uint64_t faa_pre_[kMaxReplicaFanout] = {};
+  bool faa_answered_[kMaxReplicaFanout] = {};
+  uint64_t faa_max_pre_ = kNoFaa;
   size_t bumped_ = 0;  ///< completions queued by the post in progress
   VecOffset spec_pending_ = kNullVec;
   /// Bitmask of replicas whose header was actually READ this round.

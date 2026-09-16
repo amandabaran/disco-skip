@@ -778,6 +778,14 @@ class RangeOperation {
       // still correct and still what the chain needs.
       Batch stamp;
       stamp.casTs(helped_off_, kNullTs, r.ts);
+        // ABD's write-back, applied to the counter: if this FAA round found
+        // the replicas' counters disagreeing, raise the laggards to the
+        // maximum BEFORE the operation returns. Without it a later writer can
+        // claim a smaller timestamp than one that already finished -- the
+        // "with only a majority it breaks" case derived in ds_ts.hpp. Rides
+        // this batch, so it costs no extra round trip, and is omitted entirely
+        // when the round was in agreement.
+        if (ops_.tsNeedsWriteBack()) stamp.faaTsCatchUp();
       last_batch_ = stamp;
       step_ = RangeStep::AwaitSettleStamp;
       return ops_.postBatch(last_batch_);

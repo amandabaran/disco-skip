@@ -113,6 +113,21 @@ class FakeOps {
   /// snapshot, not a slot: readers that FAA'd would contend with each other and
   /// burn counter values for nothing. See ds_range.hpp.
   [[nodiscard]] uint64_t readTsCounter() const { return ts_counter_; }
+  /// TEST HOOK: advance this arena's counter without writing anything.
+  ///
+  /// Counter divergence and DATA divergence are different things, and a test
+  /// that produces the first by downing a replica gets the second for free --
+  /// after which the next quorum containing that replica cannot form a
+  /// majority on the node it missed, so the write under test never resolves.
+  /// Injecting the counter state directly isolates the variable. It models
+  /// what really produces divergence: an FAA lost while the rest of its batch
+  /// reached its quorum, or a returning replica whose data is repaired and
+  /// whose counter is not.
+  void advanceTsCounterForTest(uint64_t by) { ts_counter_ += by; }
+  /// A single arena cannot diverge from itself, so no write-back is ever owed.
+  /// See faaCatchUpAddends in ds_ts.hpp for what this gates.
+  [[nodiscard]] bool tsNeedsWriteBack() const { return false; }
+
   void setClientIdx(uint64_t i) { client_idx_ = i; }
   [[nodiscard]] uint64_t clientIdx() const { return client_idx_; }
   [[nodiscard]] uint64_t tsCounter() const { return ts_counter_; }
@@ -164,7 +179,7 @@ class FakeOps {
   /// what same-QP RC ordering guarantees. Counted so a test can assert that an
   /// operation issued ONE batch rather than several, which is the property the
   /// round-trip count depends on.
-  ds::BatchResult submit(ds::Batch const &b) {
+  ds::BatchResult submit(ds::Batch const &b, uint64_t catchup_addend = 0) {
     ds::BatchResult out;
     if (!b.wellFormed()) return out;  // submitted == false
     ++batches_;
@@ -198,7 +213,14 @@ class FakeOps {
         case ds::BatchKind::FaaTs:
           // Claimed here, in chain order -- so it lands after the publishing
           // CAS, which is the property the ordering depends on.
-          out.ts = ds::tsFromFaa(faaTs(), client_idx_);
+          out.pre_faa = faaTs();
+          out.ts = ds::tsFromFaa(out.pre_faa, client_idx_);
+          break;
+        case ds::BatchKind::FaaTsCatchUp:
+          // The counter write-back. Addition, not assignment, for the reason
+          // in BatchKind::FaaTsCatchUp: a concurrent increment must land on
+          // top rather than be overwritten.
+          ts_counter_ += catchup_addend;
           break;
       }
     }

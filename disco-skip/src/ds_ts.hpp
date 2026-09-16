@@ -332,4 +332,41 @@ static_assert(tsFromFaa(5, 1) != tsFromFaa(5, 2),
 static_assert(tsFromFaa(5, 9) < tsFromFaa(6, 0),
               "a larger counter maximum outranks any client tiebreak");
 
+/// Per-replica addends for the counter write-back, and whether it is needed.
+///
+/// THE FIX FOR THE "WITH ONLY A MAJORITY IT BREAKS" CASE DERIVED ABOVE. That
+/// derivation shows real-time order needs W2 to observe the replica that
+/// decided W1's maximum, which quorum intersection does not provide. Raising
+/// every replica in W1's quorum to M1 + 1 before W1 returns does provide it:
+/// any later quorum intersects that set, so M2 >= M1 + 1.
+///
+/// The counter holds raw counts, and a replica that answered with pre-value p
+/// sits at p + 1 after its own FAA. Target p_max + 1, so its shortfall is
+/// p_max - p. A replica that did NOT answer gets 0: its value is unknown and
+/// it is outside the quorum being established.
+///
+/// @param pre       per-replica pre-values from the claiming FAA round
+/// @param answered  whether that replica replied at all
+/// @param max_pre   the maximum over the replicas that answered
+/// @param addends   out, one per replica
+/// @return whether any replica lags, i.e. whether the write-back must be
+///         posted at all. False in the failure-free case -- every replica
+///         answers with the same pre-value -- so the common path adds no
+///         atomic and the chain length stays uniform across replicas.
+[[nodiscard]] inline bool faaCatchUpAddends(uint64_t const *pre,
+                                            bool const *answered, size_t n,
+                                            uint64_t max_pre,
+                                            uint64_t *addends) noexcept {
+  bool needed = false;
+  for (size_t r = 0; r < n; ++r) {
+    if (!answered[r] || pre[r] >= max_pre) {
+      addends[r] = 0;
+      continue;
+    }
+    addends[r] = max_pre - pre[r];
+    needed = true;
+  }
+  return needed;
+}
+
 }  // namespace ds

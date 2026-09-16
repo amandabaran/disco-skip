@@ -142,6 +142,14 @@ struct QuorumStats {
   /// must NOT yield a timestamp; the version stays pending (kNullTs) and a
   /// reader settles it.
   uint64_t ts_short_of_quorum = 0;
+  /// Counter write-backs posted: rounds where some replica's counter lagged
+  /// the maximum and had to be raised to it before the write could return.
+  ///
+  /// Non-zero means ds_ts.hpp's "with only a majority it breaks" case went
+  /// live and was repaired. Zero means every FAA round found the replicas in
+  /// agreement, so the maximum was exact and nothing was owed -- which is the
+  /// failure-free steady state and costs no extra atomic.
+  uint64_t ts_write_backs = 0;
   /// ROUND TRIPS. One per post/resolve pair the future actually waits on.
   ///
   /// The number that explains why one workload is slower than another, and it
@@ -381,6 +389,12 @@ class QuorumOps {
   ///
   /// A batch with no publishing CAS is reported committed, so a caller that
   /// only wanted the helping steps does not have to special-case it.
+  /// Did the last claiming FAA round diverge, so a counter write-back is owed?
+  /// Forwarded from the replica set -- only it saw the per-replica pre-values.
+  [[nodiscard]] bool tsNeedsWriteBack() const {
+    return set_.tsNeedsWriteBack();
+  }
+
   BatchResult submit(Batch const &b) {
     BatchResult out;
     if (!b.wellFormed()) return out;

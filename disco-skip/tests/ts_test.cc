@@ -17,6 +17,7 @@
 
 #include <cstdio>
 #include <set>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -24,6 +25,7 @@
 #include "ds_ts.hpp"
 #include "ds_verify.hpp"
 #include "fake_ops.hpp"
+#include "fake_replicas.hpp"
 
 static int g_failures = 0;
 
@@ -307,6 +309,134 @@ static void checkHelperStampsAreTheDocumentedGap() {
         "a helper's stamp is the unguarded source");
 }
 
+
+/// The counterexample ds_ts.hpp derives, run for real.
+///
+/// "WITH ONLY A MAJORITY IT BREAKS": let W1's maximum come from replica A and
+/// let W2's quorum exclude A. W2 does touch some B in Q1 n Q2, whose value
+/// after W1 is v_B + 1 -- but v_B + 1 can still be <= M1, because M1 came from
+/// A, not B. So a write that STARTS AFTER another FINISHED can claim a
+/// timestamp that is not larger.
+///
+/// TWO THINGS THIS TEST HAS TO KEEP APART, and the first draft did not.
+/// Downing a replica to make its counter fall behind also makes its DATA fall
+/// behind, and then the next quorum containing it holds two disagreeing
+/// handles -- no majority, so the write under test never resolves and the test
+/// measures nothing. The counters are therefore diverged directly
+/// (advanceCounterForTest) while every replica stays current on data.
+///
+/// The two writers also touch DIFFERENT data nodes. W_A leaves replica 0 one
+/// version stale on its own node; if W_B wrote the same node, its quorum
+/// {0,2} could not form a majority there either. The counter is global, so
+/// ordering across two different keys is exactly the cross-writer property at
+/// issue.
+///
+/// With counters (C+10, C+10, C) and all data in agreement:
+///
+///   W_A, quorum {1,2}: pre (C+10, C), M_A = C+10 from REPLICA 1
+///                      ts_A = C+11, write-back raises replica 2 to C+11
+///   W_A COMPLETES. W_B, quorum {0,2} -- never reads replica 1:
+///     with the write-back:  pre (C+10, C+11), M_B = C+11, ts_B = C+12 > ts_A
+///     without it, replica 2 would sit at C+1:
+///                           pre (C+10, C+1),  M_B = C+10, ts_B = C+11 == ts_A
+///
+/// Equal is already a violation -- two distinct writes cannot share a
+/// timestamp and still give the old_ver chain a strict order -- so ts_B > ts_A
+/// catches both the tie and the inversion the client tiebreak turns it into.
+static void checkTheMajorityFaaCounterexampleIsRepaired() {
+  FakeReplicaSet set(3, kLayers, 16384);
+  set.setTsMode(ds::TsMode::Faa);
+  ds::QuorumStats qs;
+  ds::PutStats ps;
+  ds::WriteStats ws;
+  ds::NullPutCache cache;
+
+  auto put = [&](ds::Key k, ds::Value v) {
+    ds::QuorumOps<FakeReplicaSet> ops(set, qs, nullptr);
+    ds::Putter<ds::QuorumOps<FakeReplicaSet>, ds::NullPutCache> p(
+        ops, cache, kLayers, ps, ws);
+    return p.put(k, v, 0).resolved;
+  };
+  auto dataAddr = [&](ds::Key k) {
+    ds::QuorumOps<FakeReplicaSet> ops(set, qs, nullptr);
+    ds::PathStep path[kLayers];
+    ds::Traversal<ds::QuorumOps<FakeReplicaSet>> t(ops);
+    return t.traverse(k, kLayers, path).data_addr;
+  };
+  // The ts now on the node covering k, from any replica that is up and current.
+  auto tsOf = [&](ds::RemoteAddr addr) -> uint64_t {
+    uint64_t best = ds::kNullTs;
+    for (size_t r = 0; r < 3; ++r) {
+      if (set.isDown(r)) continue;
+      ds::NodeRecord node{};
+      if (!set.readNodeFrom(r, addr, node)) continue;
+      ds::VecRecord vec{};
+      if (!set.readVecFrom(r, node.handle.offset(), vec)) continue;
+      if (vec.ts != ds::kNullTs && (best == ds::kNullTs || vec.ts > best)) {
+        best = vec.ts;
+      }
+    }
+    return best;
+  };
+
+  // Seed a structure with at least two data nodes, every replica current.
+  std::mt19937_64 rng(0x7A5A11);
+  for (int i = 0; i < 300; ++i) {
+    (void)put(static_cast<ds::Key>(rng() % 2000),
+              static_cast<ds::Value>(i + 1));
+  }
+  ds::Key const k_a = 100;
+  ds::Key const k_b = 1900;
+  CHECK(put(k_a, 1), "seed k_a");
+  CHECK(put(k_b, 2), "seed k_b");
+  ds::RemoteAddr const addr_a = dataAddr(k_a);
+  ds::RemoteAddr const addr_b = dataAddr(k_b);
+  CHECK(addr_a != addr_b, "the two writers touch different data nodes");
+
+  // Diverge the COUNTERS only. Replica 1 alone runs ahead, and that is the
+  // point: W_A's maximum must be held by exactly the replica W_B will not
+  // read. Diverging replicas 0 and 1 together does not discriminate, because
+  // W_B reads replica 0 and would see the maximum there anyway.
+  set.advanceCounterForTest(1, 10);
+
+  uint64_t const wb_before = set.tsWriteBacks();
+
+  // W_A runs with EVERY REPLICA UP, so it leaves no replica stale on data --
+  // which is what lets W_B's quorum form a majority afterwards. Its maximum
+  // still comes from replica 1 alone.
+  CHECK(put(k_a, 900), "W_A resolves with all replicas up");
+  uint64_t const ts_a = tsOf(addr_a);
+
+  // W_A has COMPLETED. W_B's quorum is {0,2}; it never reads replica 1.
+  //
+  //   with the write-back:  replicas 0 and 2 were raised to C+11
+  //                         pre (C+11, C+11), M_B = C+11, ts_B = C+12 > ts_A
+  //   without it, both sat at C+1 (their own increment only)
+  //                         pre (C+1, C+1),   M_B = C+1,  ts_B = C+2  < ts_A
+  //
+  // so the unrepaired protocol inverts the order outright here, not merely
+  // ties it.
+  set.setDown(1, true);
+  CHECK(put(k_b, 901), "W_B resolves on {0,2}");
+  uint64_t const ts_b = tsOf(addr_b);
+  set.setDown(1, false);
+
+  std::printf("  majority-FAA counterexample: ts_A=%llu ts_B=%llu"
+              "  counters (%llu, %llu, %llu)  write-backs=%llu\n",
+              static_cast<unsigned long long>(ts_a),
+              static_cast<unsigned long long>(ts_b),
+              static_cast<unsigned long long>(set.counterOf(0)),
+              static_cast<unsigned long long>(set.counterOf(1)),
+              static_cast<unsigned long long>(set.counterOf(2)),
+              static_cast<unsigned long long>(set.tsWriteBacks() - wb_before));
+
+  CHECK(ts_a != ds::kNullTs && ts_b != ds::kNullTs, "both writes were stamped");
+  CHECK(set.tsWriteBacks() > wb_before,
+        "the diverged round actually posted a counter write-back");
+  CHECK(ts_b > ts_a,
+        "a write that began after another finished takes a LARGER timestamp");
+}
+
 int main() {
   checkModeNamesRoundTrip();
   checkNoSourceEverReturnsTheNullMarker();
@@ -317,6 +447,7 @@ int main() {
   checkFaaConsumesOneCounterValuePerStampAndNeverRepeats();
   checkChainSurvivesABackwardClock();
   checkHelperStampsAreTheDocumentedGap();
+  checkTheMajorityFaaCounterexampleIsRepaired();
 
   if (g_failures == 0) {
     std::printf("ts: all checks pass\n");

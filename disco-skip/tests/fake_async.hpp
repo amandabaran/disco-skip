@@ -258,6 +258,10 @@ class FakeAsyncOps {
 
   uint64_t now() { return set_.now(); }
   [[nodiscard]] ds::TsMode tsMode() const { return set_.tsMode(); }
+  /// Forwarded: only the replica set saw the per-replica FAA pre-values.
+  [[nodiscard]] bool tsNeedsWriteBack() const {
+    return set_.tsNeedsWriteBack();
+  }
 
   // Allocation is client-local, so it comes from the replica set's single
   // allocator pair rather than per replica -- a RemoteAddr and a VecOffset mean

@@ -53,6 +53,14 @@ inline constexpr size_t kNumReplicas = DS_N_REPLICAS;
 static_assert(kNumReplicas == 1 || kNumReplicas == 3,
               "DS_N_REPLICAS must be 1 or 3 (invariants.md §9)");
 
+/// Upper bound on the replicas one client fans out to, for stack arrays sized
+/// at compile time while the live count is dynamic (`conns_.size()`, from -s).
+///
+/// At namespace scope rather than private to RdmaReplicaSet, which is where it
+/// used to live: the async ops need the same bound for its per-replica FAA
+/// pre-value arrays, and two copies of a bound are two things to keep in step.
+inline constexpr size_t kMaxReplicaFanout = 8;
+
 /// Entries per node vector, on both sides. The cache computes this as
 /// `2 << IDX_EXP` (skipvector_disco.h, node_t::get_vector_size), and A4 settled
 /// that the remote capacity matches. The remote node layout asserts against
