@@ -255,6 +255,65 @@ static ds::GetResult runAsyncGet(Ops &ops, Cache &cache, ds::Key k,
   return g.result();
 }
 
+// ── A stale hint on the ASYNC get path ────────────────────────────────────
+
+/// A cache that always hands back a stale hint: the first data node, whatever
+/// the key.
+struct StaleHintCache {
+  [[nodiscard]] ds::RemoteAddr locateData(ds::Key) const {
+    return ds::RemoteAddr{ds::kInitialDataId};
+  }
+  void reconcile(ds::Key, ds::RemoteAddr, ds::PathStep const *, uint32_t) {}
+  void mirrorInsert(ds::Key, uint32_t, ds::RemoteAddr,
+                    std::array<ds::RemoteAddr, ds::kMaxLayers> const &) {}
+};
+
+/// Every key must still resolve correctly when the cache is wrong about all of
+/// them.
+///
+/// get_test.cc covers this for the BLOCKING Getter; this is the resumable path,
+/// which resolves a bad hint through its own state machine (AwaitHintHeader ->
+/// detect C4 -> beginTraversal) and had no coverage. A stale hint must cost
+/// round trips and nothing else -- never a wrong answer, never a hang.
+///
+/// This test outlived the optimisation it was written for: a sideways-hop
+/// recovery on mismatch, which measured 10-15% SLOWER than descending and was
+/// removed (see the note in ds_get_future.hpp::onHintHeader). The correctness
+/// property is worth keeping regardless of how staleness is resolved.
+static void checkStaleHintStillResolvesOnTheAsyncPath() {
+  FakeReplicaSet set(3, kLayers);
+  ds::QuorumStats qs;
+  ds::QuorumOps<FakeReplicaSet> sops(set, qs, nullptr);
+  ds::PutStats ps;
+  ds::WriteStats ws;
+  ds::NullCache pcache;
+  ds::Putter<ds::QuorumOps<FakeReplicaSet>, ds::NullCache> p(sops, pcache,
+                                                             kLayers, ps, ws);
+  std::mt19937_64 rng(20260916);
+  std::map<ds::Key, ds::Value> oracle;
+  for (int i = 0; i < 400; ++i) {
+    ds::Key const k = 1 + (rng() % 2000);
+    ds::Value const v = 1 + (rng() % 100000);
+    if (p.put(k, v, ds::drawHeight(rng, kLayers)).resolved) oracle[k] = v;
+  }
+
+  StaleHintCache stale;
+  ds::GetStats st;
+  FakeAsyncOps aops(set, qs, nullptr);
+  size_t unresolved = 0, wrong = 0;
+  for (auto const &kv : oracle) {
+    ds::GetResult const r = runAsyncGet(aops, stale, kv.first, st);
+    if (!r.resolved) { ++unresolved; continue; }
+    if (!r.found || r.value != kv.second) ++wrong;
+  }
+  CHECK(unresolved == 0, "every key resolves despite a wrong hint");
+  CHECK(wrong == 0, "and returns the value the oracle holds");
+  CHECK(st.kmin_mismatch > 0, "and the bad hints were detected as C4");
+  std::printf("  async stale hint: %llu keys, %llu C4 detections, 0 wrong\n",
+              (unsigned long long)oracle.size(),
+              (unsigned long long)st.kmin_mismatch);
+}
+
 static void checkAsyncGetAgreesWithTheBlockingGetter() {
   // Both over a NullCache first, so the comparison is of the traversal path and
   // the answer, with no cache state to diverge.
@@ -685,6 +744,7 @@ int main() {
   checkAgreementMidSplit();
   checkSpeculationCollapsesANodeToOneRoundTrip();
   checkAgreementUnderAStaleHint();
+  checkStaleHintStillResolvesOnTheAsyncPath();
   checkAsyncGetAgreesWithTheBlockingGetter();
   checkAsyncGetHitsTheCacheAndRepairsIt();
   checkAsyncPutBuildsTheSameStructure();

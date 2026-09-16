@@ -61,6 +61,7 @@ class GetOperation {
     k_ = k;
     out_ = GetResult{};
 
+
     RemoteAddr const hinted = cache_.locateData(k);
     if (hinted.isNull()) {
       ++stats_.cache_misses;
@@ -125,6 +126,26 @@ class GetOperation {
     // C4: the address was real and the read consistent, but this is no longer
     // the right node. A detected bad hint, not a wrong answer.
     ++stats_.kmin_mismatch;
+    // DO NOT "JUST HOP SIDEWAYS" HERE. It was built and measured, and it loses.
+    //
+    // The idea: a k_min mismatch means the named node SPLIT, so the key is in a
+    // sibling one `next` hop away, and hopping should beat re-descending from
+    // the root. Half of that is true -- 42-54% of hops did find the node -- and
+    // it still lost at every budget, on workload A with 3 servers:
+    //
+    //     clients  --hint-hops   kops   trips/op
+    //        8          0         358     6.10
+    //        8          2         321     6.72
+    //        8          4         303     7.05
+    //       16          0         405     8.01
+    //       16          2         368     8.58
+    //       16          4         366     8.76
+    //
+    // The arithmetic is why: a recovery saves a descent (~4 trips), a failure
+    // costs a trip AND still pays the descent, and ~2.4 hops were spent per
+    // mismatch. Roughly 2 trips saved against 2.4 spent -- a losing bet even at
+    // a 50% hit rate. Making staleness cheaper needs a different idea, not a
+    // bigger budget.
     return beginTraversal();
   }
 
@@ -137,7 +158,7 @@ class GetOperation {
     have_vec_ = true;
     if (covers(node_, vec_, k_)) return answerFromHint();
     ++stats_.kmin_mismatch;
-    return beginTraversal();
+    return beginTraversal();   // see the note in onHintHeader
   }
 
   size_t answerFromHint() {

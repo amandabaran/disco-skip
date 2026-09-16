@@ -36,6 +36,7 @@ struct GetStats {
   uint64_t cache_hits = 0;      ///< cache named a node that answered
   uint64_t cache_misses = 0;    ///< cache had no entry for k
   uint64_t kmin_mismatch = 0;   ///< C4: named node no longer covers k
+
   uint64_t traversals = 0;        ///< full remote traversals
   uint64_t reconciles = 0;      ///< paths fed back to the cache
   uint64_t nodes_read = 0;   ///< 64-byte header reads

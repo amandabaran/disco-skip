@@ -798,7 +798,36 @@ int main(int argc, char** argv) {
             // and different between clients so two do not make an identical
             // structural decision for the same key.
             std::mt19937_64 pop_rng(0xB0B ^ proc_id);
-            for (size_t kvIndex = 0; kvIndex < inserts.size(); kvIndex++) {
+            // PARTITION THE PRELOAD ACROSS CLIENTS. It used to be
+            // `kvIndex = 0; kvIndex < inserts.size()` on EVERY client, so all
+            // of them inserted the whole key set.
+            //
+            // At 64 clients that is 6.4 M put operations to build a 100,000-key
+            // structure, and it was wrong in three ways at once:
+            //
+            //  1. WRONG WORKLOAD. Only the first client to reach a key inserts
+            //     it; the other 63 perform UPDATES. So the "load" phase ran
+            //     ~98% updates, which is not what loading a structure means,
+            //     and the split history that comes out of it -- orphan counts,
+            //     occupancy, level populations -- is shaped by 6.4 M writes
+            //     rather than 100,000.
+            //  2. WRONG ARENA. Every put allocates a vector (copy-on-write, no
+            //     reclamation), so the preload alone reserved ~100,000 vectors
+            //     PER CLIENT. At 64 clients the arena reached 10.54 GiB of the
+            //     servers' 15.1 GiB available, and throughput collapsed from
+            //     303 kops at 16 clients to 64 at 64 -- which looked like a
+            //     scaling limit and was memory pressure.
+            //  3. WRONG SETUP TIME. 64x the necessary work before every run.
+            //
+            // Striding by client_idx gives each client a disjoint share, so the
+            // total is the key set exactly once. finishAllFutures below plus
+            // the "initialized" barrier still order the whole load before any
+            // client starts measuring, so no client can observe a partially
+            // loaded structure.
+            uint64_t const preload_stride = layout.num_clients;
+            uint64_t const preload_start = state.client_idx;
+            for (size_t kvIndex = preload_start; kvIndex < inserts.size();
+                 kvIndex += preload_stride) {
                 
                 // Extract numerical representation of key string for the register mapping
                 uint64_t target_reg = std::stoull(inserts[kvIndex].first.substr(4)) % layout.num_registers;

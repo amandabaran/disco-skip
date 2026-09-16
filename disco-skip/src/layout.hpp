@@ -450,7 +450,6 @@ public:
     }
 };
 
-
 /// Per-client bump allocator over that client's private stripe of the vector
 /// arena.
 ///

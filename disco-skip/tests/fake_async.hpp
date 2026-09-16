@@ -27,6 +27,7 @@ class FakeAsyncOps {
 
   size_t replicas() const { return set_.replicas(); }
 
+
   ds::VecOffset guess(ds::RemoteAddr a) {
     return hint_ != nullptr ? hint_->guess(a) : ds::kNullVec;
   }

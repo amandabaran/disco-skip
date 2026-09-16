@@ -95,6 +95,32 @@ static_assert((kNodeCapacity & (kNodeCapacity - 1)) == 0,
 /// naming rather than spelling 8 in three places.
 inline constexpr size_t kLevelRatio = size_t{1} << kIdxExp;
 
+// ── TARGET SIZE vs MAX CAPACITY ──────────────────────────────────────────
+//
+//   target size  = kLevelRatio   = 1 << kIdxExp    mean entries per node
+//   max capacity = kNodeCapacity = 2 << kDataExp   the node's ceiling
+//
+// With DS_DATA_EXP defaulting to DS_IDX_EXP these coincide as
+// capacity == 2 * target, which is the intended geometry and worth stating
+// because it is load-bearing rather than arbitrary. drawHeight makes a key a
+// node boundary with probability 1/kLevelRatio, so runs of height-0 keys are
+// geometric with mean (1-p)/p ~= kLevelRatio. A ceiling of TWICE that mean
+// leaves room for the tail of the distribution, which is what keeps capacity
+// splits rare: measured 7.2:1 height-driven to capacity-driven at ratio 8
+// (17,987 against 2,505).
+//
+// SEPARATING THE TWO EXPONENTS MADE THIS BREAKABLE, hence the assert. A
+// capacity below 2 * target inverts the regime -- capacity splits become the
+// common case and occupancy is clamped by the ceiling instead of being set by
+// the height distribution, which is the one thing the split statistics say
+// governs it. Going the other way (capacity well above 2 * target) is merely
+// wasteful: it was measured inert, since 8x the capacity at a fixed ratio left
+// node and entry counts identical (2238 nodes, 13,927 vs 13,926 entries).
+static_assert(kNodeCapacity >= 2 * kLevelRatio,
+              "max capacity must be at least 2 << kIdxExp, i.e. twice the "
+              "target size, or capacity splits dominate and occupancy is "
+              "clamped by the ceiling rather than by drawHeight");
+
 using Key = uint64_t;
 using Value = uint64_t;
 
