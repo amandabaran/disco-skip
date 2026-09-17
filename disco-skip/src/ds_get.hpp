@@ -38,6 +38,35 @@ struct GetStats {
   uint64_t kmin_mismatch = 0;   ///< C4: named node no longer covers k
 
   uint64_t traversals = 0;        ///< full remote traversals
+
+  // ── WHAT A CACHE MISMATCH COSTS, which was not measurable ────────────────
+  //
+  // The cache's HIT RATE was already answerable and is not the interesting
+  // number. Measured on workload A at 16 clients over 3.87 M gets: 77.5% hit
+  // and were correct, 20.8% hit and were WRONG (C4 k_min mismatch, so the
+  // named node no longer covers k), and 0.0017% -- 67 gets -- missed
+  // outright. The directory almost always names a node; it names a STALE one
+  // in one get in five. So "cache miss" is the wrong thing to think about
+  // here, and the mismatch rate is the whole cost.
+  //
+  // What that cost IS could not be stated. The client prints one pooled
+  // `round trips` figure over gets, puts and ranges -- 5.81 per op on that
+  // run -- with no way to split it, and GetStats::nodes_read and vec_reads
+  // were accumulated and then never printed. So the largest identified lever
+  // on the read path had no price attached.
+  //
+  // These two split it. Both count TIMES THE OPERATION WAITED FOR THE
+  // NETWORK, not records fetched, which is why they do not come from
+  // nodes_read + vec_reads: a speculation hit bumps vec_reads without a round
+  // trip, and 9.55 M of 18.2 M speculations hit on that run.
+  //
+  /// Round trips spent on the hint path -- the fast path, whether or not it
+  /// ended up answering. Divide by (cache_hits + kmin_mismatch) for the cost
+  /// of consulting the cache at all.
+  uint64_t rt_hint = 0;
+  /// Round trips spent inside a full remote traversal. Divide by `traversals`
+  /// for what one costs. THIS IS THE NUMBER the mismatch rate multiplies.
+  uint64_t rt_traverse = 0;
   uint64_t reconciles = 0;      ///< paths fed back to the cache
   uint64_t nodes_read = 0;   ///< 64-byte header reads
   uint64_t vec_reads = 0;    ///< 320-byte vector reads

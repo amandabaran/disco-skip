@@ -149,12 +149,14 @@ class TraversalFuture {
     // is where the offset hint actually pays.
     size_t const n = ops_.postHeaders(cur_, ops_.guess(cur_));
     ++res_.nodes_read;
+    ++res_.round_trips;
     return n;
   }
 
   size_t postVec(VecOffset off) {
     step_ = TraversalStep::AwaitVec;
     ++res_.vec_reads;
+    ++res_.round_trips;
     return ops_.postVec(off);
   }
 
@@ -182,6 +184,7 @@ class TraversalFuture {
         }
         settle_tries_ = 0;
         step_ = TraversalStep::AwaitRepair;
+        ++res_.round_trips;
         size_t const await = ops_.postRepair(cur_);
         if (await == 0) {
           // Nothing to repair means every replica already agrees, so the next
@@ -223,6 +226,7 @@ class TraversalFuture {
         if (ops_.tsNeedsWriteBack()) stamp.faaTsCatchUp();
         help_batch_ = stamp;
         step_ = TraversalStep::AwaitHelpStamp;
+        ++res_.round_trips;
         return ops_.postBatch(help_batch_);
       }
     }

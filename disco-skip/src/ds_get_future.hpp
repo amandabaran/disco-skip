@@ -71,6 +71,7 @@ class GetOperation {
     step_ = GetStep::AwaitHintHeader;
     // Speculate the vector: on a hit the whole Get is one round trip, which is
     // the best case the cache can produce.
+    ++stats_.rt_hint;
     return ops_.postHeaders(hinted, ops_.guess(hinted));
   }
 
@@ -113,12 +114,14 @@ class GetOperation {
       // The header's bound cannot be trusted mid-propagation, so the vector's
       // descriptor decides whether this node still covers k.
       step_ = GetStep::AwaitHintVec;
+      ++stats_.rt_hint;
       return ops_.postVec(node_.handle.offset());
     }
     bool const in_range = have_vec_ ? covers(node_, vec_, k_)
                                     : coversByHeader(node_, k_);
     if (in_range && !have_vec_) {
       step_ = GetStep::AwaitHintVec;
+      ++stats_.rt_hint;
       return ops_.postVec(node_.handle.offset());
     }
     if (in_range) return answerFromHint();
@@ -183,6 +186,11 @@ class GetOperation {
     stats_.nodes_read += r.nodes_read;
     stats_.vec_reads += r.vec_reads;
     stats_.right_hops += r.right_hops;
+    // Taken from the traversal's OWN counter rather than derived from the two
+    // above: a speculation hit bumps vec_reads without a round trip, and the
+    // repair and helping posts are round trips neither of them sees. See
+    // TraversalResult::round_trips.
+    stats_.rt_traverse += r.round_trips;
     stats_.helped += r.helped_ts + r.helped_splits;
 
     if (!r.ok()) {

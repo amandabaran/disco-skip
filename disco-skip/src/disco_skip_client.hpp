@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <algorithm>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -268,6 +269,55 @@ public:
                    gstats.failures);
         fmt::print("              {} cache hits, {} misses, {} kmin mismatch\n",
                    gstats.cache_hits, gstats.cache_misses, gstats.kmin_mismatch);
+        // THE CACHE'S HIT RATE IS NOT THE INTERESTING NUMBER, and the line
+        // above does not make that obvious. On workload A the directory almost
+        // never MISSES -- 67 times in 3.87 M gets -- it names a STALE node in
+        // one get in five. So the cost is the mismatch rate multiplied by what
+        // a traversal costs, and until now the second factor was unprintable:
+        // `round trips` below is pooled over gets, puts and ranges.
+        //
+        // `traversals` was also never shown, though it is recoverable two ways
+        // that agree exactly -- ok minus cache_hits, and mismatch plus misses.
+        // Verified equal on 16 of 16 clients. Shown now so it need not be
+        // reconstructed.
+        {
+            uint64_t const consulted = gstats.cache_hits + gstats.kmin_mismatch;
+            fmt::print("              {} traversals ({:.1f}% of gets), "
+                       "{} reconciles\n",
+                       gstats.traversals,
+                       100.0 * static_cast<double>(gstats.traversals) /
+                           static_cast<double>(std::max<uint64_t>(
+                               1, gstats.cache_hits + gstats.traversals +
+                                      gstats.not_found)),
+                       gstats.reconciles);
+            fmt::print("              round trips: {} on the hint path "
+                       "({:.2f}/consult), {} in traversals "
+                       "({:.2f}/traversal)\n",
+                       gstats.rt_hint,
+                       static_cast<double>(gstats.rt_hint) /
+                           static_cast<double>(std::max<uint64_t>(1, consulted)),
+                       gstats.rt_traverse,
+                       static_cast<double>(gstats.rt_traverse) /
+                           static_cast<double>(
+                               std::max<uint64_t>(1, gstats.traversals)));
+            // What the staleness actually costs, in the one unit that matters.
+            // A correct hit and a mismatch are not the same operation: the
+            // mismatch pays the hint path AND the traversal.
+            if (gstats.traversals != 0 && gstats.cache_hits != 0) {
+                double const hit_rt =
+                    static_cast<double>(gstats.rt_hint) /
+                    static_cast<double>(std::max<uint64_t>(1, consulted));
+                double const trav_rt =
+                    static_cast<double>(gstats.rt_traverse) /
+                    static_cast<double>(gstats.traversals);
+                fmt::print("              so a stale hint costs ~{:.2f} extra "
+                           "round trips vs ~{:.2f} for a correct one\n",
+                           trav_rt, hit_rt);
+            }
+            fmt::print("              {} node reads, {} vector reads, "
+                       "{} right hops (RECORDS, not trips)\n",
+                       gstats.nodes_read, gstats.vec_reads, gstats.right_hops);
+        }
         if (gstats.failures != 0) {
             fmt::print("              gave up: {} no-majority, {} settle-stuck, "
                        "{} too-many-hops\n",

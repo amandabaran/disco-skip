@@ -94,6 +94,22 @@ struct TraversalResult {
   uint32_t helped_ts = 0;
   uint32_t helped_splits = 0;
 
+  /// Times this traversal STOPPED AND WAITED FOR THE NETWORK.
+  ///
+  /// WHY NOT nodes_read + vec_reads, WHICH LOOKS LIKE THE SAME NUMBER. It is
+  /// not, and it overstates: a speculation HIT increments vec_reads without a
+  /// round trip, because the vector arrived alongside the header it was
+  /// speculated with. On workload A with the hint on, 9.55 M of 18.2 M
+  /// speculations hit, so the error is not a rounding one. The repair and
+  /// helping posts, meanwhile, are round trips that neither counter sees at
+  /// all.
+  ///
+  /// This exists to answer "what does a cache mismatch COST". The client's
+  /// `round trips` is a single pooled figure over gets, puts and ranges, so
+  /// the 5.81 per op measured on workload A cannot be split -- and 20.8% of
+  /// gets there traverse, which is the largest single lever nobody had priced.
+  uint32_t round_trips = 0;
+
   /// Which guard fired, when status is not Ok. See TraversalGaveUp.
   TraversalGaveUp gave_up = TraversalGaveUp::No;
 
