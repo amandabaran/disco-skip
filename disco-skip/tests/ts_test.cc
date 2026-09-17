@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "ds_put.hpp"
+#include "ds_range.hpp"
 #include "ds_ts.hpp"
 #include "ds_verify.hpp"
 #include "fake_ops.hpp"
@@ -437,6 +438,121 @@ static void checkTheMajorityFaaCounterexampleIsRepaired() {
         "a write that began after another finished takes a LARGER timestamp");
 }
 
+
+/// --ts none: no stamps, no helping, no ranges -- and one submission per write.
+///
+/// The mode exists because point operations never need a timestamp (they
+/// linearize on the publishing CAS and the version tags) while workloads A-D
+/// contain no scans at all, so those runs were paying for a capability they
+/// never used. What they were paying, per write per server: one atomic to
+/// claim or read a timestamp, one atomic to CAS it into the vector, and -- in
+/// Faa mode -- a whole extra ROUND TRIP, because the value is not known until
+/// the FAA returns so the stamp cannot ride the publish chain.
+///
+/// Three properties, and the second is the one that makes this a MODE rather
+/// than simply an absent field:
+///
+///   1. Nothing is stamped. Every version keeps ts == kNullTs.
+///   2. NOBODY TRIES TO HELP. kNullTs already means "published but unstamped,
+///      go help it", so if writes just stopped stamping then every version
+///      would look pending forever and every reader would queue a helping
+///      batch for a write nobody was ever going to stamp -- turning a saving
+///      into unbounded helper traffic. tsIsPending() takes the mode.
+///   3. A range REFUSES rather than answering. Nothing was stamped, so no
+///      order can be reconstructed after the fact and any interval returned
+///      would mix states that never coexisted. Reported as a failure the
+///      caller can see, not as an empty result, which would look like a
+///      legitimate answer.
+static void checkTsNoneSkipsStampingWithoutStrandingReaders() {
+  Rig r;
+  r.ops.setTsMode(ds::TsMode::None);
+
+  uint64_t const batches_before = r.ops.batches();
+  for (int i = 0; i < 40; ++i) {
+    ds::Key const k = static_cast<ds::Key>(100 + (i % 10));
+    CHECK(r.put(k, static_cast<ds::Value>(i + 1), i % 3).resolved,
+          "a put resolves with no timestamp mode");
+  }
+  uint64_t const batches_after = r.ops.batches();
+
+  // 1. Nothing stamped, anywhere in the arena.
+  uint64_t stamped = 0, total = 0;
+  for (uint64_t off = 0; off < r.ops.vecCount(); ++off) {
+    uint64_t const ts = r.ops.vecAt(static_cast<ds::VecOffset>(off)).ts;
+    if (ts == ds::kBootstrapTs) continue;   // bootstrap writes a settled tree
+    ++total;
+    if (ts != ds::kNullTs) ++stamped;
+  }
+  CHECK(total > 0, "there were versions to inspect");
+  CHECK(stamped == 0, "no version is stamped in TsMode::None");
+
+  // 2. No helping. helped_ts counts timestamps a reader fixed for a writer;
+  //    in this mode there is nothing to fix and asking would be wasted work.
+  CHECK(r.ws.helped_ts == 0, "no reader helped a timestamp in TsMode::None");
+
+  // And a traversal over that arena must not decide to help either -- this is
+  // the path that would storm.
+  {
+    ds::PathStep path[kLayers];
+    ds::Traversal<FakeOps> t(r.ops);
+    ds::TraversalResult const tr = t.traverse(105, kLayers, path);
+    CHECK(tr.status == ds::TraversalStatus::Ok, "a traversal still resolves");
+    CHECK(tr.helped_ts == 0, "a traversal helps no timestamp in TsMode::None");
+  }
+
+  // 3. A range refuses, and says why.
+  {
+    ds::RangeStats rs;
+    std::vector<ds::Entry> got;
+    ds::Ranger<FakeOps> ranger(r.ops, rs);
+    ds::RangeResult const res = ranger.range(0, 1000, kLayers, 1u << 20, got);
+    CHECK(!res.resolved, "a range does not resolve in TsMode::None");
+    CHECK(res.gave_up_no_timestamps,
+          "and reports it as a configuration error, not a race");
+    CHECK(rs.failures == 1, "counted as a failure the caller can see");
+    CHECK(got.empty(), "and returns nothing rather than a plausible interval");
+  }
+
+  // The structure itself is still sound -- this mode changes what is recorded
+  // about ORDER, not what is stored.
+  CHECK(r.verify("with no timestamps"), "the structure verifies in TsMode::None");
+
+  std::printf("  ts none: %llu writes in %llu batches (%.2f per write), "
+              "%llu of %llu versions stamped\n",
+              40ULL,
+              static_cast<unsigned long long>(batches_after - batches_before),
+              static_cast<double>(batches_after - batches_before) / 40.0,
+              static_cast<unsigned long long>(stamped),
+              static_cast<unsigned long long>(total));
+}
+
+/// The saving, stated as a comparison rather than asserted in the abstract.
+///
+/// Faa needs a SECOND submission per write: the counter value is not known
+/// until the first chain completes, and a timestamp may not be allocated
+/// before the version it stamps is visible. None needs no second submission at
+/// all. On the cluster that second submission is a round trip; here it is a
+/// batch count, which is the same quantity the fake can see.
+static void checkTsNoneCostsFewerSubmissionsThanFaa() {
+  uint64_t counts[2];
+  ds::TsMode const modes[2] = {ds::TsMode::Faa, ds::TsMode::None};
+  for (int i = 0; i < 2; ++i) {
+    Rig r;
+    r.ops.setTsMode(modes[i]);
+    uint64_t const before = r.ops.batches();
+    for (int j = 0; j < 30; ++j) {
+      CHECK(r.put(static_cast<ds::Key>(200 + (j % 8)),
+                  static_cast<ds::Value>(j + 1), 0).resolved, "put resolves");
+    }
+    counts[i] = r.ops.batches() - before;
+  }
+  std::printf("  submissions for 30 writes: faa=%llu none=%llu\n",
+              static_cast<unsigned long long>(counts[0]),
+              static_cast<unsigned long long>(counts[1]));
+  CHECK(counts[1] < counts[0],
+        "TsMode::None issues strictly fewer submissions per write than Faa");
+}
+
 int main() {
   checkModeNamesRoundTrip();
   checkNoSourceEverReturnsTheNullMarker();
@@ -448,6 +564,8 @@ int main() {
   checkChainSurvivesABackwardClock();
   checkHelperStampsAreTheDocumentedGap();
   checkTheMajorityFaaCounterexampleIsRepaired();
+  checkTsNoneSkipsStampingWithoutStrandingReaders();
+  checkTsNoneCostsFewerSubmissionsThanFaa();
 
   if (g_failures == 0) {
     std::printf("ts: all checks pass\n");

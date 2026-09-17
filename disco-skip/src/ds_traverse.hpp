@@ -146,7 +146,7 @@ template <class Ops>
 bool settleNode(Ops &ops, RemoteAddr addr, NodeRecord &node, VecRecord &vec,
                 HelpCounters &c) {
   for (int attempt = 0; attempt < detail::kMaxSettleAttempts; ++attempt) {
-    bool const pending = vec.isPending();
+    bool const pending = tsIsPending(vec, ops.tsMode());
     bool const unstable = !node.isStable();
     if (!pending && !unstable) return true;
 

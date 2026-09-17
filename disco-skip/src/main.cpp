@@ -501,8 +501,8 @@ int main(int argc, char** argv) {
     }
 
     if (!ds::parseTsMode(ts_mode_name, layout.ts_mode)) {
-        std::cerr << "--ts must be clock, tsc or faa; got '" << ts_mode_name
-                  << "'" << std::endl;
+        std::cerr << "--ts must be clock, tsc, faa or none; got '"
+                  << ts_mode_name << "'" << std::endl;
         return 1;
     }
     // Both of these are legal and useful, and both are easy to select by
@@ -986,6 +986,33 @@ int main(int argc, char** argv) {
                           << " operations: " << n_get << " read, " << n_put
                           << " update, " << n_scan << " scan, " << n_ins
                           << " insert." << std::endl;
+
+                // --ts none WITH SCANS IS A CONFIGURATION ERROR, and it has to
+                // fail HERE rather than per range.
+                //
+                // Nothing in the arena is stamped in that mode, so a range has
+                // no snapshot to answer at and RangeOperation refuses. If the
+                // run proceeded, every scan would count as a failure and the
+                // throughput number would describe a workload that answered
+                // 95% of its operations with an error -- a plausible-looking
+                // figure for something that did no useful work. Refusing up
+                // front costs one line of output instead of a void sweep.
+                //
+                // The check lives after the census because that is the first
+                // point at which the operation mix is known: the mode is a
+                // flag, but whether the workload scans is a property of the
+                // YCSB file.
+                if (!ds::tsStamps(state.layout.ts_mode) && n_scan > 0) {
+                    std::cerr << "\n*** --ts none cannot run a workload with "
+                              << "scans: " << n_scan << " of "
+                              << operations.size() << " operations are scans."
+                              << "\n*** No version is stamped in that mode, so "
+                              << "a range has no snapshot to answer at."
+                              << "\n*** Use --ts faa (or clock/tsc) for scan "
+                              << "workloads; --ts none is for the point-only "
+                              << "workloads (YCSB A-D)." << std::endl;
+                    return 1;
+                }
             }
 
             std::cout << "Waiting for the initialization of other clients... " << std::flush;

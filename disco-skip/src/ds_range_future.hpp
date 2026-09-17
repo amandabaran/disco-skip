@@ -80,6 +80,18 @@ class RangeOperation {
     begin(lo, hi, cap, out);
     if (hi < lo) return done(true);   // empty interval, not an error
 
+    // NO TIMESTAMPS MEANS NO SNAPSHOT, so there is no answer to give. Refusing
+    // is the only correct behaviour: the versions in the arena were never
+    // stamped, so no ordering can be reconstructed now and any interval we
+    // returned would be a mix of states that never coexisted. Reported as a
+    // failure the caller can see, not an empty result -- an empty range looks
+    // like a legitimate answer.
+    if (!tsStamps(ops_.tsMode())) {
+      ++stats_.failures;
+      res_.gave_up_no_timestamps = true;
+      return done(false);
+    }
+
     if (ops_.tsMode() == TsMode::Faa) {
       step_ = RangeStep::AwaitSnapshot;
       return ops_.postTsCounter();
@@ -545,7 +557,7 @@ class RangeOperation {
 
       if (nd.k_min > hi_) return done(true);
 
-      if (vc.isPending() || !nd.isStable() || vc.ts > res_.snapshot) {
+      if (tsIsPending(vc, ops_.tsMode()) || !nd.isStable() || vc.ts > res_.snapshot) {
         // Not answerable from the batch. Resume the serial path at this node;
         // it settles, walks old_ver, and continues from there.
         ++stats_.batch_misses;
@@ -691,7 +703,7 @@ class RangeOperation {
   /// We hold the node and its CURRENT vector. Settle it if need be, then begin
   /// the walk back towards the snapshot.
   size_t useVersion() {
-    bool const pending = vec_.isPending();
+    bool const pending = tsIsPending(vec_, ops_.tsMode());
     bool const unstable = !node_.isStable();
     if (pending || unstable) {
       if (++settle_tries_ > static_cast<uint32_t>(detail::kMaxSettleAttempts)) {

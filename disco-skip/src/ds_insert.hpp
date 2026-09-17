@@ -206,9 +206,11 @@ class Writer {
       Batch b;
       b.writeVec(off, staged);
       b.casHandle(addr, node.handle.raw, node.handle.withContent(off).raw);
+      // TsMode::None contributes nothing: the batch stays writeVec +
+      // casHandle, and the stamping submission further down is skipped too.
       if (ops_.tsMode() == TsMode::Faa) {
         b.faaTs();
-      } else {
+      } else if (tsStamps(ops_.tsMode())) {
         // max(clock, predecessor + 1): the chain is strictly decreasing by
         // construction rather than by the clock being good enough, and it is
         // free because `vec` IS the version being superseded. See ds_ts.hpp.
@@ -244,6 +246,8 @@ class Writer {
         // order, which is the one thing this mode exists to provide -- see
         // stampFor() in ds_ts.hpp for the worked counterexample.
         stamp.casTs(off, kNullTs, stampFor(ops_.tsMode(), r.ts, vec.ts));
+        // (Faa only -- guarded by hasFaa() above, and TsMode::None never
+        // issues an faaTs, so this second submission cannot be reached.)
         // See ds_ts.hpp: a majority FAA does not order writers on its own, so
         // a round that found the counters diverged owes the laggards a
         // write-back before this write may return. Rides this same batch.
@@ -400,8 +404,14 @@ class Writer {
           ops_.tsMode(), ops_.tsMode() == TsMode::Faa ? r.ts : ops_.now(),
           vec.ts);
       Batch finish;
-      finish.casTs(new_vec, kNullTs, ts);
-      finish.casTs(created_vec, kNullTs, ts);
+      // TsMode::None stamps neither half of a split. This site is easy to
+      // miss -- F1's stamp is obvious, F2's is two of them buried in the
+      // completion chain -- and missing it left 40 of 99 versions stamped in a
+      // mode whose whole claim is that nothing is.
+      if (tsStamps(ops_.tsMode())) {
+        finish.casTs(new_vec, kNullTs, ts);
+        finish.casTs(created_vec, kNullTs, ts);
+      }
       finish.casNextKMin(addr, node.next_k_min, split_key);
       finish.casNextId(addr, node.next_id, created.id);
       finish.casTailWord(addr, packTailWord(node.level, node.tail_struct_ver),

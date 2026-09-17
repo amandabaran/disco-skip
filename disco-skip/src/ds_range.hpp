@@ -169,6 +169,12 @@ struct RangeResult {
   bool resolved = false;
   uint64_t snapshot = kNullTs;
   bool capped = false;   ///< stopped at the entry cap; see RangeStats::capped
+  /// The run was started with --ts none, so no version in the arena was ever
+  /// stamped and no snapshot exists to answer at. Distinguished from an
+  /// ordinary failure because it is a CONFIGURATION error, not a race: no
+  /// number of retries will help, and the caller should be told to pick a
+  /// timestamp mode rather than to try again.
+  bool gave_up_no_timestamps = false;
 };
 
 namespace detail {
@@ -185,6 +191,10 @@ inline constexpr uint32_t kMaxVersionHops = 1u << 16;
 /// admit every client index at that counter value. Clock: read the clock.
 template <class Ops>
 [[nodiscard]] uint64_t takeSnapshot(Ops &ops) {
+  // TsMode::None has no snapshot to take; Ranger::range refuses before
+  // reaching here, and this returns kNullTs so a caller that somehow did
+  // cannot mistake a stale clock reading for a valid T.
+  if (!tsStamps(ops.tsMode())) return kNullTs;
   if (ops.tsMode() != TsMode::Faa) return ops.now();
   return (ops.readTsCounter() << kFaaClientBits) | kFaaClientMask;
 }
@@ -215,6 +225,14 @@ class Ranger {
   /// @param cap  stop after this many entries and report capped
   RangeResult range(Key lo, Key hi, uint32_t layers, size_t cap,
                     std::vector<Entry> &out) {
+    // Same refusal as RangeOperation::start: no stamps, no snapshot, no
+    // answer. The two paths are differentially tested, so they must agree.
+    if (!tsStamps(ops_.tsMode())) {
+      RangeResult res;
+      res.gave_up_no_timestamps = true;
+      ++stats_.failures;
+      return res;
+    }
     return rangeAt(lo, hi, layers, cap, takeSnapshot(ops_), out);
   }
 
@@ -308,7 +326,7 @@ class Ranger {
       ++stats_.nodes_read;
       if (!ops_.readVec(node.handle.offset(), vec)) return false;
       ++stats_.vec_reads;
-      if (!vec.isPending() && node.isStable()) return true;
+      if (!tsIsPending(vec, ops_.tsMode()) && node.isStable()) return true;
       // Unstamped or mid-split: complete it rather than guess. A pending
       // version's eventual stamp may be <= T, so skipping it would drop a
       // committed write from the snapshot.

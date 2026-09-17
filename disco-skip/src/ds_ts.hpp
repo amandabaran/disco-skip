@@ -173,6 +173,33 @@ enum class TsMode : uint8_t {
   Clock,  ///< disciplined CLOCK_REALTIME via the vDSO -- the default
   Tsc,    ///< raw rdtscp: cheapest, and not comparable across machines
   Faa,    ///< the global counter: no timing assumption, one point of failure
+  /// NO TIMESTAMPS AT ALL. Point operations do not need one -- they linearize
+  /// on the publishing CAS and the version tags (L1-L3, and
+  /// cache-remote-interface.md §9 is explicit that only ranges need a
+  /// timestamp) -- so a run with no scans is paying for a capability it never
+  /// uses. YCSB A, B, C and D contain no scans whatsoever.
+  ///
+  /// WHAT IT SAVES, and the round trip is the large part. In Faa mode a write
+  /// cannot fold its stamp into the publish chain, because the value is not
+  /// known until the FAA returns; so every write is publish-then-stamp, two
+  /// submissions. With no timestamp a write is writeVec + casHandle in ONE
+  /// chain: one round trip instead of two, and one atomic per server instead
+  /// of three (casHandle, faaTs, casTs). On this hardware atomics measure
+  /// 2.705 Mpps against 7.859 for reads, and a CAS stream drags concurrent
+  /// reads down to 2.43, so those two atomics are not a rounding cost.
+  ///
+  /// THE CATCH, AND WHY THIS IS A MODE RATHER THAN AN ABSENT FIELD.
+  /// `ts == kNullTs` already means "published but not yet stamped -- go help
+  /// it", and isPending() drives the helping path in every state machine. If
+  /// writes simply stopped stamping, every version would look pending forever
+  /// and every reader would try to help one, turning a saving into unbounded
+  /// helper traffic. So readers have to KNOW the mode: see tsIsPending().
+  ///
+  /// IT IS A PROPERTY OF THE RUN, NOT OF AN OPERATION. A range arriving in a
+  /// run that never stamped cannot reconstruct an order after the fact, so
+  /// this cannot be "skip the stamp unless somebody scans". A range in this
+  /// mode is refused outright rather than answered wrongly.
+  None,
 };
 
 /// Parse the --ts option.
@@ -180,7 +207,26 @@ enum class TsMode : uint8_t {
   if (s == "clock") { out = TsMode::Clock; return true; }
   if (s == "tsc")   { out = TsMode::Tsc;   return true; }
   if (s == "faa")   { out = TsMode::Faa;   return true; }
+  if (s == "none")  { out = TsMode::None;  return true; }
   return false;
+}
+
+/// Does this mode stamp versions at all?
+[[nodiscard]] inline constexpr bool tsStamps(TsMode m) noexcept {
+  return m != TsMode::None;
+}
+
+/// Is /v/ a version somebody still owes a timestamp to?
+///
+/// THE MODE IS PART OF THE QUESTION, which is why this is not a method on
+/// VecRecord. `ts == kNullTs` means "published, unstamped, help it" in every
+/// mode that stamps -- and means nothing at all in TsMode::None, where no
+/// version is ever stamped. Asking the record alone would make every version
+/// look pending forever the moment stamping was switched off, and every reader
+/// would queue a helping batch for a write that was never going to be stamped.
+template <class Vec>
+[[nodiscard]] inline bool tsIsPending(Vec const &v, TsMode m) noexcept {
+  return tsStamps(m) && v.isPending();
 }
 
 [[nodiscard]] inline char const *tsModeName(TsMode m) {
@@ -188,6 +234,7 @@ enum class TsMode : uint8_t {
     case TsMode::Clock: return "clock (disciplined CLOCK_REALTIME)";
     case TsMode::Tsc:   return "tsc (raw rdtscp, not cross-machine)";
     case TsMode::Faa:   return "faa (global counter, one point of failure)";
+    case TsMode::None:  return "none (NO SNAPSHOT RANGES -- point operations only)";
   }
   return "?";
 }

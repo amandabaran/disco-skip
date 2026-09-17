@@ -64,11 +64,32 @@ inline constexpr size_t kMaxChainDepth = 1u << 20;
 
 }  // namespace detail
 
+namespace verifyDetail {
+/// Does /reader/ expose a timestamp mode, and does that mode stamp?
+///
+/// Detected rather than required: the verifier is handed FakeOps, QuorumOps,
+/// RdmaOps and a couple of test-only readers, and threading a mode through
+/// every one of them to answer a question most of them do not have an opinion
+/// on would be worse than asking.
+template <class R>
+auto stamps(R &r, int) -> decltype(tsStamps(r.tsMode())) {
+  return tsStamps(r.tsMode());
+}
+template <class R>
+bool stamps(R &, long) { return true; }
+template <class R>
+bool stamps(R &r) { return stamps(r, 0); }
+}  // namespace verifyDetail
+
 template <class Reader>
 class StructureVerifier {
  public:
-  StructureVerifier(Reader &reader, uint32_t layers)
-      : r_(reader), layers_(layers) {
+  /// @param stamps  whether this run's timestamp mode stamps versions at
+  ///                all. False under TsMode::None, where every version is
+  ///                unstamped by design and the ts assertions would report
+  ///                the mode working as a structural fault.
+  StructureVerifier(Reader &reader, uint32_t layers, bool stamps = true)
+      : r_(reader), layers_(layers), stamps_(stamps) {
     rep_.nodes_per_level.assign(layers, 0);
   }
 
@@ -101,6 +122,7 @@ class StructureVerifier {
  private:
   Reader &r_;
   uint32_t layers_;
+  bool stamps_ = true;
   VerifyReport rep_;
 
   /// child id -> (expected k_min, expected level, referencing node)
@@ -148,7 +170,13 @@ class StructureVerifier {
     }
 
     // Likewise no version should still be pending.
-    if (s.isPending()) {
+    //
+    // UNLESS NOTHING STAMPS. In TsMode::None every version is unstamped by
+    // design, so this assertion and the chain-decreasing one below are
+    // meaningless there -- they would report the mode working correctly as a
+    // structural fault. The reader is asked for its mode rather than the
+    // checks being weakened for everyone.
+    if (stamps_ && s.isPending()) {
       err(idStr(id) +
           ": current version's ts is null (pending) in a quiescent structure");
     }
@@ -235,7 +263,10 @@ class StructureVerifier {
       }
       ++rep_.old_versions;
 
-      if (older.isPending()) {
+      if (!stamps_) {
+        // No ts ordering to check in TsMode::None; content_ver below still is,
+        // and it is what actually orders a chain in that mode.
+      } else if (older.isPending()) {
         err(idStr(id) + ": a superseded version at offset " +
             std::to_string(off) + " is still pending, so no snapshot can ever "
                                   "be resolved against it");
@@ -425,7 +456,16 @@ class StructureVerifier {
 /// Convenience wrapper.
 template <class Reader>
 VerifyReport verifyStructure(Reader &reader, uint32_t layers) {
-  return StructureVerifier<Reader>(reader, layers).run();
+  // Asks the reader for its mode when it can answer, so a caller does not have
+  // to remember to. Readers without tsMode() are stamping readers.
+  return StructureVerifier<Reader>(reader, layers,
+                                   verifyDetail::stamps(reader)).run();
+}
+
+/// The same, with the mode stated explicitly.
+template <class Reader>
+VerifyReport verifyStructure(Reader &reader, uint32_t layers, bool stamps) {
+  return StructureVerifier<Reader>(reader, layers, stamps).run();
 }
 
 }  // namespace ds

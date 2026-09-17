@@ -331,7 +331,7 @@ class PutOperation {
     // propagated into its header, which is what makes it safe for the new
     // version to carry none -- publishing a descriptor-free version over an
     // open window would strand the old bound in the header.
-    bool const pending = vec_.isPending();
+    bool const pending = tsIsPending(vec_, ops_.tsMode());
     bool const unstable = !node_.isStable();
     if (pending || unstable) {
       Batch b;
@@ -448,9 +448,13 @@ class PutOperation {
     // See ds_ts.hpp: Faa claims its value after the publish and writes it in a
     // second round trip; the local modes fold it into this chain, guarded
     // against the version being superseded so the chain cannot invert.
+    // TsMode::None adds NOTHING here, which is the whole point of the mode:
+    // the batch stays writeVec + casHandle, one chained submission, and the
+    // AwaitStamp step below never runs. Faa's second round trip disappears
+    // with it.
     if (ops_.tsMode() == TsMode::Faa) {
       batch_.faaTs();
-    } else {
+    } else if (tsStamps(ops_.tsMode())) {
       batch_.casTs(off, kNullTs,
                    stampFor(ops_.tsMode(), ops_.now(), vec_.ts));
     }
@@ -588,8 +592,12 @@ class PutOperation {
         ops_.tsMode(), ops_.tsMode() == TsMode::Faa ? r.ts : ops_.now(),
         pred_ts_);
     finish_ = Batch{};
-    finish_.casTs(new_vec_, kNullTs, ts);
-    finish_.casTs(created_vec_, kNullTs, ts);
+    // Neither half of a split is stamped in TsMode::None -- see the matching
+    // note in ds_insert.hpp.
+    if (tsStamps(ops_.tsMode())) {
+      finish_.casTs(new_vec_, kNullTs, ts);
+      finish_.casTs(created_vec_, kNullTs, ts);
+    }
     finish_.casNextKMin(target_, pre_split_.next_k_min, split_key_);
     finish_.casNextId(target_, pre_split_.next_id, created_.id);
     finish_.casTailWord(

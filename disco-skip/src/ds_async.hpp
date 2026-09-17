@@ -289,7 +289,7 @@ class TraversalFuture {
 
   /// We hold the covering node and its vector. Settle it if need be, then route.
   size_t useEntries() {
-    bool const pending = vec_.isPending();
+    bool const pending = tsIsPending(vec_, ops_.tsMode());
     bool const unstable = !node_.isStable();
     if (pending || unstable) {
       if (++settle_tries_ > static_cast<uint32_t>(detail::kMaxSettleAttempts)) {
