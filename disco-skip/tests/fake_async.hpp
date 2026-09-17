@@ -147,6 +147,13 @@ class FakeAsyncOps {
 
   static constexpr size_t kFanout = 16;
   static constexpr size_t walkFanout() { return kFanout; }
+  /// Sideways hops a stale hint may spend before descending. Settable so the
+  /// test can drive both the 0 case (descend at once) and a budgeted one --
+  /// the previous experiment on this had no off-cluster coverage at all, which
+  /// is part of why re-running it meant rebuilding the mechanism from a commit
+  /// message.
+  [[nodiscard]] uint32_t hintHops() const { return hint_hops_; }
+  void setHintHops(uint32_t n) { hint_hops_ = n; }
 
   size_t postWalkHeaders(ds::RemoteAddr const *addrs, size_t n) {
     walk_n_ = n;
@@ -295,6 +302,7 @@ class FakeAsyncOps {
   ds::BatchResult last_batch_{};
   uint64_t steal_commits_ = 0;
   uint64_t ts_counter_seen_ = 0;
+  uint32_t hint_hops_ = 0;
   size_t walk_n_ = 0;
   ds::RemoteAddr walk_addr_[kFanout]{};
   ds::NodeRecord walk_seen_[kFanout][8]{};

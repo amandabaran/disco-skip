@@ -83,6 +83,11 @@ struct Layout {
     /// Spread VECTOR reads across the replicas that agree, instead of always
     /// taking the first. See resolveWalkHeader in ds_rdma_async.hpp.
     bool spread_reads;
+    /// Sideways hops allowed when a cache hint turns out stale, before giving
+    /// up and descending from the head. 0 = descend immediately, which is the
+    /// shipped behaviour. See GetStats::hops_taken for the derivation and for
+    /// why the previous measurement of this is not conclusive.
+    uint32_t hint_hops;
     /// DIAGNOSTIC, AND DELIBERATELY INCORRECT: issue every batch CAS as a
     /// plain 8-byte RDMA WRITE of the desired value.
     ///

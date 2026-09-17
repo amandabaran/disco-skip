@@ -542,6 +542,9 @@ class RdmaAsyncOps {
   }
 
   static constexpr size_t walkFanout() { return Layout::kWalkFanout; }
+  /// Sideways hops a stale hint may spend before descending. See
+  /// Layout::hint_hops and GetStats::hops_taken.
+  [[nodiscard]] uint32_t hintHops() const { return layout_.hint_hops; }
 
   /// ── Snapshot acquisition ───────────────────────────────────────────────
   ///

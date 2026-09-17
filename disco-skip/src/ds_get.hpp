@@ -67,6 +67,41 @@ struct GetStats {
   /// Round trips spent inside a full remote traversal. Divide by `traversals`
   /// for what one costs. THIS IS THE NUMBER the mismatch rate multiplies.
   uint64_t rt_traverse = 0;
+
+  // ── RECOVERING A STALE HINT BY HOPPING SIDEWAYS (--hint-hops) ───────────
+  //
+  // A k_min mismatch means the named node SPLIT, so k is probably in a sibling
+  // one `next` hop away, and following it should cost one round trip where a
+  // full descent costs four or five.
+  //
+  // IT WAS MEASURED ONCE AND LOST, and the measurement's provenance is now
+  // ambiguous, which is why the mechanism is back behind a flag rather than
+  // gone. The recorded arms were hops 0/2/4 at 8 and 16 clients -- so budget
+  // ONE was never measured at all, and its arithmetic is different: the losing
+  // case was "~2 trips saved against ~2.4 spent", and at a budget of 1 at most
+  // one can be spent. The commit that recorded those numbers ALSO fixed a
+  // preload bug under which every client inserted the whole key set, and its
+  // two tables disagree about 16-client throughput (405 kops in the hop table,
+  // 303 in the preload note), so which preload the hop arms ran on cannot be
+  // established from the history.
+  //
+  /// Gets whose hint went stale, counted ONCE PER OPERATION.
+  ///
+  /// THE COUNTER THE ORIGINAL TEST NEEDED AND DID NOT HAVE. kmin_mismatch
+  /// counts DETECTIONS, and each failed hop lands on another node that also
+  /// fails to cover k -- which inflated it 24,232 -> 127,121 across those arms
+  /// and made the staleness rate look 5x worse instead of holding constant. So
+  /// the arms could not be compared on the quantity the experiment was about.
+  /// This one is invariant to the hop budget by construction.
+  uint64_t hint_stale_ops = 0;
+  /// Sideways hops actually taken, and how many landed on a node covering k.
+  /// The ratio is the hit rate the bet turns on -- previously 42-54%, inferred
+  /// from arm-to-arm differences rather than counted.
+  uint64_t hops_taken = 0;
+  uint64_t hops_recovered = 0;
+  /// Gets that spent their whole hop budget and still had to descend. These
+  /// paid the hops AND the traversal, which is the losing case.
+  uint64_t hops_exhausted = 0;
   uint64_t reconciles = 0;      ///< paths fed back to the cache
   uint64_t nodes_read = 0;   ///< 64-byte header reads
   uint64_t vec_reads = 0;    ///< 320-byte vector reads

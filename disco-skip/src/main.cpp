@@ -361,6 +361,7 @@ int main(int argc, char** argv) {
     layout.read_quorum       = false;
     layout.consult_cache     = DS_CACHE_ENABLED ? true : false;
     layout.writeback         = DS_REG_WRITEBACK_ENABLED ? true : false;
+    layout.hint_hops         = 0;
     layout.ts_mode           = ds::TsMode::Clock;
     layout.measure_latency   = true;
 
@@ -489,6 +490,14 @@ int main(int argc, char** argv) {
             "as faa, one fewer atomic per write per server. none stamps "
             "nothing at all and REFUSES any workload containing a scan, which "
             "is legal for YCSB A-D. See ds_ts.hpp.") |
+        lyra::opt(layout.hint_hops, "hint_hops").optional()["--hint-hops"](
+            "Sideways `next` hops a stale cache hint may follow before giving "
+            "up and descending from the head (default 0). A k_min mismatch "
+            "means the named node SPLIT, so k is probably in the sibling one "
+            "hop away: a recovery saves a ~4-trip descent, a failure costs a "
+            "trip and still pays it. Measured once at 0/2/4 and it lost -- but "
+            "budget 1 was never measured, and that commit also fixed a preload "
+            "bug, so the provenance is not clean. See GetStats::hops_taken.") |
         lyra::opt(run_ml_workload, "ml").optional()["--ml"] |
         lyra::opt(think_time, "think").optional()["--think"];
 
@@ -707,6 +716,7 @@ int main(int argc, char** argv) {
                   << (layout.batched_walk ? "on" : "off") << "\n"
                   << "  offset-hint: " << (layout.offset_hint ? "on" : "off")
                   << "  async: " << layout.async_parallelism
+                  << "  hint-hops: " << layout.hint_hops
                   << "  maxrange: " << layout.max_range
                   << "  latency: " << (layout.measure_latency ? "on" : "off")
                   << std::endl;

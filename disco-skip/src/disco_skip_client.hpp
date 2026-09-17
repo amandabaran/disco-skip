@@ -317,6 +317,45 @@ public:
             fmt::print("              {} node reads, {} vector reads, "
                        "{} right hops (RECORDS, not trips)\n",
                        gstats.nodes_read, gstats.vec_reads, gstats.right_hops);
+            // STALENESS PER OPERATION, which is the rate the hop experiment is
+            // actually about. kmin_mismatch above counts DETECTIONS and is
+            // inflated by every failed hop, so the two differ exactly when
+            // --hint-hops is on -- and comparing arms on the detection count
+            // is what made the previous run's staleness look 5x worse instead
+            // of constant.
+            if (gstats.hint_stale_ops != 0 || gstats.hops_taken != 0) {
+                fmt::print("              stale hints: {} operations "
+                           "({} detections)\n",
+                           gstats.hint_stale_ops, gstats.kmin_mismatch);
+            }
+            if (gstats.hops_taken != 0) {
+                fmt::print("              sideways hops: {} taken, {} "
+                           "recovered ({:.1%}), {} budgets exhausted\n",
+                           gstats.hops_taken, gstats.hops_recovered,
+                           static_cast<double>(gstats.hops_recovered) /
+                               static_cast<double>(
+                                   std::max<uint64_t>(1, gstats.hops_taken)),
+                           gstats.hops_exhausted);
+                // THE BET, ARITHMETIC AND ALL. A recovery saves the descent a
+                // traversal would have cost; every hop costs one trip whether
+                // it works or not. Printed rather than reasoned about after
+                // the fact, which is how the previous conclusion came to rest
+                // on a hop-hit rate inferred from arm-to-arm differences.
+                double const trav_rt =
+                    static_cast<double>(gstats.rt_traverse) /
+                    static_cast<double>(
+                        std::max<uint64_t>(1, gstats.traversals));
+                double const saved =
+                    static_cast<double>(gstats.hops_recovered) * trav_rt;
+                double const spent = static_cast<double>(gstats.hops_taken);
+                fmt::print("              the bet: saved ~{:.0f} trips, spent "
+                           "{:.0f} -> {}{:.2f} net per hop\n",
+                           saved, spent,
+                           saved >= spent ? "+" : "",
+                           (saved - spent) /
+                               static_cast<double>(
+                                   std::max<uint64_t>(1, gstats.hops_taken)));
+            }
         }
         if (gstats.failures != 0) {
             fmt::print("              gave up: {} no-majority, {} settle-stuck, "

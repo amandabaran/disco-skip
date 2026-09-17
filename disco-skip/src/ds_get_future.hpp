@@ -60,6 +60,7 @@ class GetOperation {
   size_t start(Key k) {
     k_ = k;
     out_ = GetResult{};
+    hops_ = 0;
 
 
     RemoteAddr const hinted = cache_.locateData(k);
@@ -128,7 +129,54 @@ class GetOperation {
 
     // C4: the address was real and the read consistent, but this is no longer
     // the right node. A detected bad hint, not a wrong answer.
+    return onStaleHint();
+  }
+
+  /// The hint named a node that does not cover k: hop sideways if the budget
+  /// allows, otherwise descend.
+  ///
+  /// ONE HANDLER, TWO DETECTION SITES. A mismatch is found either at the header
+  /// (stable node, next_k_min decides) or after the follow-up vector read
+  /// (mid-propagation, the split descriptor decides). The hop logic and the
+  /// per-operation counting were on the HEADER path only, so a get whose
+  /// staleness was detected at the VECTOR neither hopped nor counted as stale
+  /// -- silently exempting exactly the contended, mid-split nodes the
+  /// experiment is about.
+  size_t onStaleHint() {
     ++stats_.kmin_mismatch;
+    // Counted once per OPERATION, not per detection, so it is invariant to the
+    // hop budget -- see GetStats::hint_stale_ops for why the original
+    // experiment could not compare its own arms without it.
+    if (hops_ == 0) ++stats_.hint_stale_ops;
+
+    // ── OPTIONAL: FOLLOW `next` INSTEAD OF DESCENDING (--hint-hops) ────────
+    //
+    // A mismatch means this node split, so k is probably in the sibling one
+    // hop away. The successor comes from the vector when we hold it, because
+    // the vector's split descriptor is authoritative mid-propagation and the
+    // header's next_id is not -- the same rule the traversal's right-walk
+    // follows, and getting it backwards here would hop to a node the split has
+    // already superseded.
+    if (hops_ < ops_.hintHops()) {
+      RemoteAddr const next = have_vec_ ? nextNode(node_, vec_)
+                                        : RemoteAddr{node_.next_id};
+      if (!next.isNull()) {
+        ++hops_;
+        ++stats_.hops_taken;
+        hinted_ = next;
+        have_vec_ = false;
+        step_ = GetStep::AwaitHintHeader;
+        ++stats_.rt_hint;
+        return ops_.postHeaders(next, ops_.guess(next));
+      }
+      // No successor to hop to: this is the tail, so descending is the only
+      // option and the budget is irrelevant. Not counted as exhausted -- that
+      // bucket is for budgets actually spent.
+    } else if (ops_.hintHops() != 0) {
+      // Spent the whole budget and still has to descend: paid the hops AND the
+      // traversal, which is the case that makes the bet lose.
+      ++stats_.hops_exhausted;
+    }
     // DO NOT "JUST HOP SIDEWAYS" HERE. It was built and measured, and it loses.
     //
     // The idea: a k_min mismatch means the named node SPLIT, so the key is in a
@@ -160,12 +208,20 @@ class GetOperation {
     ++stats_.vec_reads;
     have_vec_ = true;
     if (covers(node_, vec_, k_)) return answerFromHint();
-    ++stats_.kmin_mismatch;
-    return beginTraversal();   // see the note in onHintHeader
+    return onStaleHint();
   }
 
   size_t answerFromHint() {
     ++stats_.cache_hits;
+    // A RECOVERY IS COUNTED HERE, not at the range check, because there are
+    // TWO ways to reach an answer on the hint path: the header alone when the
+    // node is stable, or a follow-up vector read when it is not. The counter
+    // started at the header check and so missed every recovery that needed the
+    // vector -- which the one-split test caught at once, reporting
+    // `1 hop, 0 recovered, 0 traversals`: a hop that plainly worked, since no
+    // descent was paid, scored as a failure. That is the same inference error
+    // the original hop experiment made, reproduced in its instrumentation.
+    if (hops_ != 0) ++stats_.hops_recovered;
     int const idx = findLte(vec_, k_);
     out_.resolved = true;
     if (idx >= 0 && vec_.keyAt(idx) == k_) {
@@ -239,6 +295,9 @@ class GetOperation {
 
   Key k_ = 0;
   GetStep step_ = GetStep::Idle;
+  /// Sideways hops spent on THIS operation. Also the flag for "we got here by
+  /// hopping", which is what makes hops_recovered and hint_stale_ops correct.
+  uint32_t hops_ = 0;
   RemoteAddr hinted_{};
   NodeRecord node_{};
   VecRecord vec_{};

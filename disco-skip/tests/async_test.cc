@@ -276,10 +276,15 @@ struct StaleHintCache {
 /// detect C4 -> beginTraversal) and had no coverage. A stale hint must cost
 /// round trips and nothing else -- never a wrong answer, never a hang.
 ///
-/// This test outlived the optimisation it was written for: a sideways-hop
-/// recovery on mismatch, which measured 10-15% SLOWER than descending and was
-/// removed (see the note in ds_get_future.hpp::onHintHeader). The correctness
-/// property is worth keeping regardless of how staleness is resolved.
+/// This test outlived the optimisation it was written for -- a sideways-hop
+/// recovery on mismatch -- and that optimisation is now BACK behind
+/// --hint-hops, default 0, because its one measurement is not conclusive: the
+/// arms were 0/2/4 so budget ONE was never tried, and the commit recording
+/// them also fixed a preload bug. See GetStats::hops_taken.
+///
+/// The correctness property holds however staleness is resolved, which is why
+/// checkStaleHintUnderEveryHopBudget below runs this same oracle at every
+/// budget rather than trusting that the hop path cannot return a wrong answer.
 static void checkStaleHintStillResolvesOnTheAsyncPath() {
   FakeReplicaSet set(3, kLayers);
   ds::QuorumStats qs;
@@ -312,6 +317,197 @@ static void checkStaleHintStillResolvesOnTheAsyncPath() {
   std::printf("  async stale hint: %llu keys, %llu C4 detections, 0 wrong\n",
               (unsigned long long)oracle.size(),
               (unsigned long long)st.kmin_mismatch);
+}
+
+
+/// The same oracle at every hop budget: a sideways hop must never change the
+/// ANSWER, only what it costs.
+///
+/// THE COVERAGE THAT DID NOT EXIST. The hop mechanism was built, measured on
+/// the cluster, and discarded without a single off-cluster test -- so
+/// re-running the experiment meant reconstructing the mechanism from a commit
+/// message. A hop follows `next` from a node the split has already superseded
+/// unless it takes the successor from the VECTOR when it holds one, and
+/// getting that backwards returns a node that does not cover k, which the C4
+/// check would catch as another mismatch rather than as a wrong answer. So the
+/// bug would show up as "slower", not "wrong", and only on the cluster.
+///
+/// Every hint here points at kInitialDataId, so EVERY get is stale and the hop
+/// path is taken on every one of them -- which is the point: at budget 0 the
+/// traversal answers, at budget 1 or 2 the hop is tried first, and all three
+/// must agree with the oracle exactly.
+static void checkStaleHintUnderEveryHopBudget() {
+  FakeReplicaSet set(3, kLayers);
+  ds::QuorumStats qs;
+  ds::QuorumOps<FakeReplicaSet> sops(set, qs, nullptr);
+  ds::PutStats ps;
+  ds::WriteStats ws;
+  ds::NullCache pcache;
+  ds::Putter<ds::QuorumOps<FakeReplicaSet>, ds::NullCache> p(sops, pcache,
+                                                             kLayers, ps, ws);
+  std::mt19937_64 rng(20260917);
+  std::map<ds::Key, ds::Value> oracle;
+  for (int i = 0; i < 400; ++i) {
+    ds::Key const k = 1 + (rng() % 2000);
+    ds::Value const v = 1 + (rng() % 100000);
+    if (p.put(k, v, ds::drawHeight(rng, kLayers)).resolved) oracle[k] = v;
+  }
+
+  uint64_t stale_at_budget_0 = 0;
+  for (uint32_t budget : {0u, 1u, 2u, 4u}) {
+    StaleHintCache stale;
+    ds::GetStats st;
+    FakeAsyncOps aops(set, qs, nullptr);
+    aops.setHintHops(budget);
+    size_t unresolved = 0, wrong = 0;
+    for (auto const &kv : oracle) {
+      ds::GetResult const r = runAsyncGet(aops, stale, kv.first, st);
+      if (!r.resolved) { ++unresolved; continue; }
+      if (!r.found || r.value != kv.second) ++wrong;
+    }
+    CHECK(unresolved == 0, "every key resolves at this hop budget");
+    CHECK(wrong == 0, "and the hop path never changes the answer");
+    // hint_stale_ops is ONE PER OPERATION, so it must be the same at every
+    // budget -- that is the property the original experiment lacked and
+    // without which its arms were not comparable. kmin_mismatch, the
+    // DETECTION count, is free to grow with the budget and does.
+    //
+    // NOT compared against oracle.size(): three of these 366 keys are
+    // legitimately covered by kInitialDataId (the lowest ones), so they are
+    // not stale at all. Compared against the BUDGET-0 measurement, which is
+    // the invariance the property is actually about.
+    if (budget == 0) {
+      stale_at_budget_0 = st.hint_stale_ops;
+      CHECK(st.hops_taken == 0, "budget 0 takes no hops");
+      CHECK(st.kmin_mismatch == st.hint_stale_ops,
+            "and detections equal operations when nothing hops");
+    } else {
+      CHECK(st.hint_stale_ops == stale_at_budget_0,
+            "staleness per operation is invariant to the hop budget");
+      CHECK(st.kmin_mismatch > st.hint_stale_ops,
+            "while DETECTIONS inflate with the budget, as they must");
+      CHECK(st.hops_taken > 0, "a non-zero budget actually hops");
+      CHECK(st.hops_recovered <= st.hops_taken,
+            "recoveries cannot exceed hops");
+      CHECK(st.hops_taken <= stale_at_budget_0 * budget,
+            "no operation exceeds its budget");
+    }
+    // DELIBERATELY NOT asserting hops_recovered > 0 HERE. This cache points
+    // every key at kInitialDataId, so its staleness is "aimed at the head of
+    // the chain", not "one split behind" -- and hopping one or two nodes
+    // forward from the head cannot reach a key that lives far to the right.
+    // 0 recoveries is a property of the setup, not of the mechanism, and
+    // reading it as a result would be exactly the inference error the hop
+    // experiment already made once. checkAHopRecoversAOneSplitStaleHint below
+    // is where recovery is actually exercised.
+    std::printf("  hop budget %u: %llu stale ops, %llu detections, "
+                "%llu hops, %llu recovered, %llu exhausted\n",
+                budget,
+                (unsigned long long)st.hint_stale_ops,
+                (unsigned long long)st.kmin_mismatch,
+                (unsigned long long)st.hops_taken,
+                (unsigned long long)st.hops_recovered,
+                (unsigned long long)st.hops_exhausted);
+  }
+}
+
+
+/// A hint that is stale BY ONE SPLIT is recovered by a single sideways hop.
+///
+/// This is the case the whole --hint-hops idea rests on, and neither the
+/// original experiment nor the test above exercises it. The test above points
+/// every key at the head of the chain, which no small budget can recover from;
+/// the cluster run measures a mixture and reports a rate. Neither shows that
+/// the mechanism CAN recover, which is the thing to establish before spending
+/// cluster time on how often it does.
+///
+/// Built to be exactly the real situation: learn a key's data node, then write
+/// until that node splits, then get with a cache still holding the OLD address.
+/// Budget 0 must descend; budget 1 must recover by hopping.
+///
+/// THE SUBTLETY THIS GUARDS. The successor must come from the VECTOR when we
+/// hold one, because mid-propagation the header's next_id is not yet the split
+/// result -- the same rule the traversal's right-walk follows. Taking next_id
+/// unconditionally hops to a node the split has superseded, which C4 then
+/// rejects as another mismatch. That failure mode is invisible in a
+/// correctness test (the answer stays right, via the descent) and shows up
+/// only as "hopping does not help", which is precisely the conclusion the
+/// previous run reached.
+struct PinnedCache {
+  ds::RemoteAddr addr{};
+  [[nodiscard]] ds::RemoteAddr locateData(ds::Key) const { return addr; }
+  void reconcile(ds::Key, ds::RemoteAddr, ds::PathStep const *, uint32_t) {}
+  void mirrorInsert(ds::Key, uint32_t, ds::RemoteAddr,
+                    std::array<ds::RemoteAddr, ds::kMaxLayers> const &) {}
+};
+
+static void checkAHopRecoversAOneSplitStaleHint() {
+  FakeReplicaSet set(3, kLayers);
+  ds::QuorumStats qs;
+  ds::QuorumOps<FakeReplicaSet> sops(set, qs, nullptr);
+  ds::PutStats ps;
+  ds::WriteStats ws;
+  ds::NullCache pcache;
+  auto put = [&](ds::Key k, ds::Value v, uint32_t h) {
+    ds::Putter<ds::QuorumOps<FakeReplicaSet>, ds::NullCache> p(sops, pcache,
+                                                               kLayers, ps, ws);
+    return p.put(k, v, h).resolved;
+  };
+
+  // Fill one data node densely at height 0 so the next insert splits it, and
+  // keep the keys spread so the split boundary lands between them.
+  std::map<ds::Key, ds::Value> oracle;
+  for (ds::Key k = 100; k <= 100 + 64 * 8; k += 8) {
+    if (put(k, static_cast<ds::Value>(k), 0)) oracle[k] = k;
+  }
+  // The address covering a HIGH key now -- it is about to stop covering it.
+  ds::Key const probe = 100 + 64 * 8;
+  ds::PathStep path[kLayers];
+  ds::Traversal<ds::QuorumOps<FakeReplicaSet>> t(sops);
+  ds::TraversalResult const before = t.traverse(probe, kLayers, path);
+  CHECK(before.status == ds::TraversalStatus::Ok, "the probe routes");
+  ds::RemoteAddr const old_addr = before.data_addr;
+
+  // Write until the node holding `probe` splits away from it.
+  for (int i = 0; i < 400 && true; ++i) {
+    ds::Key const k = static_cast<ds::Key>(100 + i * 3);
+    if (put(k, static_cast<ds::Value>(k + 1), 0)) oracle[k] = k + 1;
+    ds::TraversalResult const now = t.traverse(probe, kLayers, path);
+    if (now.status == ds::TraversalStatus::Ok && now.data_addr != old_addr) break;
+  }
+  ds::TraversalResult const after = t.traverse(probe, kLayers, path);
+  CHECK(after.status == ds::TraversalStatus::Ok, "the probe still routes");
+  CHECK(after.data_addr != old_addr,
+        "the node holding the probe really did move -- otherwise this test "
+        "asserts nothing");
+  if (after.data_addr == old_addr) return;
+
+  PinnedCache pinned;
+  pinned.addr = old_addr;              // the stale hint, one split behind
+  for (uint32_t budget : {0u, 1u}) {
+    ds::GetStats st;
+    FakeAsyncOps aops(set, qs, nullptr);
+    aops.setHintHops(budget);
+    ds::GetResult const r = runAsyncGet(aops, pinned, probe, st);
+    CHECK(r.resolved && r.found && r.value == oracle[probe],
+          "the stale hint still returns the right value");
+    CHECK(st.hint_stale_ops == 1, "and it was detected as stale");
+    if (budget == 0) {
+      CHECK(st.hops_taken == 0, "budget 0 descends");
+      CHECK(st.traversals == 1, "so it pays a full traversal");
+    } else {
+      CHECK(st.hops_taken == 1, "budget 1 hops exactly once");
+      CHECK(st.hops_recovered == 1,
+            "and ONE HOP RECOVERS A ONE-SPLIT-STALE HINT -- the premise the "
+            "whole --hint-hops idea rests on");
+      CHECK(st.traversals == 0, "so no descent is paid at all");
+    }
+    std::printf("  one-split stale, budget %u: %llu hops, %llu recovered, "
+                "%llu traversals\n",
+                budget, (unsigned long long)st.hops_taken,
+                (unsigned long long)st.hops_recovered,
+                (unsigned long long)st.traversals);
+  }
 }
 
 static void checkAsyncGetAgreesWithTheBlockingGetter() {
@@ -745,6 +941,8 @@ int main() {
   checkSpeculationCollapsesANodeToOneRoundTrip();
   checkAgreementUnderAStaleHint();
   checkStaleHintStillResolvesOnTheAsyncPath();
+  checkStaleHintUnderEveryHopBudget();
+  checkAHopRecoversAOneSplitStaleHint();
   checkAsyncGetAgreesWithTheBlockingGetter();
   checkAsyncGetHitsTheCacheAndRepairsIt();
   checkAsyncPutBuildsTheSameStructure();
