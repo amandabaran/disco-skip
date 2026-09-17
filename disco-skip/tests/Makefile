@@ -68,15 +68,38 @@ RANGE   := obj/range
 #
 # -Wno-nested-anon-types exempts register.hpp's pre-existing anonymous struct in
 # an anonymous union (chimera's code, and GCC accepts it).
-STRICTWARN := -Werror -Wall -Wextra -Wpedantic -Wconversion -Wfloat-equal \
-              -Wpointer-arith -Wswitch-default -Wpacked -Winvalid-pch \
-              -Wmissing-field-initializers -Wunreachable-code -Wcast-align \
-              -Wcast-qual -Wdisabled-optimization -Wformat=2 -Wformat-nonliteral \
-              -Wuninitialized -Wformat-security -Wformat-y2k -Winit-self \
-              -Wmissing-declarations -Wmissing-include-dirs -Wredundant-decls \
-              -Wstrict-overflow=5 -Wundef -Wno-unused -Wctor-dtor-privacy \
-              -Wsign-promo -Woverloaded-virtual -Wold-style-cast -Wlogical-op \
-              -Wstrict-null-sentinel -Wnoexcept
+# Split into the flags both compilers accept and the GCC-only ones. The cluster
+# builds with GCC, so the second group is part of the real warning set -- but
+# clang rejects an unknown -W outright under -Werror, which would make this
+# target fail to run at all on the development Mac rather than merely check
+# less. A gate that does not run is worse than one with known gaps, and the
+# gaps are recorded below.
+STRICTWARN_COMMON := -Werror -Wall -Wextra -Wpedantic -Wconversion \
+              -Wfloat-equal -Wpointer-arith -Wswitch-default -Wpacked \
+              -Winvalid-pch -Wmissing-field-initializers -Wunreachable-code \
+              -Wcast-align -Wcast-qual -Wdisabled-optimization -Wformat=2 \
+              -Wformat-nonliteral -Wuninitialized -Wformat-security \
+              -Wformat-y2k -Winit-self -Wmissing-declarations \
+              -Wmissing-include-dirs -Wredundant-decls -Wundef -Wno-unused \
+              -Woverloaded-virtual -Wold-style-cast
+
+# GCC-only. Their absence off-cluster is the gate's known blind spot:
+#   -Wsign-promo          an unsigned enum picking the int overload; has cost a
+#                         cluster round trip once already
+#   -Wstrict-overflow=5   assumptions the optimiser may exploit
+#   -Wlogical-op          suspicious && / || operands
+#   -Wnoexcept            a noexcept that the body does not honour
+#   -Wctor-dtor-privacy, -Wstrict-null-sentinel
+STRICTWARN_GCC := -Wctor-dtor-privacy -Wsign-promo -Wlogical-op \
+              -Wstrict-null-sentinel -Wnoexcept -Wstrict-overflow=5
+
+# `$(CXX) --version` naming GCC is the test, since CXX may be a wrapper.
+CXX_IS_GCC := $(shell $(CXX) --version 2>/dev/null | grep -qiE '\<(gcc|g\+\+|Free Software Foundation)\>' && echo yes)
+ifeq ($(CXX_IS_GCC),yes)
+STRICTWARN := $(STRICTWARN_COMMON) $(STRICTWARN_GCC)
+else
+STRICTWARN := $(STRICTWARN_COMMON)
+endif
 
 # Exactly what src/CMakeLists.txt demotes, so the gate matches the build.
 STRICTNOERR := -Wno-error=switch-default -Wno-error=conversion \
@@ -89,8 +112,8 @@ STRICTFLAGS := -std=c++17 -O2 -g -DNDEBUG $(STRICTWARN) $(STRICTNOERR) \
 # is compiled against the stub in dory_stub/ instead. Compile-only: the stub
 # moves no data, so nothing asserts behaviour through it.
 #
-# LIMIT: -Wsign-promo is GCC-only and there is no GCC here, so the class of bug
-# it catches (an unsigned enum picking the int overload) stays cluster-only.
+# LIMIT: the GCC-only warnings listed at STRICTWARN_GCC are not applied when the
+# local compiler is clang, so those classes stay cluster-only.
 STUBFLAGS := -I dory_stub
 
 .PHONY: all check strict rdma debug clean

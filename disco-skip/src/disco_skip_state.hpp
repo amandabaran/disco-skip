@@ -225,7 +225,12 @@ public:
     BasicFuture(BasicFuture const&) = delete;
     BasicFuture& operator=(BasicFuture const&) = delete;
     BasicFuture(BasicFuture&&) noexcept = default;
-    BasicFuture& operator=(BasicFuture&&) noexcept = default;
+    // Deleted, not defaulted. `state` is a reference, so move assignment is
+    // implicitly deleted anyway -- declaring it `= default` claimed a
+    // capability that does not exist, which clang flags and gcc does not.
+    // Futures are emplaced in place into a reserved vector and never
+    // move-assigned, so nothing depends on it.
+    BasicFuture& operator=(BasicFuture&&) = delete;
 
     uint64_t futureId() const { return future_id; }
 

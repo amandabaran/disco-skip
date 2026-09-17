@@ -1,14 +1,16 @@
 #pragma once
-// Compile-only stub of the fmt surface DsState uses. See dory_stub/README.md.
+// Compile-only stub of the slice of fmt this project uses. See ../README.md.
 //
-// LIMITATION, stated because it is easy to over-trust: this accepts any format
-// string with any arguments, so it does NOT check that placeholders match the
-// arguments supplied. Real fmt 7.1.3 parses the format string at runtime, so a
-// mismatch there is a runtime throw rather than a compile error anyway -- but do
-// not read a clean stub compile as "the fmt calls are right". It exists so that
-// everything AROUND them type-checks.
+// fmt is a conan dependency and is not present off-cluster, but src/ds.hpp now
+// reaches it transitively (ds_futures.hpp -> disco_skip_state.hpp ->
+// latency.hpp). Without this the umbrella cannot be type-checked locally at
+// all, which is the one thing that gate exists for.
+//
+// Deliberately does no formatting: the signatures are what matter, since the
+// point is to catch a call that does not compile, not to produce output. Only
+// fmt::print and fmt::format are used (33 and 4 call sites respectively).
+#include <cstdio>
 #include <string>
-#include <utility>
 
 namespace fmt {
 
@@ -16,8 +18,11 @@ template <typename... Args>
 inline void print(char const *, Args &&...) {}
 
 template <typename... Args>
-inline std::string format(char const *, Args &&...) {
-  return std::string{};
+inline void print(std::FILE *, char const *, Args &&...) {}
+
+template <typename... Args>
+inline std::string format(char const *fmt_str, Args &&...) {
+  return std::string(fmt_str);
 }
 
 }  // namespace fmt

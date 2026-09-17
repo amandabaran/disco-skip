@@ -433,9 +433,11 @@ Recorded so they are not re-proposed.
 | `--selftest` body | `src/ds_selftest.hpp` | done; templated so it runs off-cluster too |
 | Chained work-request batches | `src/ds_batch.hpp` | done, tested |
 | CAS-ABD quorum (L1-L5) | `src/ds_quorum.hpp` | done, tested against a fake replica set; not yet run on 3 servers |
-| Future-based (pipelined) path | — | not started; blocking helpers are sequential, so the offset hint's doorbell batching is not yet realised |
+| Resumable/async operation path | `src/ds_async.hpp`, `src/ds_futures.hpp`, `src/ds_*_future.hpp` | done, tested |
 | 3-way replication | `src/ds_quorum.hpp` | done; passes on 3 servers with `WRITE PASS`, readback 9/9 and I1-I4 holding |
-| Deletes, reclamation, range queries | — | deferred (A7, A9, A10) |
+| Snapshot range queries (A10) | `src/ds_range.hpp`, `src/ds_range_future.hpp` | done, tested, with an always-on snapshot-violation check |
+| Timestamp modes and epsilon measurement | `src/ds_ts.hpp`, `docs/clock-measurements.md` | done |
+| Deletes, reclamation | — | deferred (A7, A9) |
 
 ### How the write path is split across the two headers
 

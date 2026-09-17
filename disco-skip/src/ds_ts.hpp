@@ -161,7 +161,17 @@
 #include <cstdint>
 #include <ctime>
 #include <string>
+
+// rdtscp is x86-only. The cluster is x86, so the TSC mode is real there; this
+// guard exists so the off-cluster gate still compiles on the development Mac
+// (arm64), where <x86intrin.h> does not exist at all. Without it the entire
+// local test suite fails to build, which defeats the point of having one.
+#if defined(__x86_64__) || defined(__i386__)
 #include <x86intrin.h>
+#define DS_HAVE_RDTSCP 1
+#else
+#define DS_HAVE_RDTSCP 0
+#endif
 
 #include "ds_defs.hpp"
 #include "ds_node.hpp"
@@ -198,8 +208,21 @@ enum class TsMode : uint8_t {
 /// of the operation it is timing. Never returns kNullTs -- 0 is the pending
 /// marker, and a timestamp of 0 would read as "not yet stamped".
 [[nodiscard]] inline uint64_t tscNow() noexcept {
+#if DS_HAVE_RDTSCP
   unsigned aux = 0;
   uint64_t const t = __rdtscp(&aux);
+#else
+  // No rdtscp off x86. This mode is a cluster-only baseline -- its whole
+  // purpose is to be the cheapest possible local read on the evaluation
+  // hardware -- so the fallback only has to be a monotonic counter that never
+  // returns kNullTs, enough for the off-cluster tests to exercise the
+  // surrounding logic. It is deliberately NOT presented as a TSC: a run that
+  // reports tsc timings must come from the cluster.
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  uint64_t const t = static_cast<uint64_t>(ts.tv_sec) * 1000000000ull +
+                     static_cast<uint64_t>(ts.tv_nsec);
+#endif
   return t == kNullTs ? 1 : t;
 }
 

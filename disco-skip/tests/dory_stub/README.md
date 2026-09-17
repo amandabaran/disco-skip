@@ -10,6 +10,13 @@ It is deliberately **not** a fake fabric: nothing here moves data, and no test
 should assert on behaviour through it. Its only job is to turn "wrong on the
 cluster" into "wrong locally".
 
+`fmt/` is stubbed for the same reason. `src/ds.hpp` reaches it transitively
+(`ds_futures.hpp` -> `disco_skip_state.hpp` -> `latency.hpp`), and fmt is a conan
+dependency not present off-cluster, so without a stub the umbrella cannot be type-checked
+locally at all -- which is the one thing that check exists for. Only `fmt::print` and
+`fmt::format` are used; the stubs deliberately do no formatting, since the signatures are
+what catch a call that does not compile and output is not the point.
+
 ## Be honest about what this does and does not catch
 
 It was added after three cluster builds failed on compile errors. It would have
