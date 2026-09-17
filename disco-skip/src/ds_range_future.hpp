@@ -233,7 +233,10 @@ class RangeOperation {
       // nothing -- the same case a write refuses to stamp with. Walking at
       // kNullTs would find no version within it and report a RESOLVED, EMPTY
       // interval, which is a wrong answer that looks like a legitimate one.
-      if (!r.submitted || r.ts == kNullTs) return done(false);
+      if (!r.submitted || r.ts == kNullTs) {
+        ++stats_.fail_snapshot;
+        return done(false);
+      }
       res_.snapshot = snapshotFromClaim(r.ts);
       // The write-back, BEFORE the walk rather than before the return: a
       // later writer's read quorum can exclude the replica that decided this
@@ -260,7 +263,10 @@ class RangeOperation {
 
   size_t onSnapshotWriteBack() {
     BatchResult const r = ops_.resolveBatch(snap_batch_);
-    if (!r.submitted) return done(false);
+    if (!r.submitted) {
+      ++stats_.fail_snapshot;
+      return done(false);
+    }
     return beginTraversal();
   }
 
@@ -399,6 +405,7 @@ class RangeOperation {
     if (!r.ok()) {
       // Miss means nothing routes to lo: the structure holds nothing at or
       // below it, so the range is empty rather than failed.
+      if (r.status != TraversalStatus::Miss) ++stats_.fail_traverse;
       return done(r.status == TraversalStatus::Miss);
     }
     cur_ = r.data_addr;
@@ -449,7 +456,10 @@ class RangeOperation {
   }
 
   size_t onIdxVec() {
-    if (!ops_.resolveVec(idx_vec_)) return done(false);
+    if (!ops_.resolveVec(idx_vec_)) {
+      ++stats_.fail_read;
+      return done(false);
+    }
     ++stats_.vec_reads;
     return useIndex();
   }
@@ -712,6 +722,7 @@ class RangeOperation {
       // one node can simply be retried by the caller -- it holds no locks and
       // has published nothing.
       if (++settle_tries_ > static_cast<uint32_t>(detail::kMaxSettleAttempts)) {
+        ++stats_.fail_no_majority;
         return done(false);
       }
       return postHeader();
@@ -744,7 +755,10 @@ class RangeOperation {
   }
 
   size_t onVec() {
-    if (!ops_.resolveVec(vec_)) return done(false);
+    if (!ops_.resolveVec(vec_)) {
+      ++stats_.fail_read;
+      return done(false);
+    }
     ++stats_.vec_reads;
     have_vec_ = true;
     return useVersion();
@@ -757,6 +771,7 @@ class RangeOperation {
     bool const unstable = !node_.isStable();
     if (pending || unstable) {
       if (++settle_tries_ > static_cast<uint32_t>(detail::kMaxSettleAttempts)) {
+        ++stats_.fail_settle;
         return done(false);
       }
       // A pending version cannot be compared with T at all, and skipping it
@@ -875,14 +890,20 @@ class RangeOperation {
       ++stats_.nodes_skipped;
       return stepRight();
     }
-    if (++hops_ > detail::kMaxVersionHops) return done(false);
+    if (++hops_ > detail::kMaxVersionHops) {
+      ++stats_.fail_hops;
+      return done(false);
+    }
     step_ = RangeStep::AwaitOldVer;
     ++stats_.versions_walked;
     return ops_.postVec(static_cast<VecOffset>(vec_.old_ver));
   }
 
   size_t onOldVer() {
-    if (!ops_.resolveVec(vec_)) return done(false);
+    if (!ops_.resolveVec(vec_)) {
+      ++stats_.fail_read;
+      return done(false);
+    }
     ++stats_.vec_reads;
     return walkToSnapshot();
   }

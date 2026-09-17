@@ -299,6 +299,37 @@ public:
             fmt::print("              snapshot violations: {}{}\n",
                        rstats.snapshot_violations,
                        rstats.snapshot_violations == 0 ? " (none)" : "  *** ");
+            // WHY A RANGE GAVE UP, not merely that one did. The walk has eight
+            // done(false) exits and `failures` alone cannot tell them apart:
+            // a hot scan run failed 4 of 1,119,888 ranges with 0 violations
+            // and no refused FAA round, and there was no way to name the cause
+            // without guessing. Printed only when something failed, so a clean
+            // run does not gain a line of zeros.
+            if (rstats.failures != 0) {
+                uint64_t const attributed =
+                    rstats.fail_no_majority + rstats.fail_settle +
+                    rstats.fail_hops + rstats.fail_read +
+                    rstats.fail_traverse + rstats.fail_snapshot +
+                    rstats.snapshot_violations;
+                fmt::print("              why: {} no majority, {} would not "
+                           "settle, {} version hops, {} read, {} traverse, "
+                           "{} snapshot, {} violation\n",
+                           rstats.fail_no_majority, rstats.fail_settle,
+                           rstats.fail_hops, rstats.fail_read,
+                           rstats.fail_traverse, rstats.fail_snapshot,
+                           rstats.snapshot_violations);
+                // The buckets must account for every failure. An exit added
+                // later without a counter would otherwise be invisible -- the
+                // total would still be right and the breakdown would silently
+                // under-report, which is the failure mode this whole block
+                // exists to remove.
+                if (attributed != rstats.failures) {
+                    fmt::print("              *** {} of {} failures "
+                               "UNATTRIBUTED -- a done(false) exit is missing "
+                               "its counter\n",
+                               rstats.failures - attributed, rstats.failures);
+                }
+            }
             if (rstats.cache_backbones != 0 || rstats.cache_misses != 0) {
                 // What the cache actually bought, in the terms that settle it:
                 // addresses per backbone is the batch width, and a miss is a

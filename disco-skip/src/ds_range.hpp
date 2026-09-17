@@ -114,6 +114,38 @@ struct RangeStats {
   uint64_t capped = 0;
   uint64_t failures = 0;
 
+  // ── WHY A FAILURE COUNT WITHOUT A REASON IS NOT ENOUGH ───────────────────
+  //
+  // `failures` alone says a range gave up and nothing else, and the walk has
+  // eight distinct done(false) exits. Measured: the hot scan workload at 16
+  // clients failed 4 of 1,119,888 ranges, snapshot_violations was 0, and no
+  // FAA round was refused -- so the cause was one of the bounded-retry exits
+  // and there was no way to say which without guessing. Same principle the
+  // violation check is here for: finding none is a result, not looking is a
+  // gap. These sum to `failures` by construction.
+  //
+  /// resolveHeaders never found a majority-supported handle for one node
+  /// within kMaxSettleAttempts. A LIVENESS limit under contention, not a
+  /// correctness fault: the range holds no locks and has published nothing,
+  /// so the caller may simply retry.
+  uint64_t fail_no_majority = 0;
+  /// A node stayed pending or mid-split for kMaxSettleAttempts. Same shape:
+  /// the helping protocol could not settle it fast enough against the writers
+  /// hitting it.
+  uint64_t fail_settle = 0;
+  /// The old_ver chain ran past kMaxVersionHops. Either it is cyclic or a
+  /// writer is producing versions faster than the walk consumes them.
+  uint64_t fail_hops = 0;
+  /// A vector or index read did not resolve to a quorum.
+  uint64_t fail_read = 0;
+  /// The traversal could not route to `lo`, and not because nothing is there
+  /// (a Miss is a legitimate empty answer, not a failure).
+  uint64_t fail_traverse = 0;
+  /// TsMode::RangeTs only: the claiming FAA fell short of a majority, so the
+  /// cut would carry no ordering. Distinct from the FAA rounds the backend
+  /// refuses, because this is the RANGE giving up rather than a write.
+  uint64_t fail_snapshot = 0;
+
   /// A10's violation check, always on.
   ///
   /// cache-remote-interface.md A10 asks that "the range-query path should be
@@ -283,6 +315,7 @@ class Ranger {
     if (snapshot == kNullTs) {
       RangeResult res;
       ++stats_.failures;
+      ++stats_.fail_snapshot;
       return res;
     }
     return rangeAt(lo, hi, layers, cap, snapshot, out);
@@ -317,6 +350,7 @@ class Ranger {
       // Miss means nothing routes to lo, i.e. the structure is empty below it.
       if (tr.status != TraversalStatus::Miss) {
         ++stats_.failures;
+        ++stats_.fail_traverse;
         return res;
       }
       res.resolved = true;
@@ -329,6 +363,13 @@ class Ranger {
       VecRecord vec;
       if (!readSettled(cur, node, vec)) {
         ++stats_.failures;
+        // readSettled returns false for BOTH "never saw a majority-supported
+        // handle" and "would not settle within the budget", and does not say
+        // which. Attributed to fail_settle rather than split on a guess; the
+        // resumable path, which has the two exits separately, is the one to
+        // read for the breakdown. Noted so the two paths' counters are not
+        // taken as more comparable than they are.
+        ++stats_.fail_settle;
         return res;
       }
       ++stats_.nodes_walked;
