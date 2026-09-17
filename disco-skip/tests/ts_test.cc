@@ -209,7 +209,8 @@ static void hammerOneKey(Rig &r, ds::Key k, int times) {
 }
 
 static void checkEveryModeProducesADecreasingChain() {
-  for (ds::TsMode m : {ds::TsMode::Clock, ds::TsMode::Tsc, ds::TsMode::Faa}) {
+  for (ds::TsMode m : {ds::TsMode::Clock, ds::TsMode::Tsc, ds::TsMode::Faa,
+                       ds::TsMode::RangeTs}) {
     Rig r;
     r.ops.setTsMode(m);
     hammerOneKey(r, 42, 30);
@@ -553,6 +554,365 @@ static void checkTsNoneCostsFewerSubmissionsThanFaa() {
         "TsMode::None issues strictly fewer submissions per write than Faa");
 }
 
+
+// ── TsMode::RangeTs ─────────────────────────────────────────────────────────
+
+static void checkRangeTsWritesReadTheCounterAndNeverAdvanceIt() {
+  // THE MODE'S ENTIRE CLAIM, stated as the only thing that can verify it: the
+  // counter. In Faa mode every write fetch-and-adds, so 30 writes advance it
+  // at least 30. Here a write only READS, so 30 writes must leave it exactly
+  // where they found it -- and a RANGE must be what moves it.
+  //
+  // Asserted on the counter rather than on a stat, because a stat can be
+  // right while the wire is wrong: BatchKind::ReadTsCounter differs from
+  // FaaTs only in the verb posted, and a missed substitution would show up
+  // here and nowhere else.
+  Rig r;
+  r.ops.setTsMode(ds::TsMode::RangeTs);
+  CHECK(r.ops.tsCounter() == 0, "the counter starts at zero");
+
+  hammerOneKey(r, 11, 30);
+  for (int i = 0; i < 16; ++i) {
+    CHECK(r.put(static_cast<ds::Key>(300 + i * 5),
+                static_cast<ds::Value>(i + 1), i % 3).resolved,
+          "mixed-height put resolves");
+  }
+  CHECK(r.ops.tsCounter() == 0,
+        "46 writes advanced the counter by ZERO in RangeTs mode");
+  CHECK(r.verify("after RangeTs writes"), "the arena verifies");
+
+  // Every stamp must be in band 1 -- the band for a writer that read 0 --
+  // which is what "nothing advanced it" looks like from the vectors' side.
+  uint64_t stamped = 0;
+  for (uint64_t off = 0; off < r.ops.vecCount(); ++off) {
+    uint64_t const ts = r.ops.vecAt(static_cast<ds::VecOffset>(off)).ts;
+    if (ts == ds::kNullTs || ts == ds::kBootstrapTs) continue;
+    ++stamped;
+    CHECK((ts >> ds::kFaaClientBits) == 1,
+          "a RangeTs stamp sits in the band of the value it read");
+  }
+  CHECK(stamped >= 30, "the rewrites really did leave stamps to check");
+
+  // And now a range, which is the only thing that may advance it.
+  ds::RangeStats rs;
+  std::vector<ds::Entry> got;
+  ds::Ranger<FakeOps> rr(r.ops, rs);
+  ds::RangeResult const res = rr.range(0, 4000, kLayers, 1u << 20, got);
+  CHECK(res.resolved, "the range resolved");
+  CHECK(r.ops.tsCounter() == 1, "the RANGE advanced the counter, by exactly 1");
+  CHECK(res.snapshot == ds::snapshotFromCounterFaa(0),
+        "and its cut is the band of the pre-value its FAA returned");
+  // Every write above completed before this range started, so every one of
+  // them is inside its cut. Band 1 <= band 1.
+  CHECK(res.snapshot >= ds::tsFromCounterRead(0, ds::kFaaClientMask),
+        "a write that read 0 is inside the cut of a range that FAA'd 0");
+}
+
+static void checkRangeTsSeparatesSuccessiveCuts() {
+  // WHY A RANGE MUST FAA RATHER THAN READ, which is the one place RangeTs is
+  // not just Faa with the verbs swapped. Nothing else advances the counter, so
+  // two ranges that merely read would take the SAME cut -- and then a write
+  // landing between them would be stamped inside that shared cut, so the
+  // second range would return a value the first had already excluded AT THE
+  // SAME T. Two ranges at one snapshot disagreeing is not a staleness
+  // quibble; it breaks the snapshot semantics outright.
+  //
+  // Driven with real values. Counter 0.
+  //   range A FAAs 0 -> 1, cut = band 1
+  //   write   reads 1, stamps band 2
+  //   range B FAAs 1 -> 2, cut = band 2
+  // So A must NOT see the write and B must, and a re-read at A's own cut must
+  // still not see it however long afterwards it runs.
+  Rig r;
+  r.ops.setTsMode(ds::TsMode::RangeTs);
+  ds::Key const k = 500;
+  CHECK(r.put(k, 1111, 0).resolved, "the pre-existing value is written");
+
+  ds::RangeStats rs;
+  std::vector<ds::Entry> a;
+  ds::Ranger<FakeOps> rr(r.ops, rs);
+  ds::RangeResult const ra = rr.range(k, k, kLayers, 1u << 20, a);
+  CHECK(ra.resolved && a.size() == 1 && a[0].val == 1111,
+        "range A sees the pre-existing value");
+  CHECK(ra.snapshot == ds::snapshotFromCounterFaa(0), "A's cut is band 1");
+
+  CHECK(r.put(k, 2222, 0).resolved, "the write after A's cut lands");
+  {
+    ds::VecRecord cur{};
+    ds::NodeRecord n{};
+    (void)n;
+    uint64_t newest = 0;
+    for (uint64_t off = 0; off < r.ops.vecCount(); ++off) {
+      cur = r.ops.vecAt(static_cast<ds::VecOffset>(off));
+      int const i = ds::findLte(cur, k);
+      if (i >= 0 && cur.keyAt(i) == k && cur.valAt(static_cast<uint32_t>(i)) == 2222) {
+        newest = cur.ts;
+      }
+    }
+    CHECK((newest >> ds::kFaaClientBits) == 2,
+          "a write after a range's FAA lands in a STRICTLY HIGHER band");
+    CHECK(newest > ra.snapshot, "so it is outside the cut A already returned");
+  }
+
+  // A's cut re-read, now that the write has landed and been stamped. Same
+  // answer, which is what "the cut A returned is stable" means.
+  std::vector<ds::Entry> again;
+  ds::RangeResult const rag =
+      rr.rangeAt(k, k, kLayers, 1u << 20, ra.snapshot, again);
+  CHECK(rag.resolved && again.size() == 1 && again[0].val == 1111,
+        "A's cut STILL excludes the later write");
+
+  std::vector<ds::Entry> b;
+  ds::RangeResult const rb = rr.range(k, k, kLayers, 1u << 20, b);
+  CHECK(rb.resolved && b.size() == 1 && b[0].val == 2222,
+        "range B, which FAA'd after the write, sees it");
+  CHECK(rb.snapshot > ra.snapshot, "and B's cut is strictly above A's");
+}
+
+static void checkRangeTsToleratesTiedStampsWithinABand() {
+  // THE PRICE OF NOT FLOORING, and the reason ds_verify.hpp checks bands in
+  // this mode rather than strict order. Nothing advances the counter between
+  // two writes, so both read the same value and their stamps differ ONLY in
+  // the 16-bit client field -- which carries no order. Pick the indices so the
+  // NEWER version gets the SMALLER stamp and the chain genuinely inverts:
+  //
+  //   client 9 writes -> ts = (1 << 16) | 9 = 65545
+  //   client 2 writes -> ts = (1 << 16) | 2 = 65538     <- newer, smaller
+  //
+  // This must not be papered over with stampOver's floor. A floored stamp
+  // could cross a band boundary, and then a range that FAA'd the earlier value
+  // would EXCLUDE a write that completed before it started -- a wrong answer,
+  // where a tie is merely an order we never claimed.
+  Rig r;
+  r.ops.setTsMode(ds::TsMode::RangeTs);
+  ds::Key const k = 620;
+  r.ops.setClientIdx(9);
+  CHECK(r.put(k, 111, 0).resolved, "client 9's write lands");
+  r.ops.setClientIdx(2);
+  CHECK(r.put(k, 222, 0).resolved, "client 2's write lands");
+
+  // Find the two versions and confirm the inversion is real rather than
+  // hypothetical -- otherwise this test passes while testing nothing.
+  uint64_t ts_111 = 0, ts_222 = 0;
+  for (uint64_t off = 0; off < r.ops.vecCount(); ++off) {
+    ds::VecRecord const v = r.ops.vecAt(static_cast<ds::VecOffset>(off));
+    int const i = ds::findLte(v, k);
+    if (i < 0 || v.keyAt(i) != k) continue;
+    ds::Value const val = v.valAt(static_cast<uint32_t>(i));
+    if (val == 111) ts_111 = v.ts;
+    if (val == 222) ts_222 = v.ts;
+  }
+  std::printf("  tied band: older ts %llu, newer ts %llu\n",
+              static_cast<unsigned long long>(ts_111),
+              static_cast<unsigned long long>(ts_222));
+  CHECK(ts_111 != 0 && ts_222 != 0, "both versions are stamped");
+  CHECK((ts_111 >> ds::kFaaClientBits) == (ts_222 >> ds::kFaaClientBits),
+        "the two writes share a band, because no range ran between them");
+  CHECK(ts_222 < ts_111,
+        "and the NEWER version really has the SMALLER stamp");
+
+  // The verifier must accept it -- there is no total order here to assert.
+  CHECK(r.verify("with a tied band"), "banded chains verify in RangeTs mode");
+
+  // And the walk must still answer with the NEWER version. "ts <= T" reduces
+  // to "band(ts) <= band(T)" because every cut is band-aligned, so the
+  // predicate is monotone along the chain and the first hit is the right one
+  // -- the within-band inversion is invisible to it.
+  ds::RangeStats rs;
+  std::vector<ds::Entry> got;
+  ds::Ranger<FakeOps> rr(r.ops, rs);
+  ds::RangeResult const res = rr.range(k, k, kLayers, 1u << 20, got);
+  CHECK(res.resolved && got.size() == 1 && got[0].val == 222,
+        "a range over a tied band returns the NEWER version");
+
+  ds::PutStats gps;
+  ds::WriteStats gws;
+  (void)gps; (void)gws;
+}
+
+static void checkRangeTsCostsTheSameTwoSubmissionsAsFaa() {
+  // THE CLAIM IN ds_ts.hpp, PRICED. RangeTs does NOT remove Faa's second
+  // submission: the counter may not be read until the version is visible, so
+  // the value arrives with the publish's completion and the stamping CAS needs
+  // another round. What it removes is one ATOMIC of three per write per
+  // server. Stating that here stops the mode being sold as something it is
+  // not -- and TsMode::None, which DOES fold the write into one submission,
+  // is the row that shows what the round trip is worth.
+  uint64_t counts[3];
+  ds::TsMode const modes[3] = {ds::TsMode::Faa, ds::TsMode::RangeTs,
+                               ds::TsMode::None};
+  for (int i = 0; i < 3; ++i) {
+    Rig r;
+    r.ops.setTsMode(modes[i]);
+    uint64_t const before = r.ops.batches();
+    for (int j = 0; j < 30; ++j) {
+      CHECK(r.put(static_cast<ds::Key>(700 + (j % 8)),
+                  static_cast<ds::Value>(j + 1), 0).resolved, "put resolves");
+    }
+    counts[i] = r.ops.batches() - before;
+  }
+  std::printf("  submissions for 30 writes: faa=%llu rangets=%llu none=%llu\n",
+              static_cast<unsigned long long>(counts[0]),
+              static_cast<unsigned long long>(counts[1]),
+              static_cast<unsigned long long>(counts[2]));
+  CHECK(counts[1] == counts[0],
+        "RangeTs costs the SAME submissions per write as Faa, not fewer");
+  CHECK(counts[2] < counts[1],
+        "and TsMode::None is what actually removes the second submission");
+}
+
+
+/// The majority counterexample, MOVED TO THE RANGE PATH -- both directions.
+///
+/// ds_ts.hpp derives that a replicated counter orders two operations only if
+/// the later one observes the replica that decided the earlier one's maximum,
+/// which quorum intersection does NOT provide: the intersecting replica's own
+/// value can still be below that maximum. In Faa mode the claim is on the
+/// write, so the write owes the write-back. In RangeTs BOTH sides claim -- a
+/// range by fetch-and-add, a write by read -- so BOTH owe one, and each guards
+/// a different half of snapshot correctness.
+///
+/// Worked with real values. Three replicas, counter C on all, then replica 1
+/// alone advanced by 10 (C+10). Replica 1 is the one the survivor quorum
+/// {0, 2} will never see, which is the whole construction: diverging 0 and 1
+/// together would not discriminate, because {0,2} reads 0 and would find the
+/// maximum there anyway.
+///
+///   HALF A -- a write that FINISHED must be INSIDE a later range's cut.
+///     W reads all three: (C, C+10, C), max C+10, stamps band C+11.
+///     W's write-back raises 0 and 2 to C+10.
+///     Replica 1 goes down. Range R FAAs {0,2}: (C+10, C+10), max C+10,
+///     cut = band C+11. W is band C+11 <= C+11, so R SEES IT.
+///   without W's write-back, 0 and 2 still sit at C, so R's max is C and its
+///   cut is band C+1 -- and W, which completed before R began, is OUTSIDE it.
+///   A range losing a completed write is a wrong answer, not staleness.
+///
+///   HALF B -- a write that BEGAN must be OUTSIDE a finished range's cut.
+///     Range R FAAs all three: (C', C'+10, C'), max C'+10, cut band C'+11.
+///     R's write-back raises 0 and 2 to C'+11.
+///     Replica 1 goes down. Write W reads {0,2}: (C'+11, C'+11), max C'+11,
+///     stamps band C'+12 > the cut. R correctly never had it.
+///   without R's write-back, 0 and 2 sit at C'+1, so W reads C'+1 and stamps
+///   band C'+2 -- INSIDE a cut R has already returned without it. A second
+///   range at R's own T would then include it, and two ranges disagreeing at
+///   one snapshot breaks snapshot semantics outright.
+static void checkTheMajorityCounterexampleIsRepairedOnBothSides() {
+  FakeReplicaSet set(3, kLayers, 16384);
+  set.setTsMode(ds::TsMode::RangeTs);
+  ds::QuorumStats qs;
+  ds::PutStats ps;
+  ds::WriteStats ws;
+  ds::NullPutCache cache;
+  using Ops = ds::QuorumOps<FakeReplicaSet>;
+
+  auto put = [&](ds::Key k, ds::Value v) {
+    Ops ops(set, qs, nullptr);
+    ds::Putter<Ops, ds::NullPutCache> p(ops, cache, kLayers, ps, ws);
+    return p.put(k, v, 0).resolved;
+  };
+  // The ts now on the node covering k, over the replicas that are up.
+  auto tsOf = [&](ds::Key k) -> uint64_t {
+    Ops ops(set, qs, nullptr);
+    ds::PathStep path[kLayers];
+    ds::Traversal<Ops> t(ops);
+    ds::RemoteAddr const addr = t.traverse(k, kLayers, path).data_addr;
+    uint64_t best = ds::kNullTs;
+    for (size_t r = 0; r < 3; ++r) {
+      if (set.isDown(r)) continue;
+      ds::NodeRecord node{};
+      if (!set.readNodeFrom(r, addr, node)) continue;
+      ds::VecRecord vec{};
+      if (!set.readVecFrom(r, node.handle.offset(), vec)) continue;
+      if (vec.ts != ds::kNullTs && (best == ds::kNullTs || vec.ts > best)) {
+        best = vec.ts;
+      }
+    }
+    return best;
+  };
+  auto rangeOver = [&](ds::Key lo, ds::Key hi, std::vector<ds::Entry> &out) {
+    Ops ops(set, qs, nullptr);
+    ds::RangeStats rs;
+    ds::Ranger<Ops> rr(ops, rs);
+    return rr.range(lo, hi, kLayers, 1u << 20, out);
+  };
+
+  std::mt19937_64 rng(0x5EED5);
+  for (int i = 0; i < 300; ++i) {
+    (void)put(static_cast<ds::Key>(rng() % 2000),
+              static_cast<ds::Value>(i + 1));
+  }
+  ds::Key const k_a = 100;
+  CHECK(put(k_a, 1), "seed k_a on every replica");
+
+  // ── HALF A: the write's write-back keeps it inside a later cut ───────────
+  set.advanceCounterForTest(1, 10);
+  uint64_t wb = set.tsWriteBacks();
+  CHECK(put(k_a, 900), "W resolves with every replica up");
+  CHECK(set.tsWriteBacks() > wb,
+        "the write's diverged READ round posted a counter write-back");
+  uint64_t const ts_w = tsOf(k_a);
+
+  set.setDown(1, true);
+  std::vector<ds::Entry> got;
+  ds::RangeResult const res = rangeOver(k_a, k_a, got);
+  set.setDown(1, false);
+  CHECK(res.resolved, "the range on {0,2} resolved");
+  bool found = false;
+  for (auto const &e : got) {
+    if (e.key == k_a) { found = true; CHECK(e.val == 900, "and with W's value"); }
+  }
+  std::printf("  half A: ts_W=%llu cut=%llu  counters (%llu, %llu, %llu)\n",
+              static_cast<unsigned long long>(ts_w),
+              static_cast<unsigned long long>(res.snapshot),
+              static_cast<unsigned long long>(set.counterOf(0)),
+              static_cast<unsigned long long>(set.counterOf(1)),
+              static_cast<unsigned long long>(set.counterOf(2)));
+  CHECK(ts_w != ds::kNullTs, "W was stamped");
+  CHECK(ts_w <= res.snapshot,
+        "a write that FINISHED is inside the cut of a range that began after");
+  CHECK(found, "so the range returns it");
+
+  // ── HALF B: the range's write-back keeps a later write outside its cut ───
+  ds::Key const k_b = 1900;
+  CHECK(put(k_b, 2), "seed k_b on every replica");
+  set.advanceCounterForTest(1, 10);
+  wb = set.tsWriteBacks();
+  std::vector<ds::Entry> got_b;
+  ds::RangeResult const res_b = rangeOver(k_b, k_b, got_b);
+  CHECK(res_b.resolved, "the range with every replica up resolved");
+  CHECK(set.tsWriteBacks() > wb,
+        "the range's diverged FAA round posted a counter write-back");
+
+  set.setDown(1, true);
+  CHECK(put(k_b, 902), "W' resolves on {0,2} after the range finished");
+  uint64_t const ts_w2 = tsOf(k_b);
+  set.setDown(1, false);
+  std::printf("  half B: cut=%llu ts_W'=%llu  counters (%llu, %llu, %llu)\n",
+              static_cast<unsigned long long>(res_b.snapshot),
+              static_cast<unsigned long long>(ts_w2),
+              static_cast<unsigned long long>(set.counterOf(0)),
+              static_cast<unsigned long long>(set.counterOf(1)),
+              static_cast<unsigned long long>(set.counterOf(2)));
+  CHECK(ts_w2 != ds::kNullTs, "W' was stamped");
+  CHECK(ts_w2 > res_b.snapshot,
+        "a write that BEGAN after a range finished is outside its cut");
+
+  // And the cut really is stable: re-reading at R's own T must still not see
+  // W', which is the property "two ranges at one snapshot agree" reduces to.
+  {
+    Ops ops(set, qs, nullptr);
+    ds::RangeStats rs;
+    ds::Ranger<Ops> rr(ops, rs);
+    std::vector<ds::Entry> again;
+    ds::RangeResult const r2 =
+        rr.rangeAt(k_b, k_b, kLayers, 1u << 20, res_b.snapshot, again);
+    CHECK(r2.resolved, "R's cut re-reads");
+    for (auto const &e : again) {
+      if (e.key == k_b) CHECK(e.val == 2, "R's cut still excludes W'");
+    }
+  }
+}
+
 int main() {
   checkModeNamesRoundTrip();
   checkNoSourceEverReturnsTheNullMarker();
@@ -566,6 +926,11 @@ int main() {
   checkTheMajorityFaaCounterexampleIsRepaired();
   checkTsNoneSkipsStampingWithoutStrandingReaders();
   checkTsNoneCostsFewerSubmissionsThanFaa();
+  checkRangeTsWritesReadTheCounterAndNeverAdvanceIt();
+  checkRangeTsSeparatesSuccessiveCuts();
+  checkRangeTsToleratesTiedStampsWithinABand();
+  checkRangeTsCostsTheSameTwoSubmissionsAsFaa();
+  checkTheMajorityCounterexampleIsRepairedOnBothSides();
 
   if (g_failures == 0) {
     std::printf("ts: all checks pass\n");

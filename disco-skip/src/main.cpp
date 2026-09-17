@@ -477,13 +477,18 @@ int main(int argc, char** argv) {
                 "GET/PUT stats sections are absent from the log rather than "
                 "zero, so the omission is visible.") |
         lyra::opt(ts_mode_name, "ts_mode").optional()["--ts"](
-            "Timestamp source: clock|tsc|faa (default clock). clock is a "
-            "disciplined CLOCK_REALTIME and is the only mode correct at more "
-            "than one client that also keeps the fault tolerance replication "
-            "provides. tsc is raw rdtscp -- cheapest, single-client only. faa "
-            "is an RDMA fetch-and-add on a global counter: no timing "
-            "assumption, at one extra round trip per write and one point of "
-            "failure. See ds_ts.hpp.") |
+            "Timestamp source: clock|tsc|faa|none|rangets (default clock). "
+            "clock is a disciplined CLOCK_REALTIME and is the only mode "
+            "correct at more than one client that also keeps the fault "
+            "tolerance replication provides. tsc is raw rdtscp -- cheapest, "
+            "single-client only. faa fetch-and-adds a REPLICATED counter on "
+            "every write and reads it on every range: no timing assumption, "
+            "at one extra round trip per write. rangets inverts that -- a "
+            "RANGE fetch-and-adds the counter and a write only READS it -- so "
+            "the atomic sits on the rare path; same two submissions per write "
+            "as faa, one fewer atomic per write per server. none stamps "
+            "nothing at all and REFUSES any workload containing a scan, which "
+            "is legal for YCSB A-D. See ds_ts.hpp.") |
         lyra::opt(run_ml_workload, "ml").optional()["--ml"] |
         lyra::opt(think_time, "think").optional()["--think"];
 
@@ -531,7 +536,7 @@ int main(int argc, char** argv) {
     }
 
     if (!ds::parseTsMode(ts_mode_name, layout.ts_mode)) {
-        std::cerr << "--ts must be clock, tsc, faa or none; got '"
+        std::cerr << "--ts must be clock, tsc, faa, none or rangets; got '"
                   << ts_mode_name << "'" << std::endl;
         return 1;
     }
@@ -544,6 +549,32 @@ int main(int argc, char** argv) {
                      "(14.31 ppm measured between these nodes, i.e. 143 us of "
                      "skew over a 10 s run), so the old_ver chains this run "
                      "writes may be non-monotonic and ds_verify will say so."
+                  << std::endl;
+    }
+    if (layout.ts_mode == ds::TsMode::RangeTs && layout.num_servers > 1) {
+        // THE WRITE-BACK MOVES TO THE RANGE PATH, which changes which
+        // operation pays for a divergent counter and which one stalls on a
+        // dead replica. Stated here because the faa note below is the run
+        // header a reader will otherwise compare against.
+        //
+        // A range claims its cut with the same round a faa-mode WRITE issues:
+        // FaaTs on every replica, maximum over those that answered, REFUSED
+        // below a majority, then faaCatchUpAddends raising the laggards before
+        // the walk starts. So ranges tolerate one failure here, where in faa
+        // mode a range's snapshot READ awaits all N and stalls.
+        //
+        // A write claims by READING the counter in the same chain, after its
+        // publishing CAS -- majority required, same as faa -- so it tolerates
+        // one failure too, and no longer advances a counter it may only have
+        // reached partially. QuorumStats::ts_partial therefore stops being a
+        // caveat on write-heavy runs and becomes one on scan-heavy runs.
+        std::cerr << "NOTE: --ts rangets puts the counter's fetch-and-add on "
+                     "the RANGE path and a plain read on the write path, both "
+                     "over a majority of "
+                  << layout.num_servers
+                  << " replicas, so writes and ranges each tolerate one "
+                     "failure. A write still costs two submissions: the "
+                     "counter may not be read until the version is visible."
                   << std::endl;
     }
     if (layout.ts_mode == ds::TsMode::Faa && layout.num_servers > 1) {

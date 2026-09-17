@@ -46,7 +46,11 @@ namespace ds {
 
 enum class RangeStep : uint8_t {
   Idle,
-  AwaitSnapshot,  ///< an RDMA read of the replicated counter (Faa mode)
+  AwaitSnapshot,  ///< claiming the cut: a counter READ in Faa mode, a
+                  ///< fetch-and-add in RangeTs (see takeSnapshot in
+                  ///< ds_range.hpp for why the verbs differ by mode)
+  AwaitSnapshotWriteBack,  ///< RangeTs only: raising the laggard replicas to
+                           ///< the cut before the walk begins
   Traversing,     ///< routing to the node covering lo
   AwaitHeader,    ///< reading the current node's header, maybe with its vector
   AwaitVec,       ///< that header did not carry its vector
@@ -92,6 +96,20 @@ class RangeOperation {
       return done(false);
     }
 
+    // RangeTs ADVANCES the counter here, which is the mode's defining move:
+    // it is the only thing that advances it at all, so two ranges that merely
+    // read would share a cut and disagree about every write between them. The
+    // claim is the same round a Faa-mode WRITE issues -- one FaaTs per replica,
+    // maximum over the answers, majority required -- so it reuses the batch
+    // path rather than postTsCounter's plain read. takeSnapshot() in
+    // ds_range.hpp carries the derivation, and the blocking Ranger is
+    // differentially tested against this, so the two must agree.
+    if (ops_.tsMode() == TsMode::RangeTs) {
+      snap_batch_ = Batch{};
+      snap_batch_.faaTs();
+      step_ = RangeStep::AwaitSnapshot;
+      return ops_.postBatch(snap_batch_);
+    }
     if (ops_.tsMode() == TsMode::Faa) {
       step_ = RangeStep::AwaitSnapshot;
       return ops_.postTsCounter();
@@ -120,6 +138,7 @@ class RangeOperation {
   size_t step() {
     switch (step_) {
       case RangeStep::AwaitSnapshot: return onSnapshot();
+      case RangeStep::AwaitSnapshotWriteBack: return onSnapshotWriteBack();
       case RangeStep::Traversing:    return onTraversal();
       case RangeStep::AwaitHeader:   return onHeader();
       case RangeStep::AwaitVec:      return onVec();
@@ -152,6 +171,8 @@ class RangeOperation {
     switch (step_) {
       case RangeStep::Idle:           st = "Idle";           break;
       case RangeStep::AwaitSnapshot:  st = "AwaitSnapshot";  break;
+      case RangeStep::AwaitSnapshotWriteBack:
+        st = "AwaitSnapshotWriteBack"; break;
       case RangeStep::Traversing:     st = "Traversing";     break;
       case RangeStep::AwaitHeader:    st = "AwaitHeader";    break;
       case RangeStep::AwaitVec:       st = "AwaitVec";       break;
@@ -205,12 +226,41 @@ class RangeOperation {
   }
 
   size_t onSnapshot() {
-    // The maximum over the replicas that answered, admitting every client
-    // index at that counter value. See ds_range.hpp for why the low bits are
-    // all ones rather than zero -- masking them down would drop writes by
-    // client id, which is a wrong answer rather than a stale one.
+    if (ops_.tsMode() == TsMode::RangeTs) {
+      BatchResult const r = ops_.resolveBatch(snap_batch_);
+      // A CUT THAT COULD NOT BE TAKEN IS NOT AN EMPTY RANGE. kNullTs from a
+      // claiming round means it fell short of a majority, so the value orders
+      // nothing -- the same case a write refuses to stamp with. Walking at
+      // kNullTs would find no version within it and report a RESOLVED, EMPTY
+      // interval, which is a wrong answer that looks like a legitimate one.
+      if (!r.submitted || r.ts == kNullTs) return done(false);
+      res_.snapshot = snapshotFromClaim(r.ts);
+      // The write-back, BEFORE the walk rather than before the return: a
+      // later writer's read quorum can exclude the replica that decided this
+      // maximum, and would then stamp below a cut already handed out. Doing it
+      // first is stronger than necessary and much easier to see is correct.
+      // Skipped entirely when the replicas agreed, which is the common case.
+      if (ops_.tsNeedsWriteBack()) {
+        snap_batch_ = Batch{};
+        snap_batch_.faaTsCatchUp();
+        step_ = RangeStep::AwaitSnapshotWriteBack;
+        return ops_.postBatch(snap_batch_);
+      }
+      return beginTraversal();
+    }
+    // Faa mode: a plain READ of the replicated counter. The maximum over the
+    // replicas that answered, admitting every client index at that counter
+    // value. See ds_range.hpp for why the low bits are all ones rather than
+    // zero -- masking them down would drop writes by client id, which is a
+    // wrong answer rather than a stale one.
     res_.snapshot = (ops_.resolveTsCounter() << kFaaClientBits) |
                     kFaaClientMask;
+    return beginTraversal();
+  }
+
+  size_t onSnapshotWriteBack() {
+    BatchResult const r = ops_.resolveBatch(snap_batch_);
+    if (!r.submitted) return done(false);
     return beginTraversal();
   }
 
@@ -731,8 +781,8 @@ class RangeOperation {
         // would need ~2.7e13 more values to catch up, which is centuries at
         // the measured 2.70 Mops/s. Point reads never noticed, because they do
         // not compare ts.
-        if (ops_.tsMode() == TsMode::Faa) {
-          b.faaTs();
+        if (tsIsRemote(ops_.tsMode())) {
+          tsClaimOn(b, ops_.tsMode());
         } else {
           b.casTs(helped_off_, kNullTs, ops_.now());
         }
@@ -781,7 +831,7 @@ class RangeOperation {
 
   size_t onSettle() {
     BatchResult const r = ops_.resolveBatch(last_batch_);
-    if (helped_ts_ && ops_.tsMode() == TsMode::Faa && r.ts != kNullTs) {
+    if (helped_ts_ && tsIsRemote(ops_.tsMode()) && r.ts != kNullTs) {
       helped_ts_ = false;
       // The claimed counter value, raw: stampFor() is the identity in Faa mode
       // and a helper has not read the predecessor anyway. Targets the offset
@@ -975,6 +1025,11 @@ class RangeOperation {
   uint32_t hops_ = 0;
   uint32_t settle_tries_ = 0;
   Batch last_batch_{};
+  /// The snapshot claim, and then its write-back. A MEMBER, not a local: the
+  /// batch must outlive the suspension, because postBatch() records a pointer
+  /// to it and resolveBatch() locates the claim by op position in that same
+  /// object. A stack local would be a dangling read at the next step().
+  Batch snap_batch_{};
   VecOffset helped_off_ = kNullVec;  ///< the pending version a help batch targeted
   bool helped_ts_ = false;           ///< that batch carried a Faa claim to write back
   PathStep path_[kMaxLayers]{};

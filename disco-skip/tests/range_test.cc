@@ -315,121 +315,131 @@ static void checkCacheWalkAgreesWithTheSerialWalk() {
 }
 
 static void checkAsyncRangeAgreesWithTheBlockingOne() {
-  // The differential test, and the reason the state machine is written at all
-  // rather than trusted. Two implementations of one algorithm over the same
-  // arena must return byte-identical results; a divergence between a blocking
-  // path and its async twin is what produced the unbounded-retry bug in
-  // ds_put_future.hpp, so the two are pinned together rather than separately
-  // asserted correct.
-  FakeReplicaSet set(3, kLayers, 16384);
-  set.setTsMode(ds::TsMode::Faa);
-  ds::QuorumStats qs;
-  ds::PutStats ps;
-  ds::WriteStats ws;
-  ds::NullPutCache cache;
+  // BOTH COUNTER MODES. RangeTs replaces the async path's snapshot READ with
+  // a claiming FAA plus a write-back round, and the blocking path's with the
+  // same thing in takeSnapshot() -- two new implementations of one rule, which
+  // is exactly what a differential test is for. The arena is quiescent while
+  // the ranges run, so the two paths taking DIFFERENT cuts (each FAA advances
+  // the counter) cannot change the answer: there is no write between them for
+  // a cut to fall on either side of.
+  for (ds::TsMode ts_mode : {ds::TsMode::Faa, ds::TsMode::RangeTs}) {
+    // The differential test, and the reason the state machine is written at all
+    // rather than trusted. Two implementations of one algorithm over the same
+    // arena must return byte-identical results; a divergence between a blocking
+    // path and its async twin is what produced the unbounded-retry bug in
+    // ds_put_future.hpp, so the two are pinned together rather than separately
+    // asserted correct.
+    FakeReplicaSet set(3, kLayers, 16384);
+    set.setTsMode(ts_mode);
+    ds::QuorumStats qs;
+    ds::PutStats ps;
+    ds::WriteStats ws;
+    ds::NullPutCache cache;
 
-  std::mt19937_64 rng(0xD1FF);
-  {
-    ds::QuorumOps<FakeReplicaSet> ops(set, qs, nullptr);
-    for (int i = 0; i < 300; ++i) {
-      ds::Key const k = static_cast<ds::Key>(rng() % 4000);
-      uint32_t const h = ds::drawHeight(rng, kLayers);
-      ds::Putter<ds::QuorumOps<FakeReplicaSet>, ds::NullPutCache> p(
-          ops, cache, kLayers, ps, ws);
-      p.put(k, static_cast<ds::Value>(i + 1), h);
-    }
-  }
-
-  size_t compared = 0, entries = 0;
-  uint64_t batch_hits = 0, batch_backs = 0, orphans = 0;
-  for (int trial = 0; trial < 30; ++trial) {
-    ds::Key lo = static_cast<ds::Key>(rng() % 4000);
-    ds::Key hi = static_cast<ds::Key>(rng() % 4000);
-    if (hi < lo) std::swap(lo, hi);
-
-    // One snapshot, both paths, so any difference is the walk and not the
-    // clock. Blocking first; the arena is quiescent, so order cannot matter.
-    ds::QuorumOps<FakeReplicaSet> bops(set, qs, nullptr);
-    uint64_t const T = ds::takeSnapshot(bops);
-
-    ds::RangeStats brs;
-    std::vector<ds::Entry> bgot;
-    ds::Ranger<ds::QuorumOps<FakeReplicaSet>> blocking(bops, brs);
-    ds::RangeResult const bres =
-        blocking.rangeAt(lo, hi, kLayers, 1u << 20, T, bgot);
-
-    FakeAsyncOps aops(set, qs, nullptr);
-    ds::RangeStats ars;
-    std::vector<ds::Entry> agot;
-    ds::RangeResult const ares =
-        runAsyncRange(aops, lo, hi, 1u << 20, ars, agot);
-
-    // The batched walk is the same state machine with --batched-walk on: it
-    // takes its backbone from a level-0 index node and fetches up to K data
-    // nodes at once. It is an OPTIMISATION, so it is not asserted correct on
-    // its own terms -- it is pinned to the serial path, which is pinned to the
-    // blocking one. Three implementations, one answer, or the build fails.
-    FakeAsyncOps bwops(set, qs, nullptr);
-    ds::RangeStats brs2;
-    std::vector<ds::Entry> bwgot;
-    ds::RangeResult const bwres =
-        runAsyncRange(bwops, lo, hi, 1u << 20, brs2, bwgot, /*batched=*/true);
-
-    CHECK(bres.resolved && ares.resolved && bwres.resolved, "all paths resolve");
-    CHECK(bgot.size() == agot.size(), "both return the same number of entries");
-    bool same = bgot.size() == agot.size();
-    for (size_t i = 0; same && i < bgot.size(); ++i) {
-      if (bgot[i].key != agot[i].key || bgot[i].val != agot[i].val) same = false;
-    }
-    CHECK(same, "and the same keys and values in the same order");
-    if (!same) {
-      std::printf("  [%llu,%llu] blocking %zu vs async %zu\n",
-                  static_cast<unsigned long long>(lo),
-                  static_cast<unsigned long long>(hi), bgot.size(), agot.size());
-      break;
-    }
-
-    bool bsame = bwgot.size() == agot.size();
-    for (size_t i = 0; bsame && i < agot.size(); ++i) {
-      if (bwgot[i].key != agot[i].key || bwgot[i].val != agot[i].val) {
-        bsame = false;
+    std::mt19937_64 rng(0xD1FF);
+    {
+      ds::QuorumOps<FakeReplicaSet> ops(set, qs, nullptr);
+      for (int i = 0; i < 300; ++i) {
+        ds::Key const k = static_cast<ds::Key>(rng() % 4000);
+        uint32_t const h = ds::drawHeight(rng, kLayers);
+        ds::Putter<ds::QuorumOps<FakeReplicaSet>, ds::NullPutCache> p(
+            ops, cache, kLayers, ps, ws);
+        p.put(k, static_cast<ds::Value>(i + 1), h);
       }
     }
-    CHECK(bsame, "and the batched walk returns exactly what the serial one did");
-    if (!bsame) {
-      std::printf("  [%llu,%llu] serial %zu vs batched %zu\n",
-                  static_cast<unsigned long long>(lo),
-                  static_cast<unsigned long long>(hi), agot.size(),
-                  bwgot.size());
-      std::printf("    serial : nodes_walked=%llu vec_reads=%llu\n",
-                  (unsigned long long)ars.nodes_walked,
-                  (unsigned long long)ars.vec_reads);
-      std::printf("    batched: nodes_walked=%llu batches=%llu fallbacks=%llu"
-                  " misses=%llu orphans=%llu resolved=%d\n",
-                  (unsigned long long)brs2.nodes_walked,
-                  (unsigned long long)brs2.batches,
-                  (unsigned long long)brs2.batch_fallbacks,
-                  (unsigned long long)brs2.batch_misses,
-                  (unsigned long long)brs2.orphans_walked,
-                  (int)bwres.resolved);
-      break;
+
+    size_t compared = 0, entries = 0;
+    uint64_t batch_hits = 0, batch_backs = 0, orphans = 0;
+    for (int trial = 0; trial < 30; ++trial) {
+      ds::Key lo = static_cast<ds::Key>(rng() % 4000);
+      ds::Key hi = static_cast<ds::Key>(rng() % 4000);
+      if (hi < lo) std::swap(lo, hi);
+
+      // One snapshot, both paths, so any difference is the walk and not the
+      // clock. Blocking first; the arena is quiescent, so order cannot matter.
+      ds::QuorumOps<FakeReplicaSet> bops(set, qs, nullptr);
+      uint64_t const T = ds::takeSnapshot(bops);
+
+      ds::RangeStats brs;
+      std::vector<ds::Entry> bgot;
+      ds::Ranger<ds::QuorumOps<FakeReplicaSet>> blocking(bops, brs);
+      ds::RangeResult const bres =
+          blocking.rangeAt(lo, hi, kLayers, 1u << 20, T, bgot);
+
+      FakeAsyncOps aops(set, qs, nullptr);
+      ds::RangeStats ars;
+      std::vector<ds::Entry> agot;
+      ds::RangeResult const ares =
+          runAsyncRange(aops, lo, hi, 1u << 20, ars, agot);
+
+      // The batched walk is the same state machine with --batched-walk on: it
+      // takes its backbone from a level-0 index node and fetches up to K data
+      // nodes at once. It is an OPTIMISATION, so it is not asserted correct on
+      // its own terms -- it is pinned to the serial path, which is pinned to the
+      // blocking one. Three implementations, one answer, or the build fails.
+      FakeAsyncOps bwops(set, qs, nullptr);
+      ds::RangeStats brs2;
+      std::vector<ds::Entry> bwgot;
+      ds::RangeResult const bwres =
+          runAsyncRange(bwops, lo, hi, 1u << 20, brs2, bwgot, /*batched=*/true);
+
+      CHECK(bres.resolved && ares.resolved && bwres.resolved, "all paths resolve");
+      CHECK(bgot.size() == agot.size(), "both return the same number of entries");
+      bool same = bgot.size() == agot.size();
+      for (size_t i = 0; same && i < bgot.size(); ++i) {
+        if (bgot[i].key != agot[i].key || bgot[i].val != agot[i].val) same = false;
+      }
+      CHECK(same, "and the same keys and values in the same order");
+      if (!same) {
+        std::printf("  [%llu,%llu] blocking %zu vs async %zu\n",
+                    static_cast<unsigned long long>(lo),
+                    static_cast<unsigned long long>(hi), bgot.size(), agot.size());
+        break;
+      }
+
+      bool bsame = bwgot.size() == agot.size();
+      for (size_t i = 0; bsame && i < agot.size(); ++i) {
+        if (bwgot[i].key != agot[i].key || bwgot[i].val != agot[i].val) {
+          bsame = false;
+        }
+      }
+      CHECK(bsame, "and the batched walk returns exactly what the serial one did");
+      if (!bsame) {
+        std::printf("  [%llu,%llu] serial %zu vs batched %zu\n",
+                    static_cast<unsigned long long>(lo),
+                    static_cast<unsigned long long>(hi), agot.size(),
+                    bwgot.size());
+        std::printf("    serial : nodes_walked=%llu vec_reads=%llu\n",
+                    (unsigned long long)ars.nodes_walked,
+                    (unsigned long long)ars.vec_reads);
+        std::printf("    batched: nodes_walked=%llu batches=%llu fallbacks=%llu"
+                    " misses=%llu orphans=%llu resolved=%d\n",
+                    (unsigned long long)brs2.nodes_walked,
+                    (unsigned long long)brs2.batches,
+                    (unsigned long long)brs2.batch_fallbacks,
+                    (unsigned long long)brs2.batch_misses,
+                    (unsigned long long)brs2.orphans_walked,
+                    (int)bwres.resolved);
+        break;
+      }
+      batch_hits += brs2.batches;
+      batch_backs += brs2.batch_fallbacks;
+      orphans += brs2.orphans_walked;
+      ++compared;
+      entries += agot.size();
     }
-    batch_hits += brs2.batches;
-    batch_backs += brs2.batch_fallbacks;
-    orphans += brs2.orphans_walked;
-    ++compared;
-    entries += agot.size();
+    std::printf("  differential (%s): %zu ranges agree, %zu entries\n",
+                ts_mode == ds::TsMode::Faa ? "faa" : "rangets", compared,
+                entries);
+    std::printf("  batched walk: %llu batches, %llu fallbacks, %llu orphans\n",
+                static_cast<unsigned long long>(batch_hits),
+                static_cast<unsigned long long>(batch_backs),
+                static_cast<unsigned long long>(orphans));
+    // A differential test that never took the path it is meant to cover passes
+    // for the wrong reason. If the index walk never fired, the two paths agree
+    // only because they were the same path.
+    CHECK(batch_hits > 0, "and the batched path actually ran");
   }
-  std::printf("  differential: %zu ranges agree, %zu entries\n", compared,
-              entries);
-  std::printf("  batched walk: %llu batches, %llu fallbacks, %llu orphans\n",
-              static_cast<unsigned long long>(batch_hits),
-              static_cast<unsigned long long>(batch_backs),
-              static_cast<unsigned long long>(orphans));
-  // A differential test that never took the path it is meant to cover passes
-  // for the wrong reason. If the index walk never fired, the two paths agree
-  // only because they were the same path.
-  CHECK(batch_hits > 0, "and the batched path actually ran");
 }
 
 static void checkAStaleCacheStillGivesTheRightAnswer() {
@@ -753,6 +763,41 @@ static ds::VecOffset publishWithoutStamping(FakeReplicaSet &set,
   return off;
 }
 
+/// The band a counter-sourced stamp sits in. Both counter modes pack
+/// (counter_value + 1) above a 16-bit client index, so the band is the part
+/// that carries the order and the low bits are a tiebreak that does not.
+static uint64_t bandOf(uint64_t ts) { return ts >> ds::kFaaClientBits; }
+
+/// Assert that /ts/ is a COUNTER-SOURCED stamp rather than a clock reading,
+/// without assuming a total order that TsMode::RangeTs does not provide.
+///
+/// The bug this exists for wrote clockNow() into a counter-valued field. In the
+/// fake, now() is `clock_ += 10`, so a clock reading lands in the low thousands
+/// -- band 0 -- while any real stamp is in band 1 or above. So "the band is at
+/// least the predecessor's, and within the counter's reach" catches it in both
+/// modes, where "strictly greater than the predecessor" would be a FALSE
+/// assertion in RangeTs: with the counter unmoved, a helper legitimately lands
+/// in the same band as the version it supersedes and may even sort below it on
+/// the client tiebreak.
+static void checkCounterSourcedStamp(uint64_t ts, uint64_t predecessor_ts,
+                                     uint64_t counter, ds::TsMode mode,
+                                     char const *what) {
+  CHECK(bandOf(ts) >= 1, "a counter-sourced stamp is never in band 0, which is"
+                         " where a clock reading would land");
+  CHECK(bandOf(ts) >= bandOf(predecessor_ts),
+        "a helper's stamp is in at least the band of the version it supersedes");
+  CHECK(ts <= ds::tsFromFaa(counter, ds::kFaaClientMask),
+        "and within the counter's reach");
+  if (mode == ds::TsMode::Faa) {
+    // Faa advances the counter per claim, so there the order really is total
+    // and the stronger assertion holds. Kept, so relaxing it for RangeTs does
+    // not silently weaken the Faa coverage this test was written for.
+    CHECK(ts > predecessor_ts,
+          "in Faa mode a helper's stamp STRICTLY outranks its predecessor");
+  }
+  (void)what;
+}
+
 static void checkFaaHelpersClaimACounterValueNotAClockReading() {
   // THE HELPING PROPERTY, which is what makes reads and ranges lock-free: a
   // reader that finds a published-but-unstamped version fixes the timestamp
@@ -780,12 +825,17 @@ static void checkFaaHelpersClaimACounterValueNotAClockReading() {
   // `clock_ += 10`, so a clock reading lands around 1e3 while real stamps sit
   // around 1.4e7 -- a clock-stamped helper INVERTS the chain, which is the
   // corruption, and is what this catches.
+  // BOTH COUNTER MODES, because RangeTs routes these same three sites through
+  // tsClaimOn() and a missed site would reintroduce exactly this bug with the
+  // verb swapped. The mode changes which value the helper claims, not whether
+  // it must claim one from the counter at all.
+  for (ds::TsMode mode : {ds::TsMode::Faa, ds::TsMode::RangeTs}) {
   for (int site = 0; site < 2; ++site) {
     bool const walk_right = (site == 1);
     char const *what = walk_right ? "range's own site (walked right)"
                                   : "traversal site (node under lo)";
     FakeReplicaSet set(3, kLayers, 16384);
-    set.setTsMode(ds::TsMode::Faa);
+    set.setTsMode(mode);
     ds::QuorumStats qs;
     ds::PutStats ps;
     ds::WriteStats ws;
@@ -856,20 +906,17 @@ static void checkFaaHelpersClaimACounterValueNotAClockReading() {
     ds::VecRecord after{};
     CHECK(set.readVecFrom(0, pending, after), "the helped version reads back");
     CHECK(!after.isPending(), "the helper fixed the timestamp");
-    std::printf("  %s:\n"
+    std::printf("  %s, %s:\n"
                 "    ts %llu -> %llu   predecessor %llu   counter %llu\n",
-                what,
+                mode == ds::TsMode::Faa ? "faa" : "rangets", what,
                 static_cast<unsigned long long>(before.ts),
                 static_cast<unsigned long long>(after.ts),
                 static_cast<unsigned long long>(predecessor_ts),
                 static_cast<unsigned long long>(set.readTsCounter()));
 
     // The corruption, stated as the invariant it breaks.
-    CHECK(after.ts > predecessor_ts,
-          "a helper's stamp outranks the version it supersedes");
-    // And it must be a value the counter could have produced.
-    CHECK(after.ts <= ds::tsFromFaa(set.readTsCounter(), ds::kFaaClientMask),
-          "a Faa helper's stamp is within the counter's reach");
+    checkCounterSourcedStamp(after.ts, predecessor_ts, set.readTsCounter(),
+                             mode, what);
 
     // The write was in limbo and its writer never came back. Helping must take
     // it out of limbo: a LATER snapshot sees it. The range that did the helping
@@ -895,6 +942,7 @@ static void checkFaaHelpersClaimACounterValueNotAClockReading() {
       CHECK(found, "the helped key is visible to a later range");
     }
   }
+  }
 }
 
 
@@ -919,8 +967,9 @@ static ds::PutResult runAsyncPutHere(Ops &ops, Cache &cache, ds::Key k,
 /// writer left pending. Covered separately because breaking it was caught by
 /// nothing: the range test above never drives a put.
 static void checkAFaaPutHelpsWithACounterValue() {
+  for (ds::TsMode mode : {ds::TsMode::Faa, ds::TsMode::RangeTs}) {
   FakeReplicaSet set(3, kLayers, 16384);
-  set.setTsMode(ds::TsMode::Faa);
+  set.setTsMode(mode);
   ds::QuorumStats qs;
   ds::PutStats ps;
   ds::WriteStats ws;
@@ -945,7 +994,7 @@ static void checkAFaaPutHelpsWithACounterValue() {
   ds::Key const target = 1500;
   ds::VecOffset const pending = publishWithoutStamping(set, qs, target, 555555);
   CHECK(pending != ds::kNullVec, "the pending version was published");
-  if (pending == ds::kNullVec) return;
+  if (pending == ds::kNullVec) continue;
 
   ds::VecRecord before{};
   CHECK(set.readVecFrom(0, pending, before) && before.isPending(),
@@ -980,14 +1029,14 @@ static void checkAFaaPutHelpsWithACounterValue() {
   ds::VecRecord after{};
   CHECK(set.readVecFrom(0, pending, after), "the helped version reads back");
   CHECK(!after.isPending(), "the helper fixed the timestamp");
-  std::printf("  async put help: ts %llu -> %llu   predecessor %llu\n",
+  std::printf("  async put help (%s): ts %llu -> %llu   predecessor %llu\n",
+              mode == ds::TsMode::Faa ? "faa" : "rangets",
               static_cast<unsigned long long>(before.ts),
               static_cast<unsigned long long>(after.ts),
               static_cast<unsigned long long>(predecessor_ts));
-  CHECK(after.ts > predecessor_ts,
-        "a put helper's stamp outranks the version it supersedes");
-  CHECK(after.ts <= ds::tsFromFaa(set.readTsCounter(), ds::kFaaClientMask),
-        "and is within the counter's reach");
+  checkCounterSourcedStamp(after.ts, predecessor_ts, set.readTsCounter(), mode,
+                           "async put help");
+  }
 }
 
 int main() {

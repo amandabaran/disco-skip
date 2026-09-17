@@ -187,6 +187,25 @@ size_t postBatchChain(Conn &rc, Layout const &layout, Batch const &b,
   size_t vec_slot = 0, node_slot = 0;
   size_t const last = b.size() - 1;
 
+  // DIAGNOSTIC SUBSTITUTION -- see Layout::cas_as_write. Turns a CAS into a
+  // plain 8-byte WRITE of the desired value, from the CAS scratch slot (which
+  // is already MR-registered, so no new staging is needed). Message count,
+  // byte count, round trips and ordering are all unchanged; only the verb
+  // differs. It is incorrect by construction: a blind write cannot detect that
+  // another writer published first.
+  auto cas_or_write = [&](size_t i, BatchOp const &o, uintptr_t addr,
+                          bool signaled) {
+    if (!layout.cas_as_write) {
+      rc.prepareSingleCas(wr[i], sg[i], wr_id, &cas_bufs[i], addr,
+                          o.expected, o.desired, signaled);
+      return;
+    }
+    cas_bufs[i] = o.desired;
+    rc.prepareSingle(wr[i], sg[i],
+                     dory::conn::ReliableConnection::RdmaWrite,
+                     wr_id, &cas_bufs[i], sizeof(uint64_t), addr, signaled);
+  };
+
   for (size_t i = 0; i < b.size(); ++i) {
     BatchOp const &o = b[i];
     bool const signaled = (i == last);
@@ -208,31 +227,21 @@ size_t postBatchChain(Conn &rc, Layout const &layout, Batch const &b,
         break;
       }
       case BatchKind::CasHandle:
-        rc.prepareSingleCas(wr[i], sg[i], wr_id, &cas_bufs[i],
-                            Layout::nodeAddrOf(rc.remoteBuf(), o.addr),
-                            o.expected, o.desired, signaled);
+        cas_or_write(i, o, Layout::nodeAddrOf(rc.remoteBuf(), o.addr), signaled);
         // F3. Must come after prepareSingleCas, which assigns send_flags.
         wr[i].send_flags |= IBV_SEND_FENCE;
         break;
       case BatchKind::CasTs:
-        rc.prepareSingleCas(wr[i], sg[i], wr_id, &cas_bufs[i],
-                            layout.vecTsAddrOf(rc.remoteBuf(), o.off),
-                            o.expected, o.desired, signaled);
+        cas_or_write(i, o, layout.vecTsAddrOf(rc.remoteBuf(), o.off), signaled);
         break;
       case BatchKind::CasNextId:
-        rc.prepareSingleCas(wr[i], sg[i], wr_id, &cas_bufs[i],
-                            Layout::nextIdAddrOf(rc.remoteBuf(), o.addr),
-                            o.expected, o.desired, signaled);
+        cas_or_write(i, o, Layout::nextIdAddrOf(rc.remoteBuf(), o.addr), signaled);
         break;
       case BatchKind::CasNextKMin:
-        rc.prepareSingleCas(wr[i], sg[i], wr_id, &cas_bufs[i],
-                            Layout::nextKMinAddrOf(rc.remoteBuf(), o.addr),
-                            o.expected, o.desired, signaled);
+        cas_or_write(i, o, Layout::nextKMinAddrOf(rc.remoteBuf(), o.addr), signaled);
         break;
       case BatchKind::CasTailWord:
-        rc.prepareSingleCas(wr[i], sg[i], wr_id, &cas_bufs[i],
-                            Layout::tailWordAddrOf(rc.remoteBuf(), o.addr),
-                            o.expected, o.desired, signaled);
+        cas_or_write(i, o, Layout::tailWordAddrOf(rc.remoteBuf(), o.addr), signaled);
         break;
       case BatchKind::FaaTs:
         // Fetch-and-add of 1 on the global counter. dory exposes no atomic-add
@@ -246,6 +255,17 @@ size_t postBatchChain(Conn &rc, Layout const &layout, Batch const &b,
                             /*expected=*/0, /*swap=*/0, signaled);
         wr[i].opcode = IBV_WR_ATOMIC_FETCH_AND_ADD;
         wr[i].wr.atomic.compare_add = 1;
+        break;
+      case BatchKind::ReadTsCounter:
+        // A PLAIN 8-BYTE READ, not an atomic. Chained on the same QP after the
+        // publishing CAS, so RC ordering serves it at this replica only once
+        // that CAS has been applied -- which is the ordering TsMode::RangeTs
+        // rests on. The value lands in cas_bufs[i], the same slot an atomic's
+        // pre-value would, so batchPreFaa() below needs no second case.
+        rc.prepareSingle(wr[i], sg[i],
+                         dory::conn::ReliableConnection::RdmaRead,
+                         wr_id, &cas_bufs[i], sizeof(uint64_t),
+                         layout.tsCounterAddrOf(rc.remoteBuf()), signaled);
         break;
       case BatchKind::FaaTsCatchUp:
         // The counter write-back of BatchKind::FaaTsCatchUp. Same repurposed
@@ -311,14 +331,18 @@ inline void stageBatchPayloads(Batch const &b, NodeRecord *stage_nodes,
 /// (which is legitimate: the very first writer sees an unincremented counter).
 inline constexpr uint64_t kNoFaa = ~uint64_t{0};
 
-/// The RAW pre-value a batch's FaaTs returned on one replica, or kNoFaa.
+/// The RAW counter value a batch's CLAIMING ROUND returned on one replica, or
+/// kNoFaa. Either verb: FaaTs's pre-value, or ReadTsCounter's observed value.
 ///
 /// Raw, not a timestamp: with the counter replicated, a timestamp is a function
 /// of the MAXIMUM pre-value across replicas plus the writer's client index, so
 /// no single replica's reply is a timestamp on its own.
 inline uint64_t batchPreFaa(Batch const &b, uint64_t const *cas_bufs) {
   for (size_t i = 0; i < b.size(); ++i) {
-    if (b[i].kind == BatchKind::FaaTs) return cas_bufs[i];
+    if (b[i].kind == BatchKind::FaaTs ||
+        b[i].kind == BatchKind::ReadTsCounter) {
+      return cas_bufs[i];
+    }
   }
   return kNoFaa;
 }
@@ -338,9 +362,16 @@ inline uint64_t batchTs(Batch const &b, uint64_t const *cas_bufs,
 ///
 /// A CAS succeeded exactly when the value it found was the one it expected,
 /// which is what the swapback holds.
-inline bool batchCommitted(Batch const &b, uint64_t const *cas_bufs) {
+inline bool batchCommitted(Batch const &b, uint64_t const *cas_bufs,
+                           bool cas_as_write = false) {
   for (size_t i = 0; i < b.size(); ++i) {
     if (b[i].kind == BatchKind::CasHandle) {
+      // Under the cas_as_write diagnostic there is NO swapback to compare: a
+      // WRITE returns nothing, so the scratch still holds the value we put
+      // there. Reporting success unconditionally is the incorrect half of an
+      // incorrect experiment -- it is what makes every concurrent writer
+      // believe it won. See Layout::cas_as_write.
+      if (cas_as_write) return true;
       return cas_bufs[i] == b[i].expected;
     }
   }
@@ -635,9 +666,12 @@ class RdmaOps : public RdmaNodeReader<Conns> {
     ++batches_;
     vec_writes_ += b.vecWrites();
     node_writes_ += b.nodeWrites();
-    cas_ += b.size() - b.vecWrites() - b.nodeWrites();
+    // A ReadTsCounter is an 8-byte READ, so it is excluded from cas_ -- and
+    // not folded into vec_reads_ or node_reads_ either, since readBytes()
+    // multiplies those by a whole record.
+    cas_ += b.size() - b.vecWrites() - b.nodeWrites() - b.tsReads();
     out.submitted = true;
-    out.committed = batchCommitted(b, cas);
+    out.committed = batchCommitted(b, cas, layout_.cas_as_write);
     out.ts = batchTs(b, cas, client_idx_);
     return out;
   }
@@ -890,7 +924,8 @@ class RdmaReplicaSet {
                                    doorbell_, kBlockingWrId, addends[r]);
       if (to_drain[r] > 0) {
         writes_ += b.vecWrites() + b.nodeWrites();
-        cas_ += b.size() - b.vecWrites() - b.nodeWrites();
+        reads_ += b.tsReads();
+        cas_ += b.size() - b.vecWrites() - b.nodeWrites() - b.tsReads();
       }
     }
     ++batches_;
@@ -903,7 +938,8 @@ class RdmaReplicaSet {
       }
       submitted[r] = true;
       // Only now are the swapbacks meaningful.
-      committed[r] = batchCommitted(b, &cas_bufs_[r * kMaxBatchOps]);
+      committed[r] = batchCommitted(b, &cas_bufs_[r * kMaxBatchOps],
+                                    layout_.cas_as_write);
       // THE COUNTER IS REPLICATED, so the timestamp is the MAXIMUM pre-value
       // over the replicas that answered, not replica 0's. The FAAs already went
       // to every replica on this same chain, so the maximum is free; what it

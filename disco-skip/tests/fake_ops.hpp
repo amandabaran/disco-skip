@@ -216,6 +216,13 @@ class FakeOps {
           out.pre_faa = faaTs();
           out.ts = ds::tsFromFaa(out.pre_faa, client_idx_);
           break;
+        case ds::BatchKind::ReadTsCounter:
+          // OBSERVED here, in chain order, so it lands after the publishing
+          // CAS -- the ordering TsMode::RangeTs rests on. No increment: in
+          // that mode only a range advances the counter.
+          out.pre_faa = readTsCounter();
+          out.ts = ds::tsFromCounterRead(out.pre_faa, client_idx_);
+          break;
         case ds::BatchKind::FaaTsCatchUp:
           // The counter write-back. Addition, not assignment, for the reason
           // in BatchKind::FaaTsCatchUp: a concurrent increment must land on

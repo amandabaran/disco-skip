@@ -55,6 +55,29 @@ enum class BatchKind : uint8_t {
   /// chained with the CAS that writes `ts`: that CAS's value is this one's
   /// result, and is not known until the chain completes.
   FaaTs,
+  /// READ the global timestamp counter instead of incrementing it -- the
+  /// RangeTs write path's claim (ds_ts.hpp, TsMode::RangeTs).
+  ///
+  /// EVERYTHING DOWNSTREAM OF IT IS SHARED WITH FaaTs, deliberately. The
+  /// per-replica value lands in the same scratch slot, batchPreFaa() finds it
+  /// the same way, the maximum over the answering replicas is taken the same
+  /// way, the majority requirement is the same, and tsFromCounterRead() is
+  /// literally tsFromFaa(). So this is FaaTs WITH THE VERB SWAPPED and nothing
+  /// else -- which is why adding the mode did not fork the backend.
+  ///
+  /// THE WRITE-BACK ARITHMETIC COINCIDES, and that is worth writing down
+  /// because it looks like a bug. faaCatchUpAddends() computes
+  /// max_pre - pre[r]. After an FAA, replica r sits at pre[r] + 1 and the
+  /// target is max_pre + 1, so its shortfall is max_pre - pre[r]. After a
+  /// READ, replica r sits at pre[r] and the target is max_pre, so its
+  /// shortfall is ALSO max_pre - pre[r]. One expression, both rounds.
+  ///
+  /// ORDERING IS STILL THE POINT. This must be chained AFTER the publishing
+  /// CAS, exactly as FaaTs is: reading the counter before the version is
+  /// visible is the counterexample spelled out under TsMode::RangeTs, where a
+  /// range fixes T = f(C), completes without the version, and a second range
+  /// at the same T would include it.
+  ReadTsCounter,
   /// Push every replica's counter up to the maximum the PRECEDING FaaTs round
   /// observed -- ABD's write-back, applied to the counter.
   ///
@@ -169,6 +192,17 @@ class Batch {
   void faaTs() {
     if (push(BatchKind::FaaTs) != nullptr) ++faas_;
   }
+  /// Claim a timestamp by OBSERVING the counter rather than advancing it --
+  /// TsMode::RangeTs. Counted in faas_ alongside faaTs() on purpose: it is the
+  /// same claiming round to every consumer of it (hasFaa(), the one-per-batch
+  /// rule in wellFormed(), batchPreFaa(), the maximum, the majority test and
+  /// the write-back), and the only thing that differs is the verb posted.
+  void readTs() {
+    if (push(BatchKind::ReadTsCounter) != nullptr) {
+      ++faas_;
+      ++ts_reads_;
+    }
+  }
   /// Ride the counter write-back on this batch. See BatchKind::FaaTsCatchUp.
   ///
   /// Deliberately NOT counted in faas_: batchPreFaa() and the FaaTs accounting
@@ -188,7 +222,14 @@ class Batch {
   [[nodiscard]] bool hasCommit() const { return commits_ > 0; }
   [[nodiscard]] size_t vecWrites() const { return vec_writes_; }
   [[nodiscard]] size_t nodeWrites() const { return node_writes_; }
+  /// Does this batch carry a timestamp-CLAIMING round -- either verb?
+  /// Named for FaaTs because that mode came first; ReadTsCounter counts too,
+  /// and every consumer wants it to.
   [[nodiscard]] bool hasFaa() const { return faas_ > 0; }
+  /// Of which, how many were plain reads. Only the statistics care: a read is
+  /// not an atomic, and counting it as one would make the RangeTs write path
+  /// look exactly as expensive as the Faa one it exists to be cheaper than.
+  [[nodiscard]] size_t tsReads() const { return ts_reads_; }
   [[nodiscard]] bool hasFaaCatchUp() const {
     for (size_t i = 0; i < n_; ++i) {
       if (ops_[i].kind == BatchKind::FaaTsCatchUp) return true;
@@ -224,6 +265,7 @@ class Batch {
   size_t n_ = 0;
   size_t commits_ = 0;
   size_t faas_ = 0;
+  size_t ts_reads_ = 0;
   size_t vec_writes_ = 0;
   size_t node_writes_ = 0;
   bool overflow_ = false;

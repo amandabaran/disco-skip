@@ -32,6 +32,7 @@
 
 #include "ds_defs.hpp"
 #include "ds_node.hpp"
+#include "ds_ts.hpp"
 
 namespace ds {
 
@@ -79,6 +80,17 @@ template <class R>
 bool stamps(R &, long) { return true; }
 template <class R>
 bool stamps(R &r) { return stamps(r, 0); }
+
+/// Does /reader/ run a mode whose stamps are BANDED rather than totally
+/// ordered? Detected the same way and for the same reason as stamps().
+template <class R>
+auto banded(R &r, int) -> decltype(r.tsMode() == TsMode::RangeTs) {
+  return r.tsMode() == TsMode::RangeTs;
+}
+template <class R>
+bool banded(R &, long) { return false; }
+template <class R>
+bool banded(R &r) { return banded(r, 0); }
 }  // namespace verifyDetail
 
 template <class Reader>
@@ -88,8 +100,12 @@ class StructureVerifier {
   ///                all. False under TsMode::None, where every version is
   ///                unstamped by design and the ts assertions would report
   ///                the mode working as a structural fault.
-  StructureVerifier(Reader &reader, uint32_t layers, bool stamps = true)
-      : r_(reader), layers_(layers), stamps_(stamps) {
+  /// @param banded  whether successive versions may SHARE a timestamp band,
+  ///                 as they do under TsMode::RangeTs. See the derivation on
+  ///                 checkOldVerChain.
+  StructureVerifier(Reader &reader, uint32_t layers, bool stamps = true,
+                    bool banded = false)
+      : r_(reader), layers_(layers), stamps_(stamps), banded_(banded) {
     rep_.nodes_per_level.assign(layers, 0);
   }
 
@@ -123,6 +139,7 @@ class StructureVerifier {
   Reader &r_;
   uint32_t layers_;
   bool stamps_ = true;
+  bool banded_ = false;
   VerifyReport rep_;
 
   /// child id -> (expected k_min, expected level, referencing node)
@@ -239,9 +256,36 @@ class StructureVerifier {
   /// Walks the old_ver chain, checking it is finite and ordered.
   ///
   /// A snapshot read walks back for the version with ts <= T and stops at the
-  /// first one that qualifies, so the chain must be strictly decreasing in ts.
-  /// An inversion would make it stop early and serve the wrong version, which
-  /// is the failure mode a range query cannot detect for itself.
+  /// first one that qualifies, so the predicate "ts <= T" must be MONOTONE
+  /// along the chain. In the clock modes and in Faa that is exactly "strictly
+  /// decreasing in ts", because every stamp is distinct.
+  ///
+  /// ── WHY TsMode::RangeTs IS CHECKED BY BAND INSTEAD ─────────────────────
+  ///
+  /// In that mode only a RANGE advances the counter, so two successive writes
+  /// to one node routinely read the SAME value V and stamp
+  /// ((V+1) << 16) | client -- identical but for the client field. Worked
+  /// through with real values: node id 7, no range running, client 3 writes
+  /// then client 1 writes.
+  ///
+  ///   client 3 reads V = 4  ->  ts = (5 << 16) | 3 = 327683
+  ///   client 1 reads V = 4  ->  ts = (5 << 16) | 1 = 327681
+  ///
+  /// The newer version's ts is SMALLER. Strictly decreasing fails, and it is
+  /// right to fail: there is no total order here to assert, because the
+  /// counter never moved between the two writes.
+  ///
+  /// It is not a correctness problem, because every snapshot in this mode is
+  /// band-aligned: T = ((P + 1) << 16) | kFaaClientMask, so "ts <= T" reduces
+  /// to "band(ts) <= band(T)" and the client field cannot affect the cut. What
+  /// must hold is that BANDS are non-increasing going back the chain, and that
+  /// does hold: settle-before-write stamps the predecessor before this version
+  /// publishes, and the predecessor's value was written back to a majority, so
+  /// this writer's read quorum intersects it and returns at least as much.
+  ///
+  /// So the assertion is relaxed exactly as far as the mode weakens the claim
+  /// and no further. content_ver below is still strictly decreasing in every
+  /// mode, and it is what distinguishes two versions inside one band.
   void checkOldVerChain(NodeRecord const &n, VecRecord const &current,
                         uint64_t id) {
     VecOffset off = static_cast<VecOffset>(current.old_ver);
@@ -270,10 +314,13 @@ class StructureVerifier {
         err(idStr(id) + ": a superseded version at offset " +
             std::to_string(off) + " is still pending, so no snapshot can ever "
                                   "be resolved against it");
-      } else if (older.ts >= newer_ts) {
+      } else if (banded_ ? (older.ts >> kFaaClientBits) >
+                               (newer_ts >> kFaaClientBits)
+                         : older.ts >= newer_ts) {
         err(idStr(id) + ": old_ver chain is not decreasing in ts -- offset " +
             std::to_string(off) + " has ts " + std::to_string(older.ts) +
-            " at or above its successor's " + std::to_string(newer_ts));
+            (banded_ ? " in a HIGHER BAND than" : " at or above") +
+            " its successor's " + std::to_string(newer_ts));
       }
       if (older.content_ver >= newer_content && older.struct_ver == n.handle.structVer()) {
         err(idStr(id) + ": old_ver chain is not decreasing in content_ver at "
@@ -459,13 +506,15 @@ VerifyReport verifyStructure(Reader &reader, uint32_t layers) {
   // Asks the reader for its mode when it can answer, so a caller does not have
   // to remember to. Readers without tsMode() are stamping readers.
   return StructureVerifier<Reader>(reader, layers,
-                                   verifyDetail::stamps(reader)).run();
+                                   verifyDetail::stamps(reader),
+                                   verifyDetail::banded(reader)).run();
 }
 
 /// The same, with the mode stated explicitly.
 template <class Reader>
-VerifyReport verifyStructure(Reader &reader, uint32_t layers, bool stamps) {
-  return StructureVerifier<Reader>(reader, layers, stamps).run();
+VerifyReport verifyStructure(Reader &reader, uint32_t layers, bool stamps,
+                             bool banded = false) {
+  return StructureVerifier<Reader>(reader, layers, stamps, banded).run();
 }
 
 }  // namespace ds

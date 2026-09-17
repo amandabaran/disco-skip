@@ -208,8 +208,8 @@ class Writer {
       b.casHandle(addr, node.handle.raw, node.handle.withContent(off).raw);
       // TsMode::None contributes nothing: the batch stays writeVec +
       // casHandle, and the stamping submission further down is skipped too.
-      if (ops_.tsMode() == TsMode::Faa) {
-        b.faaTs();
+      if (tsIsRemote(ops_.tsMode())) {
+        tsClaimOn(b, ops_.tsMode());
       } else if (tsStamps(ops_.tsMode())) {
         // max(clock, predecessor + 1): the chain is strictly decreasing by
         // construction rather than by the clock being good enough, and it is
@@ -239,7 +239,7 @@ class Writer {
       // reader starting afterwards cannot be ordered before it. A helper
       // stamping instead only happens while this writer is still in flight,
       // and such a write is genuinely concurrent with the reader.
-      if (ops_.tsMode() == TsMode::Faa) {
+      if (tsIsRemote(ops_.tsMode())) {
         Batch stamp;
         // stampFor, not stampOver: in Faa mode the counter value is used RAW.
         // Flooring it at the predecessor can invert the counter's own global
@@ -377,7 +377,7 @@ class Writer {
       stage.writeVec(new_vec, nvec);
       stage.casHandle(addr, node.handle.raw,
                       node.handle.withStruct(new_vec).raw);
-      if (ops_.tsMode() == TsMode::Faa) stage.faaTs();
+      if (tsIsRemote(ops_.tsMode())) tsClaimOn(stage, ops_.tsMode());
       BatchResult const r = ops_.submit(stage);
       if (!r.submitted) return fail(out);
       stats_.vec_writes += 2;
@@ -401,7 +401,7 @@ class Writer {
       // split published them together -- so giving them different stamps would
       // claim an order between two versions that became visible at once.
       uint64_t const ts = stampFor(
-          ops_.tsMode(), ops_.tsMode() == TsMode::Faa ? r.ts : ops_.now(),
+          ops_.tsMode(), tsIsRemote(ops_.tsMode()) ? r.ts : ops_.now(),
           vec.ts);
       Batch finish;
       // TsMode::None stamps neither half of a split. This site is easy to

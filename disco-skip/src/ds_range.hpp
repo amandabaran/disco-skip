@@ -74,6 +74,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "ds_batch.hpp"
 #include "ds_defs.hpp"
 #include "ds_node.hpp"
 #include "ds_traverse.hpp"
@@ -185,16 +186,56 @@ namespace detail {
 inline constexpr uint32_t kMaxVersionHops = 1u << 16;
 }  // namespace detail
 
-/// The snapshot to read at, for /mode/.
+/// The snapshot to read at, for /mode/. kNullTs means NO SNAPSHOT COULD BE
+/// TAKEN, which callers must treat as a failure rather than as an empty answer.
 ///
-/// Faa: READ the replicated counter (never FAA -- see the header note) and
-/// admit every client index at that counter value. Clock: read the clock.
+///   Clock/Tsc  read the clock.
+///
+///   Faa        READ the replicated counter, never FAA it -- writes are what
+///              advance it, and a range that advanced it would burn values and
+///              push concurrent writes out of its own cut. Admit every client
+///              index at the value observed.
+///
+///   RangeTs    FETCH-AND-ADD it, because here the range is the only thing
+///              that advances it at all, and then WRITE BACK before returning.
+///
+/// WHY RangeTs CANNOT JUST READ, which is the whole asymmetry. In Faa mode the
+/// counter is pushed forward by every write, so reading it is enough to sit
+/// above everything already stamped. In RangeTs nothing advances it unless a
+/// range does, so two ranges that merely read would take the SAME cut -- and
+/// every write between them would be stamped at a value inside that cut, so
+/// the second range would return writes the first had already excluded at the
+/// same T. Advancing it is what separates one range's cut from the next's.
+///
+/// AND WHY THE WRITE-BACK IS NOT OPTIONAL. The maximum can come from replica A
+/// while a later writer's read quorum excludes A; the intersecting replica sits
+/// at v_B + 1, which can still be <= this maximum, so that writer would stamp
+/// BELOW a snapshot that has already been returned. Raising every replica in
+/// the quorum to the maximum first is what makes any later quorum observe it --
+/// the same faaCatchUpAddends() write-back the Faa write path performs, moved
+/// to the range path. It is skipped entirely when the replicas agreed, which is
+/// the failure-free case.
 template <class Ops>
 [[nodiscard]] uint64_t takeSnapshot(Ops &ops) {
   // TsMode::None has no snapshot to take; Ranger::range refuses before
   // reaching here, and this returns kNullTs so a caller that somehow did
   // cannot mistake a stale clock reading for a valid T.
   if (!tsStamps(ops.tsMode())) return kNullTs;
+  if (ops.tsMode() == TsMode::RangeTs) {
+    Batch claim;
+    claim.faaTs();
+    BatchResult const r = ops.submit(claim);
+    // kNullTs from a claiming round means it fell short of a majority, so the
+    // value carries no ordering at all -- exactly the case a write refuses to
+    // stamp with. A range cannot leave itself pending, so it gives up.
+    if (!r.submitted || r.ts == kNullTs) return kNullTs;
+    if (ops.tsNeedsWriteBack()) {
+      Batch back;
+      back.faaTsCatchUp();
+      if (!ops.submit(back).submitted) return kNullTs;
+    }
+    return snapshotFromClaim(r.ts);
+  }
   if (ops.tsMode() != TsMode::Faa) return ops.now();
   return (ops.readTsCounter() << kFaaClientBits) | kFaaClientMask;
 }
@@ -233,7 +274,18 @@ class Ranger {
       ++stats_.failures;
       return res;
     }
-    return rangeAt(lo, hi, layers, cap, takeSnapshot(ops_), out);
+    uint64_t const snapshot = takeSnapshot(ops_);
+    // A CUT THAT COULD NOT BE TAKEN IS NOT AN EMPTY RANGE. In RangeTs mode the
+    // claiming round can fall short of a majority, and kNullTs is what comes
+    // back; walking at kNullTs would find no version within it and report a
+    // RESOLVED, EMPTY interval -- a wrong answer that looks legitimate, which
+    // is the failure mode gave_up_no_timestamps exists to avoid elsewhere.
+    if (snapshot == kNullTs) {
+      RangeResult res;
+      ++stats_.failures;
+      return res;
+    }
+    return rangeAt(lo, hi, layers, cap, snapshot, out);
   }
 
   /// The same walk at a CALLER-SUPPLIED snapshot.

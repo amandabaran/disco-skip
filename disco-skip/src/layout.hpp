@@ -83,6 +83,28 @@ struct Layout {
     /// Spread VECTOR reads across the replicas that agree, instead of always
     /// taking the first. See resolveWalkHeader in ds_rdma_async.hpp.
     bool spread_reads;
+    /// DIAGNOSTIC, AND DELIBERATELY INCORRECT: issue every batch CAS as a
+    /// plain 8-byte RDMA WRITE of the desired value.
+    ///
+    /// This BREAKS LINEARIZABILITY and loses updates. A blind write cannot
+    /// detect that another writer published first, so two concurrent writers
+    /// to one node both "succeed" and one version is silently dropped; the
+    /// same applies to the link fields and the tail word during a split. No
+    /// number taken with it describes a correct store.
+    ///
+    /// It exists to answer one question that cannot be answered any other way:
+    /// HOW MUCH OF THE WRITE PATH IS THE ATOMIC VERB ITSELF. ConnectX-3 does
+    /// atomics by taking an internal lock and doing a read-modify-write --
+    /// measured here at 2.705 Mpps against 7.859 for reads, and a concurrent
+    /// CAS stream drags 8-byte reads down to 2.43 Mpps. That says the verb is
+    /// expensive in isolation; it does not say our throughput is bounded by
+    /// it. Swapping CAS for WRITE holds the message count, the byte count, the
+    /// round trips and the algorithm fixed and changes only the verb, so the
+    /// difference is the verb's contribution and nothing else.
+    ///
+    /// Run it against --ts none, which removes the timestamp atomics too, and
+    /// the write path has no atomics left at all.
+    bool cas_as_write;
     /// Post header reads to `majority()` replicas instead of all of them,
     /// load-balanced by node address. See postHeaders in ds_rdma_async.hpp.
     bool read_quorum;

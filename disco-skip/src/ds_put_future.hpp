@@ -302,7 +302,7 @@ class PutOperation {
   /// A help batch landed. In Faa mode write back the value it claimed, then
   /// re-read; otherwise re-read straight away.
   size_t onSettle() {
-    if (helped_ts_ && ops_.tsMode() == TsMode::Faa) {
+    if (helped_ts_ && tsIsRemote(ops_.tsMode())) {
       BatchResult const r = ops_.resolveBatch(help_batch_);
       helped_ts_ = false;
       if (r.ts != kNullTs) {
@@ -343,8 +343,8 @@ class PutOperation {
         // It was ops_.now() unconditionally, which in Faa mode writes
         // CLOCK_REALTIME nanoseconds into a counter-valued field -- see
         // ds_range_future.hpp for what that does to a snapshot walk.
-        if (ops_.tsMode() == TsMode::Faa) {
-          b.faaTs();
+        if (tsIsRemote(ops_.tsMode())) {
+          tsClaimOn(b, ops_.tsMode());
         } else {
           b.casTs(helped_off_, kNullTs, ops_.now());
         }
@@ -452,8 +452,8 @@ class PutOperation {
     // the batch stays writeVec + casHandle, one chained submission, and the
     // AwaitStamp step below never runs. Faa's second round trip disappears
     // with it.
-    if (ops_.tsMode() == TsMode::Faa) {
-      batch_.faaTs();
+    if (tsIsRemote(ops_.tsMode())) {
+      tsClaimOn(batch_, ops_.tsMode());
     } else if (tsStamps(ops_.tsMode())) {
       batch_.casTs(off, kNullTs,
                    stampFor(ops_.tsMode(), ops_.now(), vec_.ts));
@@ -477,7 +477,7 @@ class PutOperation {
       ++wstats_.retries;
       return fetch();
     }
-    if (ops_.tsMode() == TsMode::Faa) {
+    if (tsIsRemote(ops_.tsMode())) {
       // Visible but unstamped. Fix it before the operation is called complete,
       // so "the write finished" includes its timestamp and a reader starting
       // afterwards cannot be ordered before it.
@@ -561,7 +561,7 @@ class PutOperation {
     batch_.writeVec(nvec_off, nvec_);
     batch_.casHandle(target_, node_.handle.raw,
                      node_.handle.withStruct(nvec_off).raw);
-    if (ops_.tsMode() == TsMode::Faa) batch_.faaTs();
+    if (tsIsRemote(ops_.tsMode())) tsClaimOn(batch_, ops_.tsMode());
     pred_ts_ = vec_.ts;
     pre_split_ = node_;
     split_orphan_ = orphan;
@@ -589,7 +589,7 @@ class PutOperation {
     // visible at once. Guarded against the version being superseded, so the
     // chain cannot invert whatever the clock does.
     uint64_t const ts = stampFor(
-        ops_.tsMode(), ops_.tsMode() == TsMode::Faa ? r.ts : ops_.now(),
+        ops_.tsMode(), tsIsRemote(ops_.tsMode()) ? r.ts : ops_.now(),
         pred_ts_);
     finish_ = Batch{};
     // Neither half of a split is stamped in TsMode::None -- see the matching

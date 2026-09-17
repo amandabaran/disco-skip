@@ -204,7 +204,7 @@ class TraversalFuture {
   }
 
   size_t onHelp() {
-    if (helped_ts_ && ops_.tsMode() == TsMode::Faa) {
+    if (helped_ts_ && tsIsRemote(ops_.tsMode())) {
       BatchResult const r = ops_.resolveBatch(help_batch_);
       helped_ts_ = false;
       if (r.ts != kNullTs) {
@@ -309,8 +309,8 @@ class TraversalFuture {
         // which leaves the version chain non-monotonic and puts it out of
         // reach of every range snapshot. See ds_range_future.hpp's copy of
         // this comment for the worked numbers.
-        if (ops_.tsMode() == TsMode::Faa) {
-          b.faaTs();
+        if (tsIsRemote(ops_.tsMode())) {
+          tsClaimOn(b, ops_.tsMode());
         } else {
           b.casTs(helped_off_, kNullTs, ops_.now());
         }

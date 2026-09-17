@@ -167,10 +167,10 @@ bool settleNode(Ops &ops, RemoteAddr addr, NodeRecord &node, VecRecord &vec,
     //    A helper cannot apply stampOver()'s guard: it has not read the version
     //    this one supersedes. So a helper's stamp depends on epsilon being
     //    below the gap between successive versions of one node -- see ds_ts.hpp.
-    bool const faa = ops.tsMode() == TsMode::Faa;
+    bool const faa = tsIsRemote(ops.tsMode());
     if (pending) {
       if (faa) {
-        b.faaTs();
+        tsClaimOn(b, ops.tsMode());
       } else {
         b.casTs(node.handle.offset(), kNullTs, ops.now());
       }

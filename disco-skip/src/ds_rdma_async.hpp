@@ -818,7 +818,8 @@ class RdmaAsyncOps {
     }
     size_t took = 0;
     for (size_t r = 0; r < conns_.size(); ++r) {
-      if (batchCommitted(b, layout_.casBufsFor(future_id_, r))) ++took;
+      if (batchCommitted(b, layout_.casBufsFor(future_id_, r),
+                         layout_.cas_as_write)) ++took;
     }
     if (took >= majority()) {
       ++stats_.commits;

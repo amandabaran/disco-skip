@@ -200,6 +200,110 @@ enum class TsMode : uint8_t {
   /// this cannot be "skip the stamp unless somebody scans". A range in this
   /// mode is refused outright rather than answered wrongly.
   None,
+  /// THE COUNTER IS ADVANCED BY RANGES, AND ONLY BY RANGES. A write READS it.
+  ///
+  /// Faa has it the other way round: every write fetch-and-adds, every range
+  /// reads. That puts an atomic on the path taken by 50% of workload A's
+  /// operations in order to serve a capability workload A never uses, and it
+  /// makes the counter diverge under partial writes (see the write-back
+  /// derivation above). Inverting it puts the atomic on the rare path.
+  ///
+  /// ── THE INVARIANT THAT MAKES IT CORRECT ──────────────────────────────
+  ///
+  /// The moment a range advances the counter from C to C+1, EVERY write that
+  /// will stamp at or below f(C) must already be VISIBLE.
+  ///
+  /// That is what lets a range at T = f(C) trust its own result: any writer
+  /// holding C published before the range's FAA, so the range must encounter
+  /// that version, find it pending, and help it -- and a helped version is
+  /// accounted for rather than missed.
+  ///
+  /// ── WHICH FORCES THE ORDER, AND IT IS NOT NEGOTIABLE ─────────────────
+  ///
+  ///     1. writeVec + casHandle        publish, one chain
+  ///     2. read the counter            legal ONLY now
+  ///     3. casTs(off, kNullTs, f(C))   stamp
+  ///
+  /// Reading the counter BEFORE publishing breaks the invariant, and the
+  /// counterexample is short. Counter C. Writer W reads C at locate time and
+  /// has not published. Range R FAAs, gets C, T = f(C), walks W's node, sees
+  /// only the old version, and COMPLETES. W then publishes and stamps f(C).
+  /// Now ts_W <= T, so W is inside R's snapshot -- but R already returned
+  /// without it, and a second range at the same T would include it. Two
+  /// ranges at one snapshot disagreeing is not a linearizability quibble; it
+  /// breaks snapshot semantics outright, and concurrency does not excuse it
+  /// because the timestamp is the externally visible ordering claim.
+  ///
+  /// So this mode costs the same TWO submissions per write as Faa: step 2's
+  /// value arrives with step 1's completion, and step 3 needs it. What it
+  /// saves is one ATOMIC of three per write per server -- casHandle and casTs
+  /// remain. Measured reference points: Faa -> None removed two atomics AND
+  /// the round trip for +17-21%, while removing every atomic at a fixed round
+  /// trip count was +6%. So expect single digits, not the full 17-21%: the
+  /// ordering rule above is exactly what keeps the round trip.
+  ///
+  /// ── THE WRITE-BACK DOES NOT GO AWAY, IT MOVES ────────────────────────
+  ///
+  /// The "with only a majority it breaks" derivation above mirrors precisely.
+  /// A range's maximum can come from replica A; a later writer's read quorum
+  /// can exclude A; the intersecting replica's value after the range is
+  /// v_B + 1, which can still be <= the range's maximum. The writer then
+  /// stamps BELOW a snapshot that has already completed. So a range must raise
+  /// every replica in its quorum to M + 1 before it returns -- the same
+  /// faaCatchUpAddends() write-back, applied on the range path instead of the
+  /// write path.
+  ///
+  /// ── ONE WINDOW IS STILL OPEN, AND IT IS SHARED WITH Faa ──────────────
+  ///
+  /// A WRITER THAT LOSES ITS STAMPING CAS TO A HELPER RETURNS ON THE HELPER'S
+  /// TIMESTAMP WITHOUT WAITING FOR THE HELPER'S WRITE-BACK. PutOperation's
+  /// onStamp() does not even resolve its own stamp batch -- there is nothing
+  /// to do about a lost casTs, since the version is stamped either way -- so
+  /// the write completes as soon as its own chain drains, while the helper's
+  /// catch-up is still in flight on other queue pairs.
+  ///
+  /// Worked through with real values. Three replicas, RangeTs.
+  ///
+  ///   counters (17, 16, 16). Reachable: a range's FAA landed on r0, answered
+  ///   below a majority, and that range gave up -- but the increment stuck.
+  ///
+  ///   writer W publishes v_new at node 7, reads {r1, r2} -> max 16, so W
+  ///   intends band 17, and owes no write-back (r1 and r2 agree).
+  ///
+  ///   helper H reads {r0, r2} -> max 17, so H stamps band 18 and DOES owe a
+  ///   write-back: addend 1 for r2, 0 for r0, nothing for r1 (never read).
+  ///   H's chain per replica is casTs then catch-up.
+  ///
+  ///   H's casTs reaches r1. W's casTs there finds band 18 instead of kNullTs
+  ///   and fails; W drains its own chain and RETURNS. ts(W) = band 18.
+  ///
+  ///   H's catch-up on r2 has not landed. Counters are still (17, 16, 16), so
+  ///   band 18 is supported by r0 alone. A range R3 now FAAs {r1, r2}: pre
+  ///   (16, 16), P = 16, cut = band 17 -- and EXCLUDES W, which completed
+  ///   before R3 began.
+  ///
+  /// Three coincidences deep and every one of them failure-related, but real,
+  /// and NOT introduced by this mode: substitute "H's FAA" for "H's read" and
+  /// the same sequence runs in Faa mode, where a helper likewise claims, wins
+  /// the casTs, and owes a write-back the losing writer does not await.
+  ///
+  /// THE FIX, NOT YET IMPLEMENTED. A writer whose casTs loses must not return
+  /// until the band of the WINNING stamp is on a majority of counters. That
+  /// needs the losing casTs's swapback surfaced -- BatchResult carries the
+  /// publishing CAS's result, not casTs's -- and then one conditional extra
+  /// round: read the counter, and write back if the maximum is below the
+  /// winner's band minus one. Rare path, one round trip, no change to the
+  /// common case.
+  ///
+  /// ── WHAT IT BUYS BEYOND SPEED ────────────────────────────────────────
+  ///
+  /// No FAA on the write path means no counter divergence from partial
+  /// writes, so QuorumStats::ts_partial stops being a caveat on every
+  /// write-heavy run. And a helper can read the counter in the SAME fan-out
+  /// as the header read it already performs -- the version it is stamping is
+  /// by definition already visible -- so helping becomes one submission
+  /// rather than the two Faa forces.
+  RangeTs,
 };
 
 /// Parse the --ts option.
@@ -208,6 +312,7 @@ enum class TsMode : uint8_t {
   if (s == "tsc")   { out = TsMode::Tsc;   return true; }
   if (s == "faa")   { out = TsMode::Faa;   return true; }
   if (s == "none")  { out = TsMode::None;  return true; }
+  if (s == "rangets") { out = TsMode::RangeTs; return true; }
   return false;
 }
 
@@ -229,12 +334,52 @@ template <class Vec>
   return tsStamps(m) && v.isPending();
 }
 
+/// Does the stamp come from the REMOTE counter in this mode?
+///
+/// THIS IS THE PREDICATE EVERY CALL SITE ACTUALLY WANTS, and it used to be
+/// spelled `tsMode() == TsMode::Faa` in eleven places. What those eleven
+/// branches are really asking is not "which verb" but "is my stamp's value
+/// still unknown when I publish" -- because if it is, the write cannot fold
+/// casTs into the publish chain and must split into two submissions. Faa and
+/// RangeTs both answer yes, for the same reason and with the same shape; the
+/// clock modes answer no because ops_.now() is available before the post.
+///
+/// Adding RangeTs as a second `== TsMode::Faa` at each site is exactly the
+/// mistake that made three helping sites stamp clockNow() into a counter-valued
+/// field: the sites that matter are easy to find and the ones that matter most
+/// are easy to miss. One predicate, so a third counter mode cannot reintroduce
+/// it.
+[[nodiscard]] inline constexpr bool tsIsRemote(TsMode m) noexcept {
+  return m == TsMode::Faa || m == TsMode::RangeTs;
+}
+
+/// Claim a timestamp on /b/ with whichever verb /m/ calls for.
+///
+/// Templated on the batch type purely to keep ds_ts.hpp free of ds_batch.hpp:
+/// the timestamp rules are the lower layer and should not depend on the batch
+/// representation.
+///
+/// Faa ADVANCES the counter -- the writer is taking a slot, so nobody else may
+/// have it. RangeTs only OBSERVES it: in that mode the counter moves when a
+/// RANGE fetch-and-adds it, and a write that advanced it would push every
+/// subsequent write out of the snapshot of a range that had not started.
+template <class B>
+inline void tsClaimOn(B &b, TsMode m) {
+  if (m == TsMode::Faa) {
+    b.faaTs();
+  } else {
+    b.readTs();
+  }
+}
+
 [[nodiscard]] inline char const *tsModeName(TsMode m) {
   switch (m) {
     case TsMode::Clock: return "clock (disciplined CLOCK_REALTIME)";
     case TsMode::Tsc:   return "tsc (raw rdtscp, not cross-machine)";
     case TsMode::Faa:   return "faa (global counter, one point of failure)";
     case TsMode::None:  return "none (NO SNAPSHOT RANGES -- point operations only)";
+    case TsMode::RangeTs:
+      return "rangets (ranges advance the counter; writes read it)";
   }
   return "?";
 }
@@ -337,7 +482,11 @@ template <class Vec>
 /// too, which it should not have if the counter were really in charge.
 [[nodiscard]] inline uint64_t stampFor(TsMode mode, uint64_t source,
                                        uint64_t predecessor_ts) noexcept {
-  return mode == TsMode::Faa ? source : stampOver(source, predecessor_ts);
+  // RangeTs is counter-sourced exactly like Faa, so the floor is wrong for the
+  // same reason: it can invert the global order the counter exists to provide.
+  return (mode == TsMode::Faa || mode == TsMode::RangeTs)
+             ? source
+             : stampOver(source, predecessor_ts);
 }
 
 /// Turn an FAA's returned value into a timestamp.
@@ -378,6 +527,86 @@ static_assert(tsFromFaa(5, 1) != tsFromFaa(5, 2),
               "two writers computing the same counter maximum must still differ");
 static_assert(tsFromFaa(5, 9) < tsFromFaa(6, 0),
               "a larger counter maximum outranks any client tiebreak");
+
+/// The stamp for a RangeTs writer, from the counter value it READ.
+///
+/// SAME PACKING AS tsFromFaa, AND THAT IS THE POINT: one counter value maps to
+/// one band of 2^16 stamps whichever mode produced it, so the +1 that clears
+/// kBootstrapTs and the client tiebreak in the low bits are shared rather than
+/// re-derived. What differs is only WHICH value is fed in -- tsFromFaa is given
+/// a pre-value by the writer that incremented the counter itself, this is given
+/// a value the writer merely OBSERVED.
+///
+/// The inclusion test a range applies, with the range at FAA pre-value P and
+/// T = snapshotFromCounterFaa(P) = ((P + 1) << 16) | kFaaClientMask:
+///
+///   writer read V = P      ((P+1) << 16) | client <= T     INCLUDED, and it
+///                          MUST be: it published before that range's FAA, so
+///                          the range either saw its version or helped it.
+///
+///   writer read V = P + 1  ((P+2) << 16) | client  > T     EXCLUDED, and it
+///                          MUST be: it read the counter only after the range
+///                          had advanced past P, so it is not in the cut.
+///
+/// The band is what makes that boundary exact: every client index at V = P
+/// lands at or below T and every client index at V = P+1 lands strictly above
+/// it, so where the cut falls never depends on WHO wrote.
+[[nodiscard]] inline constexpr uint64_t tsFromCounterRead(
+    uint64_t read_value, uint64_t client_idx) noexcept {
+  return tsFromFaa(read_value, client_idx);
+}
+
+/// The snapshot a RangeTs range reads at, from the PRE-value its FAA returned.
+///
+/// kFaaClientMask in the low bits admits EVERY client index at that counter
+/// value, which is a correctness requirement and not a convenience. Two writes
+/// ordered W1 -> W2 in real time can read the SAME counter value V -- nothing
+/// advances it between them unless a range runs -- so their stamps differ only
+/// in the client field, and the client field carries no order. A cut falling
+/// inside the band would then include W2 and exclude W1 on a tiebreak neither
+/// writer agreed to, which is a torn snapshot. Taking the whole band keeps
+/// them together: either both are in or both are out.
+[[nodiscard]] inline constexpr uint64_t snapshotFromCounterFaa(
+    uint64_t pre_value) noexcept {
+  return (((pre_value + 1) << kFaaClientBits) | kFaaClientMask);
+}
+
+static_assert(tsFromCounterRead(0, 0) > kBootstrapTs,
+              "the first RangeTs stamp must clear the bootstrap timestamp");
+static_assert(tsFromCounterRead(0, 0) != kNullTs,
+              "no RangeTs stamp may collide with the pending marker");
+// A writer that read P is INSIDE the snapshot of a range whose FAA returned P,
+// whatever its client index -- the whole band, per the comment above.
+static_assert(tsFromCounterRead(7, 0) <= snapshotFromCounterFaa(7) &&
+                  tsFromCounterRead(7, kFaaClientMask) <=
+                      snapshotFromCounterFaa(7),
+              "a writer holding the range's pre-value must be INCLUDED");
+// A writer that read P+1 is OUTSIDE it, whatever its client index.
+static_assert(tsFromCounterRead(8, 0) > snapshotFromCounterFaa(7),
+              "a writer that read past the range's FAA must be EXCLUDED");
+static_assert(tsFromCounterRead(5, 1) != tsFromCounterRead(5, 2),
+              "two writers reading the same value must still differ");
+
+/// The snapshot from the TIMESTAMP a claiming round produced, rather than from
+/// the raw pre-value.
+///
+/// A range in RangeTs mode claims its cut with exactly the round a Faa-mode
+/// WRITE uses -- one FaaTs on every replica, maximum over the answers, majority
+/// required -- so what comes back is already tsFromFaa(max_pre, client). Widening
+/// the client field to the whole band turns that into the snapshot. Going
+/// through the pre-value instead would mean plumbing BatchResult::pre_faa
+/// through the replicated backend, which sets only `ts`.
+[[nodiscard]] inline constexpr uint64_t snapshotFromClaim(
+    uint64_t claim_ts) noexcept {
+  return claim_ts | kFaaClientMask;
+}
+
+static_assert(snapshotFromClaim(tsFromFaa(7, 3)) == snapshotFromCounterFaa(7),
+              "a claim's stamp and its pre-value must give the same snapshot");
+static_assert(snapshotFromClaim(tsFromFaa(7, kFaaClientMask)) ==
+                  snapshotFromCounterFaa(7),
+              "the claiming client's index must not move the cut");
+
 
 /// Per-replica addends for the counter write-back, and whether it is needed.
 ///
