@@ -329,10 +329,35 @@ int main(int argc, char** argv) {
     layout.cache_layers      = 4;
     layout.nodes_per_client  = 1 << 16;
     layout.vecs_per_client   = 1 << 18;
-    layout.offset_hint       = true;
+    // OFF BY DEFAULT AS OF 17 SEP 2026, MEASURED. The speculative vector read
+    // appends 576 B to every header fan-out and L4 discards 47.5% of them on
+    // workload A, because every write moves the vector to a freshly allocated
+    // offset. Turning it off does MORE round trips per operation and is
+    // faster anyway:
+    //
+    //   16 clients  492.5 -> 599.3 kops  (+21.7%)  trips/op 4.81 -> 5.81
+    //   32 clients  371.9 -> 533.7 kops  (+43.5%)  trips/op 5.14 -> 6.17
+    //
+    // because per-trip service time falls 16.73 -> 9.71 us at 32 clients. What
+    // saturates is priced in WORK PER ROUND TRIP, not in round trips, so
+    // inflating every operation to save a trip on half of them is a losing
+    // trade -- and it compounds with client count. It also halves the
+    // 16-to-32 cliff: retention 0.76x -> 0.89x.
+    //
+    // The justification in layout.hpp -- that this trades "rNIC and PCIe
+    // bandwidth, which is the scarce resource under write-heavy load" -- had
+    // the premise backwards. Workload A at its cliff uses 7.4% of one server's
+    // FDR link. Bandwidth being idle is exactly WHY the trade is bad: the hint
+    // spends the plentiful resource to save the scarce one.
+    //
+    // Left as a toggle rather than deleted: on a read-mostly workload the
+    // guess is almost always right (workload C hits 0.987) and the saved trip
+    // is real. --offset-hint 1 restores it.
+    layout.offset_hint       = false;
     layout.batched_walk      = false;
     layout.cache_walk        = false;
     layout.spread_reads      = false;
+    layout.cas_as_write      = false;
     layout.read_quorum       = false;
     layout.consult_cache     = DS_CACHE_ENABLED ? true : false;
     layout.writeback         = DS_REG_WRITEBACK_ENABLED ? true : false;
@@ -400,6 +425,11 @@ int main(int argc, char** argv) {
                 "Post header reads to a load-balanced majority() replicas "
                 "instead of all of them. -m sets the quorum size. Falls back "
                 "to all replicas for the retry when the quorum disagrees.") |
+        lyra::opt(layout.cas_as_write, "cas_as_write")
+            .optional()["--unsafe-cas-as-write"](
+                "DIAGNOSTIC, BREAKS CORRECTNESS: issue every CAS as a plain "
+                "RDMA WRITE. Measures what the atomic VERB costs by holding "
+                "messages, bytes and round trips fixed. Loses updates.") |
         lyra::opt(layout.spread_reads, "spread_reads")
             .optional()["--spread-reads"](
                 "Read each vector from replica (offset % n) rather than always "
@@ -617,7 +647,27 @@ int main(int argc, char** argv) {
         // both the per-write round-trip count and what the numbers mean. A
         // result whose configuration has to be reconstructed from a script is
         // a result nobody can check.
-        std::cout << "timestamps:   " << ds::tsModeName(layout.ts_mode)
+        if (layout.cas_as_write) {
+        std::cerr << "\n*** --unsafe-cas-as-write IS ON. Every CAS is a blind "
+                     "RDMA WRITE.\n"
+                     "*** THIS STORE IS NOT LINEARIZABLE AND LOSES UPDATES: a "
+                     "write cannot detect\n"
+                     "*** that another writer published first, so concurrent "
+                     "writers all believe\n"
+                     "*** they won and versions are silently dropped. Split "
+                     "link fields and the\n"
+                     "*** tail word are equally unprotected.\n"
+                     "*** It exists to measure what the ATOMIC VERB costs, "
+                     "holding message count,\n"
+                     "*** byte count, round trips and the algorithm fixed. NO "
+                     "NUMBER FROM THIS RUN\n"
+                     "*** DESCRIBES A CORRECT STORE. Expect failures and a "
+                     "verifier that objects.\n"
+                  << std::endl;
+    }
+    std::cout << "cas-as-write: " << (layout.cas_as_write ? "ON (UNSAFE)" : "off")
+              << std::endl;
+    std::cout << "timestamps:   " << ds::tsModeName(layout.ts_mode)
                   << std::endl;
         std::cout << "cache:        " << (layout.consult_cache ? "on" : "off")
                   << "  cache-walk: " << (layout.cache_walk ? "on" : "off")
