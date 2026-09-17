@@ -686,9 +686,20 @@ int main(int argc, char* argv[]) {
           fmt::print("Average Macro Scan Latency: N/A (No scan operations occurred during measurement window)\n");
       }
 
+      // THREE DECIMALS, for the same reason disco-skip's print was changed:
+      // this is PER CLIENT, so at 64 clients it is ~4 kops each and an integer
+      // could only move in steps of 1 kops/client = 25% of the summed total.
+      // fusee needs no such change -- it prints an AGGREGATE, so one kops is a
+      // small fraction of it -- but leaving swarm-kv coarse while ours is
+      // precise would bias the comparison at exactly the client count where it
+      // matters most.
+      //
+      // The `kpos` is swarm-kv's own typo and is load-bearing: lib.sh and the
+      // plotter both match on it, so it is preserved deliberately.
       fmt::print(
-          "Local tput: {}kpos\n",
-          iter_count * 1'000'000 / static_cast<uint64_t>((end - start).count()));
+          "Local tput: {:.3f}kpos\n",
+          static_cast<double>(iter_count) * 1e6
+              / static_cast<double>((end - start).count()));
       fmt::print("Local duration: {}s\n", 
           static_cast<uint64_t>((end - start).count() / 1000000000));
       std::cout << std::flush;

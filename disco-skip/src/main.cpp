@@ -1143,9 +1143,30 @@ int main(int argc, char** argv) {
             std::cout << "Done. Results:" << std::endl;
 
             client.reportStats(detailed);
-            fmt::print("Local tput: {} kops\n",
-                    iter_count * 1'000'000
-                    / static_cast<uint64_t>((end_time - start_time).count()));
+            // THREE DECIMALS, AND THE RESOLUTION IS THE WHOLE REASON.
+            //
+            // This printed an INTEGER number of kops per client. Per-client
+            // throughput falls as clients are added -- workload A at 64
+            // clients is about 4 kops each -- so the smallest representable
+            // difference was 1 kops/client, which at 64 clients is 64 kops, or
+            // 25% of the total. Every client in a cell reported the identical
+            // integer and the summed total landed on an exact multiple of the
+            // client count: 11,11,11... = 352 then 12,12,12... = 384.
+            //
+            // That is not a rounding nuisance, it manufactured findings. The
+            // kIdxExp result at 64 clients was reported as 2.00x (128 -> 256
+            // kops) when it is 2 versus 4 kops per client -- two quantization
+            // steps, true value anywhere from roughly 1.5x to 2.5x. It also
+            // masqueraded as run-to-run variance, and an instrumented
+            // (--latency 1) run appeared 25% FASTER than an uninstrumented one
+            // at 64 clients purely by landing one step up.
+            //
+            // Computed in double rather than truncating integer division for
+            // the same reason. lib.sh's total_kops and the plotter's
+            // _TPUT_PATTERNS both accept a decimal now.
+            fmt::print("Local tput: {:.3f} kops\n",
+                    static_cast<double>(iter_count) * 1e6
+                    / static_cast<double>((end_time - start_time).count()));
             fmt::print("Local duration: {}s\n", 
             static_cast<uint64_t>((end_time - start_time).count() / 1000000000));
             std::cout << std::flush;
