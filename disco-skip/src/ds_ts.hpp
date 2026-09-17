@@ -299,10 +299,18 @@ enum class TsMode : uint8_t {
   ///
   /// No FAA on the write path means no counter divergence from partial
   /// writes, so QuorumStats::ts_partial stops being a caveat on every
-  /// write-heavy run. And a helper can read the counter in the SAME fan-out
-  /// as the header read it already performs -- the version it is stamping is
-  /// by definition already visible -- so helping becomes one submission
-  /// rather than the two Faa forces.
+  /// write-heavy run -- it becomes a caveat on scan-heavy ones instead.
+  ///
+  /// ONE OPTIMISATION IS AVAILABLE AND IS NOT TAKEN. A helper could fold its
+  /// counter read into the fan-out that read the header, because the version
+  /// it is about to stamp is BY DEFINITION already visible -- it found it --
+  /// so the ordering rule that forces the write path's second submission does
+  /// not bind here. Helping would then cost one submission where Faa forces
+  /// two. It is not implemented: the helping sites are shared with Faa mode
+  /// through tsClaimOn(), and forking them is how three of them came to stamp
+  /// clockNow() into a counter-valued field. Helping is also rare enough that
+  /// the saving is unmeasurable on the workloads we run. Recorded so the
+  /// possibility is not rediscovered as a bug report.
   RangeTs,
 };
 
