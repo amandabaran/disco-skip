@@ -902,6 +902,10 @@ int main(int argc, char** argv) {
                      "verifier that objects.\n"
                   << std::endl;
     }
+    uint32_t const ops_put_hops =
+        layout.put_hint_hops == ds::Layout::kPutHopsFollowGet
+            ? layout.hint_hops
+            : layout.put_hint_hops;
     std::cout << "cas-as-write: " << (layout.cas_as_write ? "ON (UNSAFE)" : "off")
               << std::endl;
     std::cout << "timestamps:   " << ds::tsModeName(layout.ts_mode)
@@ -913,9 +917,22 @@ int main(int argc, char** argv) {
                   << (layout.batched_walk ? "on" : "off") << "\n"
                   << "  offset-hint: " << (layout.offset_hint ? "on" : "off")
                   << "  async: " << layout.async_parallelism
-                  << "  hint-hops: " << layout.hint_hops
                   << "  maxrange: " << layout.max_range
                   << "  latency: " << (layout.measure_latency ? "on" : "off")
+                  << "\n"
+                  // BOTH HOP BUDGETS AND THE GEOMETRY, so a log says what it
+                  // ran with. put-hint-hops follows --hint-hops unless pinned,
+                  // and a run where the two differ is an experiment rather
+                  // than the shipped configuration -- which a reader cannot
+                  // tell from a banner that prints only one of them. The index
+                  // fan-out is compile-time (DS_IDX_EXP), so it is otherwise
+                  // invisible in the logs entirely, and a sweep comparing two
+                  // builds has no record of which geometry it measured.
+                  << "  hint-hops: " << layout.hint_hops
+                  << " (get) / " << ops_put_hops
+                  << " (put)"
+                  << "  idx-exp: " << ds::kIdxExp
+                  << "  node-capacity: " << ds::kNodeCapacity
                   << std::endl;
     }
 
