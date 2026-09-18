@@ -3,6 +3,9 @@
 #endif
 
 #include <fstream>
+#include <pthread.h>
+#include <sched.h>
+#include <thread>
 #include <iostream>
 #include <memory>
 #include <vector>
@@ -376,6 +379,35 @@ void run_ml_prog_tracker_workload(
               << " tput_kops=" << tput_kops << std::endl;
 }
 
+/// Pin the calling thread to one PHYSICAL core.
+///
+/// Replaces what `numactl -C $CORE` does per process today: once a node's
+/// clients are threads in one process, the process has to place them itself or
+/// they float and the measurement is about the scheduler.
+///
+/// CORE NUMBERING IS THE TRAP AND IT HAS ALREADY BEEN PAID FOR ONCE. On these
+/// machines /sys/.../thread_siblings_list reports (0,8), (1,9) ... (7,15): 8
+/// physical cores, 16 logical, with each core's second thread numbered +8. So
+/// cores 0..7 are eight DISTINCT physical cores and a stride of 1 is correct,
+/// while the stride of 2 that looks natural lands on 0,2,4,6,8,10,12,14 --
+/// which is physical cores 0,2,4,6 used twice and 1,3,5,7 left idle. run.sh
+/// carries the same note for the same reason.
+static bool pinThreadToCore(unsigned core) {
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(core, &set);
+    int const rc = pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+    if (rc != 0) {
+        std::cerr << "WARNING: could not pin thread to core " << core
+                  << " (pthread_setaffinity_np: " << rc
+                  << "). The run will still produce numbers, but they are "
+                     "about the scheduler as much as the system."
+                  << std::endl;
+        return false;
+    }
+    return true;
+}
+
 int main(int argc, char** argv) {
     ds::ProcId proc_id = 0;
     bool show_help = false;
@@ -481,6 +513,24 @@ int main(int argc, char** argv) {
     bool run_ml_workload = false;
     bool run_selftest = false;
     uint64_t think_time = 0;
+
+    // ─── CLIENT THREADS PER PROCESS ───────────────────────────────────────
+    //
+    // 1 reproduces today's arrangement exactly: one client per process, one
+    // NodeCache per process, so 64 clients keep 64 directories. Above 1 this
+    // process hosts that many client threads and they SHARE one NodeCache, so
+    // 8 nodes x 8 threads keep 8 directories instead of 64.
+    //
+    // THE STRIDE IS NOT COSMETIC. run.sh maps client c to machine
+    // (FIRST_CLIENT + (c-1) % CLIENT_MACHINES), so the clients co-located on a
+    // node are strided by CLIENT_MACHINES -- w4 hosts 1, 9, 17, ... and NOT
+    // 1..8. That numbering has to be preserved, because client_idx drives both
+    // the per-client arena stripes (node_alloc, vec_alloc) and the quorum
+    // rotation (quorum_indices). Renumbering a node's clients contiguously
+    // would change which server each one reads first and which arena stripe it
+    // writes, and the comparison would then confound cache sharing with both.
+    int64_t client_threads = 1;
+    int64_t thread_stride = 1;
 
     // -1 means "not given". The guard below must distinguish a contradictory
     // EXPLICIT request (--cache-walk 1 --cache 0, which is a mistake worth
@@ -628,6 +678,17 @@ int main(int argc, char** argv) {
             "operation avoids: repairing on a recovered hop leaves the shared "
             "directory fresher, so each path also cuts the OTHER path's "
             "traversals. 0 restores the previous behaviour.") |
+        lyra::opt(client_threads, "client_threads").optional()["--threads"](
+            "Client THREADS this process hosts, sharing one per-node cache "
+            "(default 1, which is one client per process and one cache per "
+            "client -- today's arrangement). Thread t takes proc id "
+            "(-i) + t * --thread-stride and is pinned to physical core t.") |
+        lyra::opt(thread_stride, "thread_stride").optional()["--thread-stride"](
+            "Proc-id distance between the client threads this process hosts "
+            "(default 1). Must be the number of CLIENT MACHINES, because "
+            "run.sh strides co-located clients by that: preserving the exact "
+            "proc ids keeps each client's arena stripe and quorum rotation "
+            "identical, so only the cache sharing differs.") |
         lyra::opt(put_hint_hops_arg, "put_hint_hops").optional()["--put-hint-hops"](
             "Hop budget for the WRITE path alone. Defaults to whatever "
             "--hint-hops is, which is the shipped behaviour -- both paths "
@@ -803,6 +864,25 @@ int main(int argc, char** argv) {
     // It would run, fall back to the serial walk on every range, and report a
     // number labelled --cache-walk that measures the thing --cache-walk exists
     // to replace.
+    if (client_threads < 1 || client_threads > 64) {
+        std::cerr << "--threads must be 1..64, got " << client_threads
+                  << std::endl;
+        return 1;
+    }
+    if (thread_stride < 1) {
+        std::cerr << "--thread-stride must be >= 1, got " << thread_stride
+                  << std::endl;
+        return 1;
+    }
+    if (client_threads > 1) {
+        // Say it out loud: a run that shares a cache is not comparable with one
+        // that does not, and the whole point is to tell them apart.
+        std::cerr << "NOTE: hosting " << client_threads
+                  << " client threads in this process, proc ids "
+                  << proc_id << " step " << thread_stride
+                  << ", sharing ONE per-node cache." << std::endl;
+    }
+
     bool const cache_walk_explicit = cache_walk_arg >= 0;
     if (cache_walk_explicit) layout.cache_walk = cache_walk_arg != 0;
 
@@ -1046,7 +1126,18 @@ int main(int argc, char** argv) {
     ce.unannounceReady(store, "qp", "prepared");
 
     if (is_client) {
+        // ONE CACHE PER NODE, not per client. Constructed outside the client so
+        // that when this process hosts several client THREADS they all consult
+        // and repair the same directory -- which is what the cache was written
+        // for, and what eight separate processes on a node were throwing away.
+        // At one client per process this is exactly today's arrangement, which
+        // is what makes the split verifiable before any threads exist.
+#if DS_CACHE_ENABLED
+        ds::NodeCache node_cache{layout.cache_layers};
+        ds::DsClient client{layout, ce, proc_id, node_cache};
+#else
         ds::DsClient client{layout, ce, proc_id};
+#endif
         ds::DsState& state = client.getState();
 
         // ─── Bootstrap the skip vector ─────────────────────────────

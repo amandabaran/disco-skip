@@ -22,6 +22,52 @@ namespace ds {
 using timepoint = std::chrono::steady_clock::time_point;
 using duration  = std::chrono::steady_clock::duration;
 
+#if DS_CACHE_ENABLED
+/// The compute-local skip-vector cache, owned ONE PER NODE rather than one per
+/// client.
+///
+/// WHY THIS IS A SEPARATE OBJECT. It used to be two members of DsState, which
+/// is per-client, so eight clients on a node kept eight independent
+/// directories and learned nothing from each other -- while the cache is
+/// written for concurrent use: sv_lock is a sequence lock, begin_read() is one
+/// plain load and confirm_read() an acquire fence plus a compare, and the read
+/// path takes no mutex at all. We were paying that design's cost and taking
+/// none of its benefit.
+///
+/// Declaration order is load-bearing and was already: SkipVec's constructor
+/// reads cfg->layers and cfg->merge_threshold, so the config must be declared
+/// before it and already populated -- hence the static factory rather than
+/// assigning fields in a constructor body.
+///
+/// Nothing else moved here. Queue pairs, buffers, allocators, hints and
+/// counters all stay per-client, because sharing queue pairs would mean
+/// locking them and ds_rdma_async.hpp already notes a per-queue-pair spinlock
+/// costing real CPU. Keeping the RDMA path per-thread means a difference in
+/// the results is attributable to the shared directory rather than to new
+/// contention, which is the only reason the comparison is worth running.
+class NodeCache {
+public:
+    explicit NodeCache(uint64_t layers)
+        : cfg_{makeCacheConfig(layers)}, sv_{&cfg_} {}
+
+    NodeCache(NodeCache const &) = delete;
+    NodeCache &operator=(NodeCache const &) = delete;
+
+    [[nodiscard]] SkipVec &sv() { return sv_; }
+
+private:
+    static config makeCacheConfig(uint64_t layers) {
+        config c("disco-skip", "compute-local skip-vector cache", {"normal"}, "");
+        c.merge_threshold = 1.0;
+        c.layers = static_cast<int>(layers);
+        return c;
+    }
+
+    config cfg_;
+    SkipVec sv_;
+};
+#endif
+
 class DsState {
 public:
     Layout layout;
@@ -67,34 +113,28 @@ public:
     #endif
 
 #if DS_CACHE_ENABLED
-    // ─── The compute-local skip-vector cache ───────────────────────────
+    // ─── The compute-local skip-vector cache, SHARED PER NODE ──────────
     //
-    // One per process. Declaration order matters: SkipVec's constructor reads
-    // cfg->layers and cfg->merge_threshold, so the config must be a member
-    // declared before it, and it must already be populated -- hence the
-    // static factory rather than assigning fields in the ctor body.
-    config cache_cfg;
-    SkipVec cache_sv;
-
-    static config makeCacheConfig(uint64_t layers) {
-        config c("disco-skip", "compute-local skip-vector cache", {"normal"}, "");
-        c.merge_threshold = 1.0;
-        c.layers = static_cast<int>(layers);
-        return c;
-    }
+    // A reference, not a member: see NodeCache above. Every client on this
+    // node consults and repairs the same directory, so a split one of them
+    // observes is a repair all of them see.
+    SkipVec &cache_sv;
 #endif
 
     DsState(Layout _layout,
                  dory::conn::RcConnectionExchanger<ProcId>& rcx,
-                 ProcId _proc_id)
+                 ProcId _proc_id
+        #if DS_CACHE_ENABLED
+                 , NodeCache &node_cache
+        #endif
+                 )
         : layout{_layout},
           proc_id{_proc_id}
         #if DS_REG_CACHE_ENABLED
           ,cache{_layout.num_registers}
         #endif
         #if DS_CACHE_ENABLED
-          ,cache_cfg{makeCacheConfig(_layout.cache_layers)}
-          ,cache_sv{&cache_cfg}
+          ,cache_sv{node_cache.sv()}
         #endif
     {
         // 1. Compute client_idx explicitly from incoming parameter block to avoid initialization-order bugs

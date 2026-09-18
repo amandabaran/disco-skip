@@ -53,10 +53,20 @@ private:
     std::vector<RangeFuture> range_futures;
     std::vector<bool> range_progress;
 public:
+    // The shared per-node cache is passed in rather than owned, so every client
+    // thread on this node consults and repairs ONE directory. See NodeCache.
     DsClient(Layout layout,
               dory::conn::RcConnectionExchanger<ProcId>& rcx,
-              ProcId proc_id)
+              ProcId proc_id
+#if DS_CACHE_ENABLED
+              , NodeCache &node_cache
+#endif
+              )
+#if DS_CACHE_ENABLED
+    : state{layout, rcx, proc_id, node_cache}
+#else
     : state{layout, rcx, proc_id}
+#endif
 #if DS_CACHE_ENABLED
     , cache{state.cache_sv,
             static_cast<uint32_t>(state.layout.cache_layers),
