@@ -70,14 +70,16 @@ struct Layout {
     // is flat across client counts. Two other explanations were tested and
     // eliminated: --ts clock measured identically, so it is not the timestamp
     // counter, and n=1 replica measured identically on a fraction of the
-    // physical reads, so it is not bandwidth. What is left is the serial chain, and the cache already holds
-    // every address it walks -- including the capacity-split orphans a remote
-    // index node does not name, which is why the index-sourced --batched-walk
-    // lost at every scan length.
+    // physical reads, so it is not bandwidth. What is left is the serial chain,
+    // and the cache already holds every address it walks -- including the
+    // capacity-split orphans a remote index node does not name, which is why
+    // the index-sourced --batched-walk lost at every scan length.
     //
-    // Requires the cache to be compiled in and consulted. Default off, with the
-    // serial walk as the reference: range_test.cc pins them to byte-identical
-    // results over both a quiescent and a 400-put-stale cache.
+    // Requires the cache to be compiled in and consulted. DEFAULT ON as of the
+    // sizing fix in fillFromCache; the serial walk remains the reference, and
+    // range_test.cc pins the two to byte-identical results over both a
+    // quiescent and a deliberately stale cache, so correctness does not depend
+    // on which one runs. --cache-walk 0 restores the serial walk.
     bool cache_walk;
     /// Spread VECTOR reads across the replicas that agree, instead of always
     /// taking the first. See resolveWalkHeader in ds_rdma_async.hpp.

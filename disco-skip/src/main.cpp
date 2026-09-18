@@ -412,7 +412,24 @@ int main(int argc, char** argv) {
     // restores it.
     layout.offset_hint       = false;
     layout.batched_walk      = false;
-    layout.cache_walk        = false;
+    // ON BY DEFAULT. A range used to walk next_id one node per DEPENDENT round
+    // trip; taking the backbone from the local directory batches header and
+    // vector fetches for several nodes at once, which collapses the per-node
+    // speculative vector read that dominated a long scan.
+    //
+    // IT LOST TWICE BEFORE, BOTH TIMES ON SIZING, NOT ON THE IDEA. It asked by
+    // `hi`, which OpScan leaves unbounded, so the directory returned its full
+    // width and the batch fetched several times the nodes a scan uses; then it
+    // asked by kNodeCapacity, which assumes full nodes, so it was handed about
+    // half what it needed and refilled repeatedly. fillFromCache now sizes by
+    // OBSERVED occupancy and by the entries still wanted, and the over-fetch
+    // that sank both attempts is gone.
+    //
+    // Inert where there are no ranges: cache_walk_ is read only by
+    // RangeOperation, so a scan-free workload cannot be affected by this.
+    // Needs the cache compiled in and consulted -- see the guard below, which
+    // refuses the combination rather than silently ignoring it.
+    layout.cache_walk        = true;
     layout.spread_reads      = false;
     layout.cas_as_write      = false;
     layout.read_quorum       = false;
@@ -464,6 +481,13 @@ int main(int argc, char** argv) {
     bool run_ml_workload = false;
     bool run_selftest = false;
     uint64_t think_time = 0;
+
+    // -1 means "not given". The guard below must distinguish a contradictory
+    // EXPLICIT request (--cache-walk 1 --cache 0, which is a mistake worth
+    // refusing) from the DEFAULT meeting --cache 0, which is an ordinary
+    // baseline arm and must still run. Before this existed, flipping the
+    // default made every `--cache 0` arm exit 1.
+    int cache_walk_arg = -1;
 
     // -1 means "not given", so the write path keeps following --hint-hops.
     // Signed because the sentinel has to be distinguishable from a real 0,
@@ -535,12 +559,14 @@ int main(int argc, char** argv) {
                 "Read each vector from replica (offset % n) rather than always "
                 "the first replica that agrees. Off by default so the two arms "
                 "stay comparable.") |
-        lyra::opt(layout.cache_walk, "cache_walk")
+        lyra::opt(cache_walk_arg, "cache_walk")
             .optional()["--cache-walk"](
                 "Take a range's backbone from the LOCAL CACHE instead of the "
                 "next_id chain, so the data-node addresses cost no round trip "
                 "and their vectors are fetched in one batch (1 or 0, default "
-                "0). Needs the cache compiled in and consulted. Unlike "
+                "1). Needs the cache compiled in and consulted; with --cache 0 "
+                "it turns itself off unless you asked for it explicitly, in "
+                "which case the contradiction is refused. Unlike "
                 "--batched-walk it also sees capacity-split orphans, which a "
                 "remote index node does not name.") |
         lyra::opt(layout.batched_walk, "batched_walk")
@@ -777,12 +803,29 @@ int main(int argc, char** argv) {
     // It would run, fall back to the serial walk on every range, and report a
     // number labelled --cache-walk that measures the thing --cache-walk exists
     // to replace.
+    bool const cache_walk_explicit = cache_walk_arg >= 0;
+    if (cache_walk_explicit) layout.cache_walk = cache_walk_arg != 0;
+
     if (layout.cache_walk && (!DS_CACHE_ENABLED || !layout.consult_cache)) {
-        std::cerr << "--cache-walk 1 requires DS_CACHE_ENABLED=1 and --cache 1: "
-                     "the backbone comes from the cache, so without one every "
-                     "range silently falls back to the serial walk"
+        if (cache_walk_explicit) {
+            // ASKED FOR, AND IMPOSSIBLE. Refuse rather than run something
+            // other than what was requested.
+            std::cerr << "--cache-walk 1 requires DS_CACHE_ENABLED=1 and "
+                         "--cache 1: the backbone comes from the cache, so "
+                         "without one every range silently falls back to the "
+                         "serial walk"
+                      << std::endl;
+            return 1;
+        }
+        // NOT ASKED FOR, JUST THE DEFAULT. A --cache 0 arm is a legitimate
+        // baseline and must still run; the walk has nothing to walk, so turn
+        // it off and say so. Refusing here would have killed every
+        // disco-skip-cache0 arm in the A-D sweeps the moment the default
+        // flipped, and the sweep would have reported CRASH-OR-BAD-ARGS.
+        layout.cache_walk = false;
+        std::cerr << "NOTE: --cache-walk defaults on but needs the cache; "
+                     "running with it OFF because this arm has --cache 0."
                   << std::endl;
-        return 1;
     }
 
     if(run_ml_workload){
