@@ -102,6 +102,27 @@ struct GetStats {
   /// Gets that spent their whole hop budget and still had to descend. These
   /// paid the hops AND the traversal, which is the losing case.
   uint64_t hops_exhausted = 0;
+  /// Directory repairs performed by a RECOVERED HOP rather than by a descent.
+  ///
+  /// THE FIX FOR WHY HOPPING LOST. Reconciliation used to happen only after a
+  /// traversal -- `reconciles` tracked `traversals` exactly in every cell of a
+  /// twelve-cell sweep -- so a hop that answered the get left the stale
+  /// directory entry in place and the next get on that key was stale again.
+  /// Staleness compounded from 16.3% to 39.4% at 8 clients, and the damage
+  /// reached the write path too: put hint rejections went 38,520 to 89,444 per
+  /// client, because writes consult the same directory.
+  ///
+  /// So the hop was winning its own bet -- 64.9 to 75.9% recovery, a measured
+  /// +6.3 to +7.2 round trips net per hop -- and losing 12% of throughput
+  /// anyway, because it skipped a repair worth more than the ~11 trips it
+  /// saved. A traversal's real product is the CACHE REPAIR, not the answer.
+  ///
+  /// Repairing on a recovered hop needs no path: mirror_reconcile's contract
+  /// documents `levels = 0` as "entry repair only" and the data routing entry
+  /// as "always safe, always useful", with a repeat call a no-op. What is given
+  /// up is the partition alignment of step 2, which genuinely needs a descent
+  /// -- a lost optimisation, not a correctness gap.
+  uint64_t hop_reconciles = 0;
   uint64_t reconciles = 0;      ///< paths fed back to the cache
   uint64_t nodes_read = 0;   ///< 64-byte header reads
   uint64_t vec_reads = 0;    ///< 320-byte vector reads

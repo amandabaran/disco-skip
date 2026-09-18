@@ -221,7 +221,24 @@ class GetOperation {
     // `1 hop, 0 recovered, 0 traversals`: a hop that plainly worked, since no
     // descent was paid, scored as a failure. That is the same inference error
     // the original hop experiment made, reproduced in its instrumentation.
-    if (hops_ != 0) ++stats_.hops_recovered;
+    if (hops_ != 0) {
+      ++stats_.hops_recovered;
+      // REPAIR THE DIRECTORY, which is the whole reason hopping used to lose.
+      // Reconciliation was a side effect of descending, so a hop that answered
+      // the get left the stale entry in place and the next get on this key
+      // paid the mismatch again -- compounding staleness 16.3% -> 39.4% at 8
+      // clients and pushing put hint rejections from 38,520 to 89,444.
+      //
+      // No path is needed and none is available: mirror_reconcile treats
+      // levels = 0 as "entry repair only", and the data routing entry is
+      // documented as always safe with a repeat call a no-op. node_.k_min is
+      // immutable once the node exists, and `hinted_` is the address we just
+      // read and confirmed covers k, so this is exactly the pair the contract
+      // asks for.
+      cache_.reconcile(node_.k_min, hinted_, nullptr, 0);
+      ++stats_.hop_reconciles;
+      ++stats_.reconciles;
+    }
     int const idx = findLte(vec_, k_);
     out_.resolved = true;
     if (idx >= 0 && vec_.keyAt(idx) == k_) {

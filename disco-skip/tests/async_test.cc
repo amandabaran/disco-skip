@@ -392,6 +392,12 @@ static void checkStaleHintUnderEveryHopBudget() {
       CHECK(st.hops_taken <= stale_at_budget_0 * budget,
             "no operation exceeds its budget");
     }
+    // EVERY RECOVERY REPAIRS, AND NOTHING ELSE DOES. Off by one in either
+    // direction is a silent throughput bug rather than a wrong answer: too few
+    // and staleness compounds exactly as it did before the fix, too many and
+    // the reconcile count stops meaning what the cluster summaries report.
+    CHECK(st.hop_reconciles == st.hops_recovered,
+          "a recovered hop repairs the directory, one for one");
     // DELIBERATELY NOT asserting hops_recovered > 0 HERE. This cache points
     // every key at kInitialDataId, so its staleness is "aimed at the head of
     // the chain", not "one split behind" -- and hopping one or two nodes
@@ -501,6 +507,14 @@ static void checkAHopRecoversAOneSplitStaleHint() {
             "and ONE HOP RECOVERS A ONE-SPLIT-STALE HINT -- the premise the "
             "whole --hint-hops idea rests on");
       CHECK(st.traversals == 0, "so no descent is paid at all");
+      // THE REPAIR, which is why hopping lost before it existed.
+      // Reconciliation used to be a side effect of DESCENDING, so a recovered
+      // hop answered the get and left the stale entry in place; staleness then
+      // compounded 16.3% -> 39.4% at 8 clients on the cluster and dragged the
+      // write path with it. Every recovery must now repair.
+      CHECK(st.hop_reconciles == 1, "and the hop REPAIRS the directory");
+      CHECK(st.reconciles == 1,
+            "counted as a reconcile, so the total no longer tracks traversals");
     }
     std::printf("  one-split stale, budget %u: %llu hops, %llu recovered, "
                 "%llu traversals\n",
