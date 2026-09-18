@@ -2,6 +2,14 @@
 
 #include <array>
 #include <algorithm>
+// fmt/format.h, NOT fmt/core.h: FMT_STRING lives in format.h, and FMT_STRING
+// is what turns a bad format specifier into a COMPILE error. Without it fmt
+// checks format strings at runtime -- a `{:.1%}` here compiled clean, threw
+// fmt::format_error on the cluster, and killed every client after its stats
+// block but before its throughput line, so the sweep recorded 0 kops for a run
+// whose statistics were all present. This file has no off-cluster build, so
+// runtime-checked format strings in it are unverified until a deploy.
+#include <fmt/format.h>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -282,17 +290,17 @@ public:
         // reconstructed.
         {
             uint64_t const consulted = gstats.cache_hits + gstats.kmin_mismatch;
-            fmt::print("              {} traversals ({:.1f}% of gets), "
-                       "{} reconciles\n",
+            fmt::print(FMT_STRING("              {} traversals ({:.1f}% of gets), "
+                       "{} reconciles\n"),
                        gstats.traversals,
                        100.0 * static_cast<double>(gstats.traversals) /
                            static_cast<double>(std::max<uint64_t>(
                                1, gstats.cache_hits + gstats.traversals +
                                       gstats.not_found)),
                        gstats.reconciles);
-            fmt::print("              round trips: {} on the hint path "
+            fmt::print(FMT_STRING("              round trips: {} on the hint path "
                        "({:.2f}/consult), {} in traversals "
-                       "({:.2f}/traversal)\n",
+                       "({:.2f}/traversal)\n"),
                        gstats.rt_hint,
                        static_cast<double>(gstats.rt_hint) /
                            static_cast<double>(std::max<uint64_t>(1, consulted)),
@@ -310,12 +318,12 @@ public:
                 double const trav_rt =
                     static_cast<double>(gstats.rt_traverse) /
                     static_cast<double>(gstats.traversals);
-                fmt::print("              so a stale hint costs ~{:.2f} extra "
-                           "round trips vs ~{:.2f} for a correct one\n",
+                fmt::print(FMT_STRING("              so a stale hint costs ~{:.2f} extra "
+                           "round trips vs ~{:.2f} for a correct one\n"),
                            trav_rt, hit_rt);
             }
-            fmt::print("              {} node reads, {} vector reads, "
-                       "{} right hops (RECORDS, not trips)\n",
+            fmt::print(FMT_STRING("              {} node reads, {} vector reads, "
+                       "{} right hops (RECORDS, not trips)\n"),
                        gstats.nodes_read, gstats.vec_reads, gstats.right_hops);
             // STALENESS PER OPERATION, which is the rate the hop experiment is
             // actually about. kmin_mismatch above counts DETECTIONS and is
@@ -324,15 +332,27 @@ public:
             // is what made the previous run's staleness look 5x worse instead
             // of constant.
             if (gstats.hint_stale_ops != 0 || gstats.hops_taken != 0) {
-                fmt::print("              stale hints: {} operations "
-                           "({} detections)\n",
+                fmt::print(FMT_STRING("              stale hints: {} operations "
+                           "({} detections)\n"),
                            gstats.hint_stale_ops, gstats.kmin_mismatch);
             }
             if (gstats.hops_taken != 0) {
-                fmt::print("              sideways hops: {} taken, {} "
-                           "recovered ({:.1%}), {} budgets exhausted\n",
+                // {:.1f}% AND NOT {:.1%}. The latter is a Python format spec;
+                // fmt v7 rejects it -- and it rejects it AT RUNTIME, throwing
+                // fmt::format_error("invalid type specifier"), so it compiled
+                // clean and then killed every client that took a hop, right
+                // after this stats block and before "Local tput:". The sweep
+                // duly recorded kops_total=0.0 with nlogs=0 for a run whose
+                // per-client stats were all present and correct.
+                //
+                // This file is only exercised on the cluster -- there is no
+                // off-cluster build of it -- so a runtime-checked format string
+                // here is unverified until a deploy. Percentages are computed
+                // and printed with an explicit literal '%' for that reason.
+                fmt::print(FMT_STRING("              sideways hops: {} taken, {} "
+                           "recovered ({:.1f}%), {} budgets exhausted\n"),
                            gstats.hops_taken, gstats.hops_recovered,
-                           static_cast<double>(gstats.hops_recovered) /
+                           100.0 * static_cast<double>(gstats.hops_recovered) /
                                static_cast<double>(
                                    std::max<uint64_t>(1, gstats.hops_taken)),
                            gstats.hops_exhausted);
@@ -348,8 +368,8 @@ public:
                 double const saved =
                     static_cast<double>(gstats.hops_recovered) * trav_rt;
                 double const spent = static_cast<double>(gstats.hops_taken);
-                fmt::print("              the bet: saved ~{:.0f} trips, spent "
-                           "{:.0f} -> {}{:.2f} net per hop\n",
+                fmt::print(FMT_STRING("              the bet: saved ~{:.0f} trips, spent "
+                           "{:.0f} -> {}{:.2f} net per hop\n"),
                            saved, spent,
                            saved >= spent ? "+" : "",
                            (saved - spent) /
@@ -400,9 +420,9 @@ public:
                     rstats.fail_hops + rstats.fail_read +
                     rstats.fail_traverse + rstats.fail_snapshot +
                     rstats.snapshot_violations;
-                fmt::print("              why: {} no majority, {} would not "
+                fmt::print(FMT_STRING("              why: {} no majority, {} would not "
                            "settle, {} version hops, {} read, {} traverse, "
-                           "{} snapshot, {} violation\n",
+                           "{} snapshot, {} violation\n"),
                            rstats.fail_no_majority, rstats.fail_settle,
                            rstats.fail_hops, rstats.fail_read,
                            rstats.fail_traverse, rstats.fail_snapshot,
@@ -413,9 +433,9 @@ public:
                 // under-report, which is the failure mode this whole block
                 // exists to remove.
                 if (attributed != rstats.failures) {
-                    fmt::print("              *** {} of {} failures "
+                    fmt::print(FMT_STRING("              *** {} of {} failures "
                                "UNATTRIBUTED -- a done(false) exit is missing "
-                               "its counter\n",
+                               "its counter\n"),
                                rstats.failures - attributed, rstats.failures);
                 }
             }
