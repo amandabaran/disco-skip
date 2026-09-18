@@ -277,10 +277,11 @@ struct StaleHintCache {
 /// round trips and nothing else -- never a wrong answer, never a hang.
 ///
 /// This test outlived the optimisation it was written for -- a sideways-hop
-/// recovery on mismatch -- and that optimisation is now BACK behind
-/// --hint-hops, default 0, because its one measurement is not conclusive: the
-/// arms were 0/2/4 so budget ONE was never tried, and the commit recording
-/// them also fixed a preload bug. See GetStats::hops_taken.
+/// recovery on mismatch -- which is now the DEFAULT (--hint-hops 1) on both
+/// the read and the write path. The earlier verdict that it "loses" was taken
+/// before a recovered hop repaired the directory; with the repair it wins at
+/// every client count measured. See GetStats::hops_taken and
+/// PutStats::hint_hops_taken.
 ///
 /// The correctness property holds however staleness is resolved, which is why
 /// checkStaleHintUnderEveryHopBudget below runs this same oracle at every
@@ -642,6 +643,116 @@ static ds::PutResult runAsyncPut(Ops &ops, Cache &cache, ds::Key k,
   return p.result();
 }
 
+/// The WRITE path recovers a one-split-stale hint by the same single hop.
+///
+/// The read path got sideways hops first, and that made the asymmetry the
+/// dominant cost in the system rather than fixing it: on the cluster at 64
+/// clients the get path fell to 503,918 full traversals while the put path
+/// still paid 3,611,238 -- 7.2x, from two paths that had been within 6% of
+/// each other when neither hopped. Every rejected write hint bought a descent.
+///
+/// Same construction as the read-path test above, so the two are comparable
+/// line for line: learn a key's data node, write until that node splits away
+/// from it, then PUT with a cache still holding the old address. Budget 0 must
+/// descend; budget 1 must recover by hopping, repair the directory, and pay no
+/// descent at all.
+///
+/// AND THE WRITE MUST LAND IN THE RIGHT NODE. A get that hops wrongly returns
+/// a wrong answer and any oracle catches it. A put that hops wrongly writes
+/// into a node that does not own the key, which covers() is supposed to
+/// prevent -- so the value is read back through a fresh traversal here rather
+/// than trusting the counters, because the counters cannot tell a correct
+/// write from a misplaced one.
+static void checkAWriteHopRecoversAOneSplitStaleHint() {
+  FakeReplicaSet set(3, kLayers);
+  ds::QuorumStats qs;
+  ds::QuorumOps<FakeReplicaSet> sops(set, qs, nullptr);
+  ds::PutStats seed_ps;
+  ds::WriteStats seed_ws;
+  ds::NullCache pcache;
+  auto put = [&](ds::Key k, ds::Value v, uint32_t h) {
+    ds::Putter<ds::QuorumOps<FakeReplicaSet>, ds::NullCache> p(
+        sops, pcache, kLayers, seed_ps, seed_ws);
+    return p.put(k, v, h).resolved;
+  };
+
+  for (ds::Key k = 100; k <= 100 + 64 * 8; k += 8) {
+    (void)put(k, static_cast<ds::Value>(k), 0);
+  }
+  ds::Key const probe = 100 + 64 * 8;
+  ds::PathStep path[kLayers];
+  ds::Traversal<ds::QuorumOps<FakeReplicaSet>> t(sops);
+  ds::TraversalResult const before = t.traverse(probe, kLayers, path);
+  CHECK(before.status == ds::TraversalStatus::Ok, "the probe routes");
+  ds::RemoteAddr const old_addr = before.data_addr;
+
+  for (int i = 0; i < 400; ++i) {
+    (void)put(static_cast<ds::Key>(100 + i * 3),
+              static_cast<ds::Value>(100 + i * 3), 0);
+    ds::TraversalResult const now = t.traverse(probe, kLayers, path);
+    if (now.status == ds::TraversalStatus::Ok && now.data_addr != old_addr) break;
+  }
+  ds::TraversalResult const after = t.traverse(probe, kLayers, path);
+  CHECK(after.status == ds::TraversalStatus::Ok, "the probe still routes");
+  CHECK(after.data_addr != old_addr,
+        "the node holding the probe really did move -- otherwise this test "
+        "asserts nothing");
+  if (after.data_addr == old_addr) return;
+
+  PinnedCache pinned;
+  pinned.addr = old_addr;              // the stale hint, one split behind
+  for (uint32_t budget : {0u, 1u}) {
+    ds::PutStats ps;
+    ds::WriteStats ws;
+    ds::GetStats gs;
+    FakeAsyncOps aops(set, qs, nullptr);
+    aops.setHintHops(budget);
+    // A distinct value per budget, so the read-back cannot pass on a stale
+    // value left by the other arm.
+    ds::Value const want = static_cast<ds::Value>(900000u + budget);
+    ds::PutResult const r = runAsyncPut(aops, pinned, probe, want, 0, ps, ws);
+    CHECK(r.resolved, "the write resolves despite the stale hint");
+    CHECK(ps.hinted_writes == 1, "it took the hint");
+    CHECK(ps.hint_rejected == 1, "and the hint was detected as stale");
+
+    if (budget == 0) {
+      CHECK(ps.hint_hops_taken == 0, "budget 0 takes no write hops");
+      CHECK(ps.traversals >= 1, "so it pays a full descent");
+      CHECK(ps.hop_reconciles == 0, "and repairs nothing by hopping");
+    } else {
+      CHECK(ps.hint_hops_taken == 1, "budget 1 hops exactly once");
+      CHECK(ps.hint_hops_recovered == 1,
+            "and ONE HOP RECOVERS A ONE-SPLIT-STALE WRITE HINT -- the premise "
+            "the write-side budget rests on");
+      CHECK(ps.traversals == 0, "so no descent is paid at all");
+      CHECK(ps.hint_hops_exhausted == 0, "and no budget was wasted");
+      // THE REPAIR. Identical reasoning to the read path: a recovery that
+      // skips the descent also skips the reconciliation that descending used
+      // to perform, so without this the stale entry survives and the next
+      // operation on this key pays the same mismatch again.
+      CHECK(ps.hop_reconciles == ps.hint_hops_recovered,
+            "and every recovered write hop repairs the directory, one for one");
+    }
+
+    // THE WRITE LANDED WHERE THE KEY LIVES, checked through a fresh traversal
+    // rather than through the hop path that is under test.
+    ds::GetStats rs;
+    FakeAsyncOps rops(set, qs, nullptr);
+    ds::NullCache nc;
+    ds::GetResult const back = runAsyncGet(rops, nc, probe, rs);
+    CHECK(back.resolved && back.found && back.value == want,
+          "and the value is readable at the key, so the hop wrote into the "
+          "node that actually owns it");
+    (void)gs;
+    std::printf("  one-split stale WRITE, budget %u: %llu hops, %llu recovered, "
+                "%llu traversals, %llu reconciles\n",
+                budget, (unsigned long long)ps.hint_hops_taken,
+                (unsigned long long)ps.hint_hops_recovered,
+                (unsigned long long)ps.traversals,
+                (unsigned long long)ps.hop_reconciles);
+  }
+}
+
 /// Build the same structure twice -- once with the async put, once with the
 /// blocking one -- and require the two arenas to be structurally identical.
 ///
@@ -741,6 +852,60 @@ static void checkAsyncPutHandlesCapacityOverflow() {
   ds::PathStep path[ds::kMaxLayers];
   ds::TraversalResult const r = t.traverse(175, kLayers, path);
   CHECK(r.ok() && r.found && r.value == 4242, "and the key is readable");
+
+  // THE SAME OVERFLOW, BUT REACHED THROUGH A STALE HINT AND A HOP.
+  //
+  // This is the one flow where actInsert is re-entered inside a single
+  // attempt: onSplitFinish sets phase_ back to DataInsert and calls fetch(),
+  // so control returns to the covers() check with hops_ and from_hint_
+  // unchanged. Counting the recovery on arrival rather than once per hop chain
+  // let hint_hops_recovered exceed hint_hops_taken -- a hit rate above 100%,
+  // and the identity against hop_reconciles silently meaningless.
+  //
+  // The invariants below are cheap and hold for ANY mixture, which is the
+  // point: the one-split test proves the mechanism works, this proves the
+  // counters cannot lie about how often.
+  {
+    // PER OPERATION, NOT IN AGGREGATE, and the difference is the whole test.
+    //
+    // The aggregate form of this check -- recovered <= taken -- does NOT catch
+    // the double count: with the guard removed the totals went 16 -> 17
+    // recovered against 64 taken, and 17 <= 64 passes happily. A budget of 1
+    // bounds recoveries per OPERATION at one, so that is what has to be
+    // asserted, with a fresh PutStats per put so one operation's counters
+    // cannot hide inside another's.
+    uint64_t tot_rej = 0, tot_hops = 0, tot_rec = 0, tot_rec_fix = 0;
+    uint64_t worst_rec = 0;
+    PinnedCache stale;
+    stale.addr = ds::RemoteAddr{ds::kInitialDataId};   // one end of the chain
+    for (uint32_t i = 0; i < ds::kNodeCapacity * 2; ++i) {
+      ds::PutStats hp;
+      ds::WriteStats hw;
+      FakeAsyncOps hops_ops(set, qs, nullptr);
+      hops_ops.setHintHops(1);
+      (void)runAsyncPut(hops_ops, stale, 5000 + (i + 1) * 7,
+                        static_cast<ds::Value>(i), 0, hp, hw);
+      CHECK(hp.hint_hops_recovered <= 1,
+            "ONE operation at budget 1 recovers at most once -- a capacity "
+            "split re-enters actInsert mid-attempt, and counting on arrival "
+            "rather than once per hop chain double-counts it");
+      CHECK(hp.hint_hops_taken <= 1, "and takes at most one hop");
+      CHECK(hp.hop_reconciles == hp.hint_hops_recovered,
+            "and repairs the directory exactly once per recovery");
+      if (hp.hint_hops_recovered > worst_rec) worst_rec = hp.hint_hops_recovered;
+      tot_rej += hp.hint_rejected;
+      tot_hops += hp.hint_hops_taken;
+      tot_rec += hp.hint_hops_recovered;
+      tot_rec_fix += hp.hop_reconciles;
+    }
+    CHECK(tot_rec_fix == tot_rec, "and in aggregate too");
+    CHECK(tot_hops <= tot_rej, "a hop is only ever taken after a rejection");
+    std::printf("  hinted overflow: %llu rejected, %llu hops, %llu recovered, "
+                "%llu reconciles (max %llu recoveries in any one put)\n",
+                (unsigned long long)tot_rej, (unsigned long long)tot_hops,
+                (unsigned long long)tot_rec, (unsigned long long)tot_rec_fix,
+                (unsigned long long)worst_rec);
+  }
 }
 
 static void checkAsyncPutIsIdempotentOnARepeatedBoundary() {
@@ -957,6 +1122,7 @@ int main() {
   checkStaleHintStillResolvesOnTheAsyncPath();
   checkStaleHintUnderEveryHopBudget();
   checkAHopRecoversAOneSplitStaleHint();
+  checkAWriteHopRecoversAOneSplitStaleHint();
   checkAsyncGetAgreesWithTheBlockingGetter();
   checkAsyncGetHitsTheCacheAndRepairsIt();
   checkAsyncPutBuildsTheSameStructure();

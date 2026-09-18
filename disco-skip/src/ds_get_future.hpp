@@ -177,26 +177,20 @@ class GetOperation {
       // traversal, which is the case that makes the bet lose.
       ++stats_.hops_exhausted;
     }
-    // DO NOT "JUST HOP SIDEWAYS" HERE. It was built and measured, and it loses.
+    // The budget is spent or there is nowhere to hop: descend.
     //
-    // The idea: a k_min mismatch means the named node SPLIT, so the key is in a
-    // sibling one `next` hop away, and hopping should beat re-descending from
-    // the root. Half of that is true -- 42-54% of hops did find the node -- and
-    // it still lost at every budget, on workload A with 3 servers:
+    // An earlier version of this comment said "DO NOT just hop sideways here,
+    // it was built and measured, and it loses", with a table showing budget 2
+    // and 4 losing at 8 and 16 clients. That measurement was real but it was
+    // taken WITHOUT the directory repair in answerFromHint: a recovered hop
+    // answered the get and left the stale entry behind, so staleness
+    // compounded and the same budget that now wins was then losing 12%. With
+    // the repair, budget 1 gives +8.6 / +9.2 / +5.0 / +9.9% at 8 / 16 / 32 /
+    // 64 clients on workload A with staleness flat across the budget.
     //
-    //     clients  --hint-hops   kops   trips/op
-    //        8          0         358     6.10
-    //        8          2         321     6.72
-    //        8          4         303     7.05
-    //       16          0         405     8.01
-    //       16          2         368     8.58
-    //       16          4         366     8.76
-    //
-    // The arithmetic is why: a recovery saves a descent (~4 trips), a failure
-    // costs a trip AND still pays the descent, and ~2.4 hops were spent per
-    // mismatch. Roughly 2 trips saved against 2.4 spent -- a losing bet even at
-    // a 50% hit rate. Making staleness cheaper needs a different idea, not a
-    // bigger budget.
+    // Kept as a note rather than deleted, because the old table is the reason
+    // to distrust "we measured it and it lost" when the mechanism changed
+    // underneath the measurement.
     return beginTraversal();
   }
 

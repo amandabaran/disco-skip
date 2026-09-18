@@ -86,6 +86,8 @@ class PutOperation {
     index_ = {};
     attempts_ = 0;
     fetches_ = 0;
+    hops_ = 0;
+    hop_repaired_ = false;
 
     // ── Ask the cache where to write ──────────────────────────────────────
     //
@@ -193,6 +195,10 @@ class PutOperation {
 
   size_t beginTraversal() {
     from_hint_ = false;
+    hops_ = 0;      // the hint chain is over; a later attempt gets a fresh
+                    // budget, and the total stays bounded by fetches_
+    hop_repaired_ = false;
+
     fetches_ = 0;   // a fresh attempt gets a fresh budget; the total is still
                     // bounded by kMaxPutAttempts * kMaxFetchesPerAttempt
     if (++attempts_ > static_cast<uint32_t>(detail::kMaxPutAttempts)) {
@@ -387,6 +393,46 @@ class PutOperation {
     return done(false);
   }
 
+  /// The target does not own `key`: hop sideways if the budget allows,
+  /// otherwise descend from the head.
+  ///
+  /// The mirror of GetOperation::onStaleHint, and it exists because the write
+  /// path had no recovery at all -- every rejected hint bought a full descent.
+  ///
+  /// ONE EXTRA CONDITION THE READ PATH DOES NOT STATE. A failed covers() has
+  /// two causes: `key >= rangeEnd` means this node SPLIT and the key moved
+  /// right, which is what a hop fixes; `key < k_min` would mean the node sits
+  /// to the RIGHT of the key, where hopping right walks further away. The
+  /// second cannot arise from a cache hint -- locateData returns the entry
+  /// with the largest k_min <= k, so k >= k_min holds by construction -- but
+  /// the guard is written out because it costs one comparison and the
+  /// alternative is a silent walk to the tail if that ever stops being true.
+  size_t onRejectedTarget(Key key) {
+    bool const budget_left = hops_ < ops_.hintHops();
+    if (from_hint_ && budget_left && key >= rangeEnd(node_, vec_)) {
+      RemoteAddr const next = nextNode(node_, vec_);
+      if (!next.isNull()) {
+        ++hops_;
+        ++stats_.hint_hops_taken;
+        // Both, because data_addr_ is what PutResult reports as the node
+        // holding k and target_ is what the next fetch reads. Moving one and
+        // not the other would write to the sibling and report the parent.
+        target_ = next;
+        data_addr_ = next;
+        // Hops consume the per-attempt fetch budget, which is what keeps the
+        // chain bounded: kMaxFetchesPerAttempt is 64 against a budget of 1.
+        return fetch();
+      }
+      // No successor: this is the tail, so descending is the only option and
+      // the budget is irrelevant. Not counted as exhausted -- that bucket is
+      // for budgets actually spent.
+    } else if (from_hint_ && !budget_left && ops_.hintHops() != 0) {
+      // Paid the hops AND the descent: the case that makes the bet lose.
+      ++stats_.hint_hops_exhausted;
+    }
+    return beginTraversal();
+  }
+
   /// F1: stage a new version with the entry applied, publish it, stamp it.
   size_t actInsert() {
     Key const key = insertKey();
@@ -399,7 +445,40 @@ class PutOperation {
       // different things: misses mean a cold cache, rejections mean a stale one.
       ++wstats_.not_covered;
       if (from_hint_) ++stats_.hint_rejected;
-      return beginTraversal();
+      return onRejectedTarget(key);
+    }
+
+    // A HOP THAT LANDED. Repair the directory before writing, for exactly the
+    // reason the read path does: reconciliation used to be a side effect of
+    // DESCENDING, so a recovery that skipped the descent also skipped the
+    // repair, left the stale entry in place, and made the next operation on
+    // this key pay the same mismatch. On the read path that compounded
+    // staleness 16.3% -> 39.4% at 8 clients and turned a winning bet into a
+    // 12% loss. The write path reaches this line by the same shortcut and
+    // needs the same repair.
+    //
+    // `target_` is the address just read and confirmed to cover `key`, and
+    // node_.k_min is immutable once the node exists, so this is the pair
+    // mirror_reconcile documents as always safe -- levels = 0 means "entry
+    // repair only" and a repeat call is a no-op.
+    // ONCE PER HOP CHAIN, not once per arrival here. actInsert is RE-ENTERED
+    // within a single attempt: a full node takes a capacity split and
+    // onSplitFinish sets phase_ back to DataInsert and calls fetch(), so
+    // control returns to this line with hops_ and from_hint_ unchanged.
+    // Counting on every arrival let hint_hops_recovered exceed
+    // hint_hops_taken, which is not just a cosmetic over-count -- the hit rate
+    // is recovered/taken, so it could read above 100% and the identity against
+    // hop_reconciles would stop meaning anything.
+    //
+    // The second arrival is also not a hop recovery: after a capacity split
+    // the covering node is `created_`, and repairing the directory for THAT
+    // is the split's business (mirrorInsert and the traversal), not this
+    // shortcut's.
+    if (hops_ != 0 && !hop_repaired_) {
+      hop_repaired_ = true;
+      ++stats_.hint_hops_recovered;
+      cache_.reconcile(node_.k_min, target_, nullptr, 0);
+      ++stats_.hop_reconciles;
     }
 
     int const idx = findLte(vec_, key);
@@ -737,6 +816,8 @@ class PutOperation {
   uint32_t attempts_ = 0;  ///< unsigned: see the note in ds_async.hpp
   uint32_t fetches_ = 0;   ///< re-reads within the current attempt
 
+  uint32_t hops_ = 0;       ///< sideways hops spent on the CURRENT hint chain
+  bool hop_repaired_ = false;  ///< this hop chain's recovery is already counted
   RemoteAddr target_{}, data_addr_{}, created_{}, created_data_{}, down_{};
   RemoteAddr top_orphan_{};
   uint32_t level_ = 0;  ///< unsigned: see the note in ds_async.hpp

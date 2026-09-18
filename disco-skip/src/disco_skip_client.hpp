@@ -386,9 +386,29 @@ public:
         fmt::print("puts:         {} resolved, {} FAILED ({} height-0, {} structural)\n",
                    pstats.puts, pstats.failures, pstats.height0,
                    pstats.structural);
-        fmt::print("              {} hinted, {} hint misses, {} hint rejected\n",
+        fmt::print(FMT_STRING("              {} hinted, {} hint misses, {} hint rejected\n"),
                    pstats.hinted_writes, pstats.hint_misses,
                    pstats.hint_rejected);
+        if (pstats.hint_hops_taken != 0 || pstats.hint_hops_exhausted != 0) {
+            // Printed in the same shape as the get side's "sideways hops" line
+            // so the two paths can be compared without re-deriving anything.
+            double const rate = pstats.hint_hops_taken != 0
+                ? 100.0 * static_cast<double>(pstats.hint_hops_recovered) /
+                      static_cast<double>(pstats.hint_hops_taken)
+                : 0.0;
+            fmt::print(FMT_STRING("              write hops: {} taken, {} recovered "
+                                  "({:.1f}%), {} budgets spent\n"),
+                       pstats.hint_hops_taken, pstats.hint_hops_recovered,
+                       rate, pstats.hint_hops_exhausted);
+            // A recovered hop that does not repair the directory is exactly the
+            // bug that made hopping lose 12% on the read path, so the identity
+            // is asserted in the output rather than left to be trusted.
+            if (pstats.hop_reconciles != pstats.hint_hops_recovered) {
+                fmt::print(FMT_STRING("              *** {} recovered hops but {} "
+                                      "reconciles -- REPAIR IS MISSING\n"),
+                           pstats.hint_hops_recovered, pstats.hop_reconciles);
+            }
+        }
         if (rstats.ranges != 0) {
             fmt::print("ranges:       {} resolved, {} FAILED, {} hit the entry cap\n",
                        rstats.ranges - rstats.failures, rstats.failures,
