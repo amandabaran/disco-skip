@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 #endif
 
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <vector>
@@ -63,6 +64,66 @@ size_t pseudo_hash(const std::string& str);
 // which is what -Wmissing-declarations was reporting.
 void bootstrap_structure(ds::DsState& state);
 int run_structure_selftest(ds::DsState& state);
+
+/// The largest number of entries one scan may return, read from the YCSB
+/// workload file rather than from a flag.
+///
+/// ── WHY THIS IS DERIVED AND NOT CONFIGURED ────────────────────────────────
+///
+/// max_range does two jobs and only one of them is a choice. It sizes the
+/// registered bulk buffer -- Layout::bulkBufsSize() is
+/// num_servers * max_range * sizeof(Register), and that memory is registered
+/// before the workload is even parsed, so SOMETHING has to bound it up front.
+/// But it is also a hard cap on every scan:
+///
+///     uint64_t len = op.scan_len;
+///     if (len > layout.max_range) len = layout.max_range;
+///
+/// and the scan length is already a property of the workload file. So the flag
+/// was redundant as a control and actively harmful as a default: it was 10, and
+/// a scan-100 workload run without the flag returned 9.5 entries per range
+/// instead of ~50.5. That is not a slow run, it is a DIFFERENT WORKLOAD, and
+/// nothing in the output said so -- the only visible trace was entries per
+/// range, which nobody reads unless they already suspect it.
+///
+/// It bit oops-workloade-hot exactly that way: built with maxscanlength=100 to
+/// stress the snapshot walk, capped at 10, and the walk-coverage estimate came
+/// out 15x short of prediction for that reason alone.
+///
+/// ── WHY GREP AND NOT YCSB ─────────────────────────────────────────────────
+///
+/// The operation stream is packed by shelling out to YCSB, which happens long
+/// after the memory region is allocated. The workload file is on disk and is a
+/// Java properties file, so the one line needed is readable directly and
+/// cheaply at argument-parse time. Parsing more of it than this would be
+/// re-implementing YCSB; one integer is not.
+///
+/// @return the file's maxscanlength, or 0 if the file has none (a workload with
+///         no scans, where the buffer still needs a floor and the cap is never
+///         consulted).
+static uint64_t deriveMaxRange(std::string const &workload_path) {
+    std::ifstream f(workload_path);
+    if (!f) return 0;
+    std::string line;
+    while (std::getline(f, line)) {
+        // Properties files allow whitespace and comments; take the first
+        // uncommented maxscanlength= and stop.
+        size_t const first = line.find_first_not_of(" \t");
+        if (first == std::string::npos || line[first] == '#') continue;
+        std::string const key = "maxscanlength";
+        size_t const at = line.find(key, first);
+        if (at != first) continue;
+        size_t const eq = line.find('=', at);
+        if (eq == std::string::npos) continue;
+        try {
+            long long const v = std::stoll(line.substr(eq + 1));
+            if (v > 0) return static_cast<uint64_t>(v);
+        } catch (...) {
+            return 0;
+        }
+    }
+    return 0;
+}
 void run_ml_prog_tracker_workload(
     ds::DsClient& client,
     uint64_t global_thread_id,
@@ -324,7 +385,9 @@ int main(int argc, char** argv) {
     layout.num_servers       = 1;
     layout.async_parallelism = 1;
     layout.num_registers     = 100000;
-    layout.max_range         = 10;
+    // 0 MEANS DERIVE IT FROM THE WORKLOAD FILE. See deriveMaxRange below for
+    // why this is not simply 10 any more.
+    layout.max_range         = 0;
     layout.majority          = 0;
     layout.cache_layers      = 4;
     layout.nodes_per_client  = 1 << 16;
@@ -403,7 +466,13 @@ int main(int argc, char** argv) {
         lyra::opt(layout.num_registers, "num_registers")
             .optional()["-r"]["--regs"] |
         lyra::opt(layout.max_range, "max_range")
-            .optional()["--maxrange"] |
+            .optional()["--maxrange"](
+                "Upper bound on entries one scan may return, which also sizes "
+                "the registered bulk buffer. NORMALLY LEAVE THIS UNSET: it is "
+                "derived from the workload file's maxscanlength, and a value "
+                "below that TRUNCATES every scan. Pass it only to pin the "
+                "buffer deliberately; a pinned value smaller than the workload "
+                "asks for is refused rather than applied.") |
         lyra::opt(layout.cache_layers, "cache_layers")
             .optional()["--layers"]("Skip-vector level count, directory = 0 (default 4)") |
         lyra::opt(layout.nodes_per_client, "nodes_per_client")
@@ -663,7 +732,38 @@ int main(int argc, char** argv) {
     }
 
     if(run_ml_workload){
+        // The ML workload repurposes max_range as a CLIENT count, not a scan
+        // length, so it overrides whatever the derivation produced. Kept after
+        // the derivation rather than before it so this reads as the override
+        // it is.
         layout.max_range = layout.num_clients; 
+    } else if (layout.max_range == 0) {
+        uint64_t const derived = deriveMaxRange(workload);
+        // A workload with no maxscanlength has no scans, so the cap is never
+        // consulted -- but bulkBufsSize() still multiplies by it, and a zero
+        // would register a zero-length buffer. 10 is the historical default and
+        // is the right floor for exactly the workloads that do not care.
+        layout.max_range = derived != 0 ? derived : 10;
+        std::cout << "maxrange:     " << layout.max_range
+                  << (derived != 0 ? " (from the workload's maxscanlength)"
+                                   : " (workload has no scans; buffer floor)")
+                  << std::endl;
+    } else {
+        uint64_t const derived = deriveMaxRange(workload);
+        // A PINNED VALUE BELOW WHAT THE WORKLOAD ASKS FOR IS REFUSED, not
+        // applied. Truncating every scan produces a plausible throughput
+        // number for a workload nobody requested, and the only visible trace is
+        // entries-per-range. Same reasoning as the --ts none + scans refusal
+        // below: a configuration error should cost one line, not a void sweep.
+        if (derived != 0 && layout.max_range < derived) {
+            std::cerr << "\n*** --maxrange " << layout.max_range
+                      << " is below the workload's maxscanlength of " << derived
+                      << ".\n*** Every scan would be truncated and the run "
+                         "would measure a workload\n*** that was never asked "
+                         "for. Raise it, or leave it unset to derive it."
+                      << std::endl;
+            return 1;
+        }
     }
 
 
@@ -1093,6 +1193,38 @@ int main(int argc, char** argv) {
                 // point at which the operation mix is known: the mode is a
                 // flag, but whether the workload scans is a property of the
                 // YCSB file.
+                // THE BACKSTOP. The cap is derived from the workload file
+                // before the memory region is sized, and the refusal above
+                // compares a PINNED value against that same file -- so both
+                // rest on having read the file correctly. This checks the
+                // operations that were actually packed, which is the thing
+                // that matters and the only place it can be known exactly.
+                //
+                // Cannot be fixed by resizing here: bulkBufsSize() was
+                // registered long before this point. So it refuses, for the
+                // same reason the pinned check does -- a truncated scan
+                // measures a workload nobody asked for.
+                {
+                    uint64_t widest = 0;
+                    for (auto const &o : operations) {
+                        if (o.type == OpScan && o.scan_len > widest) {
+                            widest = o.scan_len;
+                        }
+                    }
+                    if (widest > state.layout.max_range) {
+                        std::cerr << "\n*** the packed workload contains a scan "
+                                     "of " << widest << " entries but maxrange "
+                                     "is " << state.layout.max_range
+                                  << ".\n*** Every longer scan would be "
+                                     "silently truncated. This is a harness "
+                                     "bug:\n*** the cap is derived from the "
+                                     "workload file, so the file and the packed "
+                                     "\n*** operations disagree."
+                                  << std::endl;
+                        return 1;
+                    }
+                }
+
                 if (!ds::tsStamps(state.layout.ts_mode) && n_scan > 0) {
                     std::cerr << "\n*** --ts none cannot run a workload with "
                               << "scans: " << n_scan << " of "
