@@ -10,6 +10,9 @@
 // whose statistics were all present. This file has no off-cluster build, so
 // runtime-checked format strings in it are unverified until a deploy.
 #include <fmt/format.h>
+#include <fmt/ostream.h>
+
+#include "ds_log.hpp"
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -282,11 +285,11 @@ public:
         // That mattered the moment the unbounded retry in ds_put_future.hpp was
         // bounded: without this, the fix would have converted a loud crash into
         // a quiet wrong number, which is the worse failure.
-        fmt::print("\n################ Operations:\n");
-        fmt::print("gets:         {} ok, {} not-found, {} FAILED\n",
+        fmt::print(clientOut(), "\n################ Operations:\n");
+        fmt::print(clientOut(), "gets:         {} ok, {} not-found, {} FAILED\n",
                    gstats.cache_hits + gstats.traversals, gstats.not_found,
                    gstats.failures);
-        fmt::print("              {} cache hits, {} misses, {} kmin mismatch\n",
+        fmt::print(clientOut(), "              {} cache hits, {} misses, {} kmin mismatch\n",
                    gstats.cache_hits, gstats.cache_misses, gstats.kmin_mismatch);
         // THE CACHE'S HIT RATE IS NOT THE INTERESTING NUMBER, and the line
         // above does not make that obvious. On workload A the directory almost
@@ -301,7 +304,7 @@ public:
         // reconstructed.
         {
             uint64_t const consulted = gstats.cache_hits + gstats.kmin_mismatch;
-            fmt::print(FMT_STRING("              {} traversals ({:.1f}% of gets), "
+            fmt::print(clientOut(), FMT_STRING("              {} traversals ({:.1f}% of gets), "
                        "{} reconciles\n"),
                        gstats.traversals,
                        100.0 * static_cast<double>(gstats.traversals) /
@@ -309,7 +312,7 @@ public:
                                1, gstats.cache_hits + gstats.traversals +
                                       gstats.not_found)),
                        gstats.reconciles);
-            fmt::print(FMT_STRING("              round trips: {} on the hint path "
+            fmt::print(clientOut(), FMT_STRING("              round trips: {} on the hint path "
                        "({:.2f}/consult), {} in traversals "
                        "({:.2f}/traversal)\n"),
                        gstats.rt_hint,
@@ -329,11 +332,11 @@ public:
                 double const trav_rt =
                     static_cast<double>(gstats.rt_traverse) /
                     static_cast<double>(gstats.traversals);
-                fmt::print(FMT_STRING("              so a stale hint costs ~{:.2f} extra "
+                fmt::print(clientOut(), FMT_STRING("              so a stale hint costs ~{:.2f} extra "
                            "round trips vs ~{:.2f} for a correct one\n"),
                            trav_rt, hit_rt);
             }
-            fmt::print(FMT_STRING("              {} node reads, {} vector reads, "
+            fmt::print(clientOut(), FMT_STRING("              {} node reads, {} vector reads, "
                        "{} right hops (RECORDS, not trips)\n"),
                        gstats.nodes_read, gstats.vec_reads, gstats.right_hops);
             // STALENESS PER OPERATION, which is the rate the hop experiment is
@@ -343,7 +346,7 @@ public:
             // is what made the previous run's staleness look 5x worse instead
             // of constant.
             if (gstats.hint_stale_ops != 0 || gstats.hops_taken != 0) {
-                fmt::print(FMT_STRING("              stale hints: {} operations "
+                fmt::print(clientOut(), FMT_STRING("              stale hints: {} operations "
                            "({} detections)\n"),
                            gstats.hint_stale_ops, gstats.kmin_mismatch);
             }
@@ -360,7 +363,7 @@ public:
                 // off-cluster build of it -- so a runtime-checked format string
                 // here is unverified until a deploy. Percentages are computed
                 // and printed with an explicit literal '%' for that reason.
-                fmt::print(FMT_STRING("              sideways hops: {} taken, {} "
+                fmt::print(clientOut(), FMT_STRING("              sideways hops: {} taken, {} "
                            "recovered ({:.1f}%), {} budgets exhausted\n"),
                            gstats.hops_taken, gstats.hops_recovered,
                            100.0 * static_cast<double>(gstats.hops_recovered) /
@@ -379,7 +382,7 @@ public:
                 double const saved =
                     static_cast<double>(gstats.hops_recovered) * trav_rt;
                 double const spent = static_cast<double>(gstats.hops_taken);
-                fmt::print(FMT_STRING("              the bet: saved ~{:.0f} trips, spent "
+                fmt::print(clientOut(), FMT_STRING("              the bet: saved ~{:.0f} trips, spent "
                            "{:.0f} -> {}{:.2f} net per hop\n"),
                            saved, spent,
                            saved >= spent ? "+" : "",
@@ -389,22 +392,22 @@ public:
             }
         }
         if (gstats.failures != 0) {
-            fmt::print("              gave up: {} no-majority, {} settle-stuck, "
+            fmt::print(clientOut(), "              gave up: {} no-majority, {} settle-stuck, "
                        "{} too-many-hops\n",
                        gstats.gave_up_no_majority, gstats.gave_up_settle_stuck,
                        gstats.gave_up_too_many_hops);
         }
-        fmt::print("puts:         {} resolved, {} FAILED ({} height-0, {} structural)\n",
+        fmt::print(clientOut(), "puts:         {} resolved, {} FAILED ({} height-0, {} structural)\n",
                    pstats.puts, pstats.failures, pstats.height0,
                    pstats.structural);
-        fmt::print(FMT_STRING("              {} hinted, {} hint misses, {} hint rejected\n"),
+        fmt::print(clientOut(), FMT_STRING("              {} hinted, {} hint misses, {} hint rejected\n"),
                    pstats.hinted_writes, pstats.hint_misses,
                    pstats.hint_rejected);
         // PRINTED UNCONDITIONALLY, because the budget-0 arm takes no hops and
         // would otherwise have no descent count -- leaving the comparison with
         // nothing to be measured against. pstats.traversals counts every put
         // descent, stale-hint and cold-cache alike.
-        fmt::print(FMT_STRING("              write descents: {} (traversals), "
+        fmt::print(clientOut(), FMT_STRING("              write descents: {} (traversals), "
                               "{} restarts\n"),
                    pstats.traversals, pstats.restarts);
         if (pstats.hint_hops_taken != 0 || pstats.hint_hops_exhausted != 0) {
@@ -414,7 +417,7 @@ public:
                 ? 100.0 * static_cast<double>(pstats.hint_hops_recovered) /
                       static_cast<double>(pstats.hint_hops_taken)
                 : 0.0;
-            fmt::print(FMT_STRING("              write hops: {} taken, {} recovered "
+            fmt::print(clientOut(), FMT_STRING("              write hops: {} taken, {} recovered "
                                   "({:.1f}%), {} budgets spent, {} reconciles, "
                                   "{} descents\n"),
                        pstats.hint_hops_taken, pstats.hint_hops_recovered,
@@ -424,28 +427,28 @@ public:
             // the failure that made hopping a net loss on the read path, so
             // the identity is asserted in the output rather than trusted.
             if (pstats.hop_reconciles != pstats.hint_hops_recovered) {
-                fmt::print(FMT_STRING("              *** {} recovered hops but {} "
+                fmt::print(clientOut(), FMT_STRING("              *** {} recovered hops but {} "
                                       "reconciles -- REPAIR IS MISSING\n"),
                            pstats.hint_hops_recovered, pstats.hop_reconciles);
             }
         }
         if (rstats.ranges != 0) {
-            fmt::print("ranges:       {} resolved, {} FAILED, {} hit the entry cap\n",
+            fmt::print(clientOut(), "ranges:       {} resolved, {} FAILED, {} hit the entry cap\n",
                        rstats.ranges - rstats.failures, rstats.failures,
                        rstats.capped);
-            fmt::print("              {} entries, {} nodes walked, {} skipped "
+            fmt::print(clientOut(), "              {} entries, {} nodes walked, {} skipped "
                        "(newer than the snapshot)\n",
                        rstats.entries, rstats.nodes_walked,
                        rstats.nodes_skipped);
             // The old_ver hops are a range's distinctive cost -- one round trip
             // each, chasing a linked list in remote memory -- so they are
             // reported rather than folded into vec_reads.
-            fmt::print("              {} old_ver hops, {} vector reads\n",
+            fmt::print(clientOut(), "              {} old_ver hops, {} vector reads\n",
                        rstats.versions_walked, rstats.vec_reads);
             // A10: "Finding none is a result; not looking is a gap." So it is
             // printed either way -- a zero here is the result, and its absence
             // would mean nobody looked.
-            fmt::print("              snapshot violations: {}{}\n",
+            fmt::print(clientOut(), "              snapshot violations: {}{}\n",
                        rstats.snapshot_violations,
                        rstats.snapshot_violations == 0 ? " (none)" : "  *** ");
             // WHY A RANGE GAVE UP, not merely that one did. The walk has eight
@@ -460,7 +463,7 @@ public:
                     rstats.fail_hops + rstats.fail_read +
                     rstats.fail_traverse + rstats.fail_snapshot +
                     rstats.snapshot_violations;
-                fmt::print(FMT_STRING("              why: {} no majority, {} would not "
+                fmt::print(clientOut(), FMT_STRING("              why: {} no majority, {} would not "
                            "settle, {} version hops, {} read, {} traverse, "
                            "{} snapshot, {} violation\n"),
                            rstats.fail_no_majority, rstats.fail_settle,
@@ -473,7 +476,7 @@ public:
                 // under-report, which is the failure mode this whole block
                 // exists to remove.
                 if (attributed != rstats.failures) {
-                    fmt::print(FMT_STRING("              *** {} of {} failures "
+                    fmt::print(clientOut(), FMT_STRING("              *** {} of {} failures "
                                "UNATTRIBUTED -- a done(false) exit is missing "
                                "its counter\n"),
                                rstats.failures - attributed, rstats.failures);
@@ -485,7 +488,7 @@ public:
                 // range (or a refill) that fell back to the serial chain. A
                 // cache-walk arm whose misses dominate its chains measured
                 // the serial walk with extra lookups.
-                fmt::print("              cache walk: {} chains, {} addrs "
+                fmt::print(clientOut(), "              cache walk: {} chains, {} addrs "
                            "({:.1f}/chain), {} misses, {} k_min mismatches\n",
                            rstats.cache_chains, rstats.cache_addrs,
                            rstats.cache_chains == 0
@@ -499,7 +502,7 @@ public:
                 // that settle it: nodes fetched in parallel per batch, against
                 // the serial detours it could not avoid. A fallback rate near
                 // the orphan rate means the index bought little.
-                fmt::print("              batched walk: {} batches, {} nodes/batch, "
+                fmt::print(clientOut(), "              batched walk: {} batches, {} nodes/batch, "
                            "{} fallbacks, {} misses, {} orphan detours, "
                            "{} abandoned\n",
                            rstats.batches,
@@ -516,15 +519,15 @@ public:
         // the next_id chain, so a walk that took its node list from the index
         // alone would silently skip one. Counted here because the design
         // question is "do these occur in practice", not "can they".
-        fmt::print("splits:       {} height-driven, {} capacity (ORPHANS), "
+        fmt::print(clientOut(), "splits:       {} height-driven, {} capacity (ORPHANS), "
                    "{} boundary no-ops\n",
                    wstats.splits, wstats.capacity_splits,
                    wstats.boundary_noops);
-        fmt::print("writes:       {} published, {} cas lost, {} retries, "
+        fmt::print(clientOut(), "writes:       {} published, {} cas lost, {} retries, "
                    "{} retry-budget exhausted\n",
                    wstats.published, wstats.cas_lost, wstats.retries,
                    wstats.retry_exhausted);
-        fmt::print("quorum:       {} node reads -> {} replica reads, {} re-polls\n",
+        fmt::print(clientOut(), "quorum:       {} node reads -> {} replica reads, {} re-polls\n",
                    qstats.node_reads, qstats.replica_reads,
                    qstats.read_retries);
         // ts_partial: FAA ROUNDS THAT DID NOT REACH EVERY REPLICA.
@@ -542,7 +545,7 @@ public:
         //
         // NON-ZERO HERE MEANS THE FAA LINEARIZABILITY CLAIM IS WEAKER THAN
         // STATED FOR THAT RUN, and the figure needs the caveat.
-        fmt::print("              {} partial FAA rounds (did NOT reach all "
+        fmt::print(clientOut(), "              {} partial FAA rounds (did NOT reach all "
                    "replicas){}\n",
                    qstats.ts_partial,
                    qstats.ts_partial == 0 ? " (none)" : "  *** real-time order "
@@ -552,7 +555,7 @@ public:
         // non-zero count means writes are completing without an order until a
         // reader settles them -- a liveness/latency story, not a correctness
         // one, but it must not be invisible.
-        fmt::print("              {} FAA rounds refused (short of quorum){}\n",
+        fmt::print(clientOut(), "              {} FAA rounds refused (short of quorum){}\n",
                    qstats.ts_short_of_quorum,
                    qstats.ts_short_of_quorum == 0 ? " (none)" : "  ***");
         // HELPING, which is what makes reads and ranges lock-free: a reader
@@ -568,7 +571,7 @@ public:
         // claiming a counter value, and nothing in the output would have shown
         // it. Zero here means the path is untested by this run, not that it
         // works.
-        fmt::print("              helped: {} on gets, {} on puts, {} on "
+        fmt::print(clientOut(), "              helped: {} on gets, {} on puts, {} on "
                    "ranges (pending versions settled for a stalled writer)\n",
                    gstats.helped, pstats.helped, rstats.helped);
         // SPECULATION, and specifically the L4 CHECK -- also never printed
@@ -583,7 +586,7 @@ public:
         // is here, and was invisible.
         {
             uint64_t const sp = qstats.spec_hits + qstats.spec_misses;
-            fmt::print("              speculation: {} hit / {} rejected by L4"
+            fmt::print(clientOut(), "              speculation: {} hit / {} rejected by L4"
                        " ({:.3f}) -- a rejection wastes one vector read\n",
                        qstats.spec_hits, qstats.spec_misses,
                        sp == 0 ? 0.0
@@ -613,7 +616,7 @@ public:
         uint64_t const ops_resolved = (gstats.cache_hits + gstats.traversals) +
                                       pstats.puts +
                                       (rstats.ranges - rstats.failures);
-        fmt::print("              {} round trips ({:.2f} per resolved op, "
+        fmt::print(clientOut(), "              {} round trips ({:.2f} per resolved op, "
                    "over {} gets+puts+ranges)\n",
                    qstats.round_trips,
                    ops_resolved == 0
@@ -621,15 +624,15 @@ public:
                        : static_cast<double>(qstats.round_trips) /
                              static_cast<double>(ops_resolved),
                    ops_resolved);
-        fmt::print("              {} stale votes, {} tag ties, {} writebacks\n",
+        fmt::print(clientOut(), "              {} stale votes, {} tag ties, {} writebacks\n",
                    qstats.stale_votes, qstats.tag_ties, qstats.writebacks);
         // The L2 read repair. Printed unconditionally because "did the repair
         // fire?" was otherwise only inferable from failures going to zero
         // between two runs -- a correlation, not evidence.
-        fmt::print("              {} L2 read repairs, {} reached majority\n",
+        fmt::print(clientOut(), "              {} L2 read repairs, {} reached majority\n",
                    qstats.repairs, qstats.repairs_landed);
         if (pstats.failures != 0 || gstats.failures != 0) {
-            fmt::print("*** {} put and {} get operations DID NOT RESOLVE. The "
+            fmt::print(clientOut(), "*** {} put and {} get operations DID NOT RESOLVE. The "
                        "throughput above counts them as completed, so it "
                        "OVERSTATES useful work. ***\n",
                        pstats.failures, gstats.failures);

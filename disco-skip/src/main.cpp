@@ -6,6 +6,8 @@
 #include <pthread.h>
 #include <sched.h>
 #include <thread>
+
+#include "ds_log.hpp"
 #include <iostream>
 #include <memory>
 #include <vector>
@@ -1182,13 +1184,13 @@ int main(int argc, char** argv) {
             ce.waitReadyAll(store, "qp", "finished");
             ce.unannounceReady(store, "qp", "initialized");
             ce.unannounceReady(store, "qp", "connected");
-            std::cout << "###DONE###" << std::endl;
+            ds::clientOut() << "###DONE###" << std::endl;
             return rc;
         }
 
         // SWARM PATTERN: First client triggers initial data loading phase
         if (proc_id == (layout.num_servers + 1)) {
-            std::cout << "Querying YCSB for the set of initial key-pairs... " << std::flush;
+            ds::clientOut() << "Querying YCSB for the set of initial key-pairs... " << std::flush;
             std::vector<std::pair<std::string, std::string>> inserts = {};
 
             {
@@ -1210,9 +1212,9 @@ int main(int argc, char** argv) {
                     inserts.emplace_back(key, value);
                 }
             }
-            std::cout << "Done." << std::endl;
+            ds::clientOut() << "Done." << std::endl;
 
-            std::cout << "Inserting the initial key-pairs... " << std::flush;
+            ds::clientOut() << "Inserting the initial key-pairs... " << std::flush;
             // Same seed rule as the measured phase: reproducible per client,
             // and different between clients so two do not make an identical
             // structural decision for the same key.
@@ -1251,7 +1253,7 @@ int main(int argc, char** argv) {
                 
                 // Extract numerical representation of key string for the register mapping
                 uint64_t target_reg = std::stoull(inserts[kvIndex].first.substr(4)) % layout.num_registers;
-                // std::cout << "Inserting register: " << target_reg << std::endl;
+                // ds::clientOut() << "Inserting register: " << target_reg << std::endl;
                 // Population, so heights are drawn: this is what builds the
                 // index the measured phase then traverses. A populated
                 // structure with no index would measure a linked list.
@@ -1260,7 +1262,7 @@ int main(int argc, char** argv) {
                 client.getFreeFuture().doPut(target_reg, 69, ph, false);
             }
             client.finishAllFutures();
-            std::cout << " Done." << std::endl;
+            ds::clientOut() << " Done." << std::endl;
         }
 
         if (run_ml_workload) {
@@ -1268,7 +1270,7 @@ int main(int argc, char** argv) {
             // sequence. If this is client #1 (proc_id == num_servers + 1), it becomes ID 0 (Tracker).
             uint64_t global_thread_id = proc_id - layout.num_servers - 1;
 
-            std::cout << "Running single-threaded ML tracker workload. ID=" << global_thread_id  << "Registers=" << layout.num_registers << "Clients=" << layout.num_clients << std::endl;
+            ds::clientOut() << "Running single-threaded ML tracker workload. ID=" << global_thread_id  << "Registers=" << layout.num_registers << "Clients=" << layout.num_clients << std::endl;
             
             // Sync with cluster deployment infrastructure
             ce.announceReady(store, "qp", "initialized");
@@ -1283,10 +1285,10 @@ int main(int argc, char** argv) {
             ce.unannounceReady(store, "qp", "initialized");
         } 
         else {
-            std::cout << "Configuring Client " << proc_id << std::endl;
+            ds::clientOut() << "Configuring Client " << proc_id << std::endl;
             
             // SWARM PATTERN: Load continuous execution operations
-            std::cout << "Querying YCSB for the list of operations... " << std::flush;
+            ds::clientOut() << "Querying YCSB for the list of operations... " << std::flush;
 
             {
                 auto fp = exec(ycsb_path + " run basic -P " + workload + " -s 2> /dev/null");
@@ -1379,7 +1381,7 @@ int main(int argc, char** argv) {
                         case OpInsert: ++n_ins;  break;
                     }
                 }
-                std::cout << "Done. Packed " << operations.size()
+                ds::clientOut() << "Done. Packed " << operations.size()
                           << " operations: " << n_get << " read, " << n_put
                           << " update, " << n_scan << " scan, " << n_ins
                           << " insert." << std::endl;
@@ -1444,12 +1446,12 @@ int main(int argc, char** argv) {
                 }
             }
 
-            std::cout << "Waiting for the initialization of other clients... " << std::flush;
+            ds::clientOut() << "Waiting for the initialization of other clients... " << std::flush;
             ce.announceReady(store, "qp", "initialized");
             ce.waitReadyAll(store, "qp", "initialized");
-            std::cout << "Done." << std::endl;
+            ds::clientOut() << "Done." << std::endl;
 
-            std::cout << "Running the benchmark (YCSB Swarm Engine)... " << std::endl;
+            ds::clientOut() << "Running the benchmark (YCSB Swarm Engine)... " << std::endl;
 
             std::chrono::steady_clock::time_point start_time;
             std::chrono::steady_clock::time_point end_time;
@@ -1596,7 +1598,7 @@ int main(int argc, char** argv) {
             }
 
             client.finishAllFutures();
-            std::cout << "Done. Results:" << std::endl;
+            ds::clientOut() << "Done. Results:" << std::endl;
 
             client.reportStats(detailed);
             // THREE DECIMALS, AND THE RESOLUTION IS THE WHOLE REASON.
@@ -1626,7 +1628,7 @@ int main(int argc, char** argv) {
                     / static_cast<double>((end_time - start_time).count()));
             fmt::print("Local duration: {}s\n", 
             static_cast<uint64_t>((end_time - start_time).count() / 1000000000));
-            std::cout << std::flush;
+            ds::clientOut() << std::flush;
             
             ce.announceReady(store, "qp", "finished");
             ce.waitReadyAll(store, "qp", "finished");
