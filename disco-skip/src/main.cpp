@@ -413,7 +413,7 @@ int main(int argc, char** argv) {
     layout.offset_hint       = false;
     layout.batched_walk      = false;
     // ON BY DEFAULT. A range used to walk next_id one node per DEPENDENT round
-    // trip; taking the backbone from the local directory batches header and
+    // trip; taking the chain from the local directory batches header and
     // vector fetches for several nodes at once, which collapses the per-node
     // speculative vector read that dominated a long scan.
     //
@@ -561,8 +561,8 @@ int main(int argc, char** argv) {
                 "stay comparable.") |
         lyra::opt(cache_walk_arg, "cache_walk")
             .optional()["--cache-walk"](
-                "Take a range's backbone from the LOCAL CACHE instead of the "
-                "next_id chain, so the data-node addresses cost no round trip "
+                "Take a range's chain of data nodes from the LOCAL CACHE "
+                "instead of walking next_id, so the addresses cost no round trip "
                 "and their vectors are fetched in one batch (1 or 0, default "
                 "1). Needs the cache compiled in and consulted; with --cache 0 "
                 "it turns itself off unless you asked for it explicitly, in "
@@ -571,8 +571,8 @@ int main(int argc, char** argv) {
                 "remote index node does not name.") |
         lyra::opt(layout.batched_walk, "batched_walk")
             .optional()["--batched-walk"](
-                "Take a range's backbone from a level-0 index node and fetch "
-                "up to 16 data nodes per round trip instead of one (1 or 0, "
+                "Take a range's chain of data nodes from a level-0 index node "
+                "and fetch up to 16 per round trip instead of one (1 or 0, "
                 "default 0). Orphaned nodes still cost a serial detour, and "
                 "short ranges pay for the index read, so it favours long "
                 "scans.") |
@@ -811,7 +811,7 @@ int main(int argc, char** argv) {
             // ASKED FOR, AND IMPOSSIBLE. Refuse rather than run something
             // other than what was requested.
             std::cerr << "--cache-walk 1 requires DS_CACHE_ENABLED=1 and "
-                         "--cache 1: the backbone comes from the cache, so "
+                         "--cache 1: the chain comes from the cache, so "
                          "without one every range silently falls back to the "
                          "serial walk"
                       << std::endl;

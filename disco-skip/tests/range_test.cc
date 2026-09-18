@@ -19,7 +19,7 @@
 #include <random>
 #include <vector>
 
-// For the cache-sourced backbone: a real SkipVec mirroring the fake arena.
+// For the cache-sourced chain: a real SkipVec mirroring the fake arena.
 #include "ds_cache.hpp"
 
 #include "ds_get.hpp"
@@ -224,7 +224,7 @@ static ds::RangeResult runCacheRange(Ops &ops, Cache &cache, ds::Key lo,
 }
 
 static void checkCacheWalkAgreesWithTheSerialWalk() {
-  // The cache-sourced backbone: locateDataRange hands over the data-node
+  // The cache-sourced chain: locateDataRange hands over the data-node
   // addresses from LOCAL memory, so the walk issues one batched read instead of
   // ~11 dependent round trips. It is an optimisation, so it is not asserted
   // correct on its own terms -- it is pinned to the serial walk, which the
@@ -259,7 +259,7 @@ static void checkCacheWalkAgreesWithTheSerialWalk() {
   }
 
   size_t compared = 0, entries = 0;
-  uint64_t backbones = 0, addrs = 0, misses = 0, stale = 0;
+  uint64_t chains = 0, addrs = 0, misses = 0, stale = 0;
   for (int trial = 0; trial < 40; ++trial) {
     ds::Key lo = static_cast<ds::Key>(rng() % 4000);
     ds::Key hi = static_cast<ds::Key>(rng() % 4000);
@@ -285,15 +285,15 @@ static void checkCacheWalkAgreesWithTheSerialWalk() {
     CHECK(same, "the cache walk returns exactly what the serial walk did");
     if (!same) {
       std::printf("  [%llu,%llu] serial %zu vs cache %zu "
-                  "(backbones=%llu addrs=%llu stale=%llu)\n",
+                  "(chains=%llu addrs=%llu stale=%llu)\n",
                   static_cast<unsigned long long>(lo),
                   static_cast<unsigned long long>(hi), agot.size(), cgot.size(),
-                  static_cast<unsigned long long>(crs.cache_backbones),
+                  static_cast<unsigned long long>(crs.cache_chains),
                   static_cast<unsigned long long>(crs.cache_addrs),
                   static_cast<unsigned long long>(crs.cache_stale));
       break;
     }
-    backbones += crs.cache_backbones;
+    chains += crs.cache_chains;
     addrs += crs.cache_addrs;
     misses += crs.cache_misses;
     stale += crs.cache_stale;
@@ -303,14 +303,14 @@ static void checkCacheWalkAgreesWithTheSerialWalk() {
 
   std::printf("  cache walk: %zu ranges agree, %zu entries\n", compared,
               entries);
-  std::printf("  backbones %llu (%llu addrs), %llu misses, %llu stale\n",
-              static_cast<unsigned long long>(backbones),
+  std::printf("  chains %llu (%llu addrs), %llu misses, %llu stale\n",
+              static_cast<unsigned long long>(chains),
               static_cast<unsigned long long>(addrs),
               static_cast<unsigned long long>(misses),
               static_cast<unsigned long long>(stale));
   // A differential that never took the path it covers passes for the wrong
   // reason: every cache lookup could have missed and the walk been serial.
-  CHECK(backbones > 0, "and the cache actually supplied a backbone");
+  CHECK(chains > 0, "and the cache actually supplied a chain");
   CHECK(addrs > 0, "and supplied addresses");
 }
 
@@ -373,7 +373,7 @@ static void checkAsyncRangeAgreesWithTheBlockingOne() {
           runAsyncRange(aops, lo, hi, 1u << 20, ars, agot);
 
       // The batched walk is the same state machine with --batched-walk on: it
-      // takes its backbone from a level-0 index node and fetches up to K data
+      // takes its chain from a level-0 index node and fetches up to K data
       // nodes at once. It is an OPTIMISATION, so it is not asserted correct on
       // its own terms -- it is pinned to the serial path, which is pinned to the
       // blocking one. Three implementations, one answer, or the build fails.
@@ -453,8 +453,8 @@ static void checkAStaleCacheStillGivesTheRightAnswer() {
   // the node it claimed. What it misses is nodes created BETWEEN the entries it
   // holds. So the protection is not the k_min assertion in drainBatch -- that
   // cannot fire, and an earlier version of this test wrongly required it to --
-  // but the SUCCESSOR CHECK: a backbone node whose next_id is not the following
-  // backbone address has an orphan chain between them, which gets walked.
+  // but the SUCCESSOR CHECK: a chain node whose next_id is not the following
+  // chain address has an orphan chain between them, which gets walked.
   //
   // The requirement is therefore the answer itself, plus evidence that the
   // orphan path carried it.
@@ -497,7 +497,7 @@ static void checkAStaleCacheStillGivesTheRightAnswer() {
   }
 
   size_t compared = 0;
-  uint64_t stale = 0, backbones = 0, orphans = 0;
+  uint64_t stale = 0, chains = 0, orphans = 0;
   for (int trial = 0; trial < 40; ++trial) {
     ds::Key lo = static_cast<ds::Key>(rng() % 4000);
     ds::Key hi = static_cast<ds::Key>(rng() % 4000);
@@ -529,21 +529,21 @@ static void checkAStaleCacheStillGivesTheRightAnswer() {
       break;
     }
     stale += crs.cache_stale;
-    backbones += crs.cache_backbones;
+    chains += crs.cache_chains;
     orphans += crs.orphans_walked;
     ++compared;
   }
 
-  std::printf("  stale cache: %zu ranges agree, %llu backbones, "
+  std::printf("  stale cache: %zu ranges agree, %llu chains, "
               "%llu orphan detours, %llu k_min mismatches\n", compared,
-              static_cast<unsigned long long>(backbones),
+              static_cast<unsigned long long>(chains),
               static_cast<unsigned long long>(orphans),
               static_cast<unsigned long long>(stale));
   // The evidence that the stale case was actually reached: the cache supplied
-  // backbones, and the successor check had to detour around nodes it did not
+  // chains, and the successor check had to detour around nodes it did not
   // know about. Without the second, this is the previous differential with
   // extra puts.
-  CHECK(backbones > 0, "the cache supplied backbones despite being stale");
+  CHECK(chains > 0, "the cache supplied chains despite being stale");
   CHECK(orphans > 0, "and the successor check detoured around unknown nodes");
 }
 
@@ -614,7 +614,7 @@ static void checkAsyncSkipsANodeCreatedAfterTheSnapshot() {
   // And the BATCHED walk, at that same old snapshot. This is the only place the
   // batch-miss detour runs: the differential test's arena is quiescent, so no
   // node there is ever newer than T or mid-split, and batch_misses stayed 0.
-  // Here the post-snapshot split makes a backbone node unanswerable from the
+  // Here the post-snapshot split makes a chain node unanswerable from the
   // batch, which must hand off to the serial path and resume -- not drop it.
   FakeAsyncOps wops(set, qs, nullptr);
   ds::RangeStats wrs;

@@ -256,7 +256,7 @@ struct NullCache {
   /// Always a MISS, so a cache-less future falls back to the remote descent.
   /// Returning 0 is not a degenerate stub: RangeOperation::fillFromCache
   /// treats 0 as "the cache knows nothing about this range" and walks the
-  /// backbone remotely, which is exactly the no-cache behaviour.
+  /// chain remotely, which is exactly the no-cache behaviour.
   [[nodiscard]] size_t locateDataRange(Key, Key, Key *, RemoteAddr *,
                                        size_t) const {
     return 0;

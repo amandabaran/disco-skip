@@ -46,7 +46,7 @@ struct Layout {
     // for write-heavy ones, where every write moves the vector.
     bool offset_hint;
 
-    // Whether a range takes its backbone from a level-0 index node and fetches
+    // Whether a range takes its chain from a level-0 index node and fetches
     // up to kWalkFanout data nodes at once, instead of following next_id one
     // node per round trip. A scan of 100 entries costs 10.9 serial round trips
     // measured, 26.2 at scan 255, and an index node names 16 consecutive data
@@ -62,7 +62,7 @@ struct Layout {
     // so this is a throughput measurement and not an argument.
     bool batched_walk;
 
-    // Whether a range takes its backbone from the LOCAL CACHE rather than a
+    // Whether a range takes its chain from the LOCAL CACHE rather than a
     // remote index node, so the addresses cost no round trip at all.
     //
     // This is the one that addresses the measured ceiling. A range walks

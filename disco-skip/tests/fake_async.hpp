@@ -154,6 +154,13 @@ class FakeAsyncOps {
   /// message.
   [[nodiscard]] uint32_t hintHops() const { return hint_hops_; }
   void setHintHops(uint32_t n) { hint_hops_ = n; }
+  /// The write path's budget. Follows hintHops() unless pinned, mirroring
+  /// RdmaAsyncOps so a test cannot pass here and fail on the cluster.
+  [[nodiscard]] uint32_t putHintHops() const {
+    return put_hint_hops_ == kFollow ? hint_hops_ : put_hint_hops_;
+  }
+  void setPutHintHops(uint32_t n) { put_hint_hops_ = n; }
+  static constexpr uint32_t kFollow = 0xFFFFFFFFu;
 
   size_t postWalkHeaders(ds::RemoteAddr const *addrs, size_t n) {
     walk_n_ = n;
@@ -303,6 +310,7 @@ class FakeAsyncOps {
   uint64_t steal_commits_ = 0;
   uint64_t ts_counter_seen_ = 0;
   uint32_t hint_hops_ = 0;
+  uint32_t put_hint_hops_ = kFollow;
   size_t walk_n_ = 0;
   ds::RemoteAddr walk_addr_[kFanout]{};
   ds::NodeRecord walk_seen_[kFanout][8]{};

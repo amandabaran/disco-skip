@@ -469,19 +469,19 @@ public:
                                rstats.failures - attributed, rstats.failures);
                 }
             }
-            if (rstats.cache_backbones != 0 || rstats.cache_misses != 0) {
+            if (rstats.cache_chains != 0 || rstats.cache_misses != 0) {
                 // What the cache actually bought, in the terms that settle it:
-                // addresses per backbone is the batch width, and a miss is a
+                // addresses per chain is the batch width, and a miss is a
                 // range (or a refill) that fell back to the serial chain. A
-                // cache-walk arm whose misses dominate its backbones measured
+                // cache-walk arm whose misses dominate its chains measured
                 // the serial walk with extra lookups.
-                fmt::print("              cache walk: {} backbones, {} addrs "
-                           "({:.1f}/backbone), {} misses, {} k_min mismatches\n",
-                           rstats.cache_backbones, rstats.cache_addrs,
-                           rstats.cache_backbones == 0
+                fmt::print("              cache walk: {} chains, {} addrs "
+                           "({:.1f}/chain), {} misses, {} k_min mismatches\n",
+                           rstats.cache_chains, rstats.cache_addrs,
+                           rstats.cache_chains == 0
                                ? 0.0
                                : static_cast<double>(rstats.cache_addrs) /
-                                     static_cast<double>(rstats.cache_backbones),
+                                     static_cast<double>(rstats.cache_chains),
                            rstats.cache_misses, rstats.cache_stale);
             }
             if (rstats.batches != 0) {

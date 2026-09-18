@@ -169,7 +169,7 @@ struct RangeStats {
   uint64_t batch_fallbacks = 0;  ///< a contended index or node sent us serial
   uint64_t batch_misses = 0;     ///< node needed settling or an old_ver walk
   /// Ranges that gave up on batching entirely and finished serially: either no
-  /// index level existed to take a backbone from, or the walk ran off the end
+  /// index level existed to take a chain from, or the walk ran off the end
   /// of the index with nodes still to come. Distinct from batch_fallbacks,
   /// which is a CONTENDED read -- this one is structural, and without it a run
   /// that batched almost nothing still reported "0 fallbacks".
@@ -181,18 +181,18 @@ struct RangeStats {
   /// evidence that the chain check is doing something.
   uint64_t orphans_walked = 0;
 
-  // ── The cache-sourced backbone (--cache-walk) ────────────────────────────
+  // ── The cache-sourced chain (--cache-walk) ────────────────────────────
   //
   // Same batched fetch as above, but the addresses come from the LOCAL cache
   // instead of a remote index node. That removes the last round trip from the
   // dependency chain: the index-sourced version still had to read the index
   // node before it knew what to fetch, and it also could not see
   // capacity-split orphans, which the cache's directories do hold.
-  uint64_t cache_backbones = 0;   ///< ranges that got a backbone from the cache
+  uint64_t cache_chains = 0;   ///< ranges that got a chain from the cache
   uint64_t cache_addrs = 0;       ///< addresses it supplied, in total
   uint64_t cache_misses = 0;      ///< lookups that returned nothing (traversed)
   /// A cache address whose fetched node did NOT have the k_min the cache
-  /// claimed. The structure moved under us, so the backbone is abandoned and
+  /// claimed. The structure moved under us, so the chain is abandoned and
   /// the rest of the range walks the next_id chain -- which cannot skip a node.
   /// A wrong answer here would be silent, so it is counted, not assumed absent.
   uint64_t cache_stale = 0;

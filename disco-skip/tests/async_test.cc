@@ -751,6 +751,46 @@ static void checkAWriteHopRecoversAOneSplitStaleHint() {
                 (unsigned long long)ps.traversals,
                 (unsigned long long)ps.hop_reconciles);
   }
+
+  // THE ISOLATION THE CLUSTER EXPERIMENT DEPENDS ON. --hint-hops moves BOTH
+  // paths, so the write path's own contribution is only measurable by pinning
+  // one of them. If --put-hint-hops did not actually hold the write path at 0
+  // while the read path hopped, the experiment would silently measure the
+  // combined effect and attribute it to the write path.
+  {
+    ds::PutStats ps;
+    ds::WriteStats ws;
+    FakeAsyncOps aops(set, qs, nullptr);
+    aops.setHintHops(1);        // the READ path may hop
+    aops.setPutHintHops(0);     // the WRITE path may not
+    CHECK(aops.hintHops() == 1 && aops.putHintHops() == 0,
+          "the two budgets really are independent when pinned");
+    ds::PutResult const r =
+        runAsyncPut(aops, pinned, probe, static_cast<ds::Value>(4242), 0, ps, ws);
+    CHECK(r.resolved, "the write still resolves with its own budget pinned off");
+    CHECK(ps.hint_rejected == 1, "the hint was still rejected");
+    CHECK(ps.hint_hops_taken == 0,
+          "and the WRITE path took no hop, though the read budget is 1");
+    CHECK(ps.traversals >= 1, "so it descended");
+    CHECK(ps.hop_reconciles == 0, "and repaired nothing by hopping");
+    std::printf("  write budget pinned to 0 with read budget 1: %llu hops, "
+                "%llu traversals\n",
+                (unsigned long long)ps.hint_hops_taken,
+                (unsigned long long)ps.traversals);
+  }
+
+  // And the SENTINEL: unpinned, the write path follows the read budget. A
+  // default that silently disagreed with --hint-hops would ship an asymmetry
+  // nobody asked for.
+  {
+    FakeAsyncOps aops(set, qs, nullptr);
+    aops.setHintHops(3);
+    CHECK(aops.putHintHops() == 3,
+          "unpinned, the write budget FOLLOWS the read budget -- one knob, "
+          "both paths, which is the shipped configuration");
+    aops.setHintHops(0);
+    CHECK(aops.putHintHops() == 0, "including when that budget is 0");
+  }
 }
 
 /// Build the same structure twice -- once with the async put, once with the

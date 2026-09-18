@@ -382,13 +382,13 @@ class RdmaAsyncOps {
     // ONE ibv_post_send PER REPLICA, not one per node per replica.
     //
     // This used to call postSendSingle n * replicas times -- 24 verbs calls for
-    // an 8-node backbone across 3 replicas. Every ibv_post_send takes a
+    // an 8-node chain across 3 replicas. Every ibv_post_send takes a
     // per-queue-pair spinlock, and perf put pthread_spin_lock high in this
     // client's CPU on workload E: the cost scales with the NUMBER OF CALLS, not
     // with bytes or round trips. That is why batching reads into fewer round
     // trips measured flat -- it left the call count alone.
     //
-    // Chaining through wr.next posts the whole backbone for one replica in a
+    // Chaining through wr.next posts the whole chain for one replica in a
     // single call, so 24 becomes 3.
     for (size_t r = 0; r < r_count; ++r) {
       auto &rc = *conns_[r];
