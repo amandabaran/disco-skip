@@ -424,7 +424,41 @@ int main(int argc, char** argv) {
     layout.read_quorum       = false;
     layout.consult_cache     = DS_CACHE_ENABLED ? true : false;
     layout.writeback         = DS_REG_WRITEBACK_ENABLED ? true : false;
-    layout.hint_hops         = 0;
+    // ONE SIDEWAYS HOP BY DEFAULT.
+    //
+    // A k_min mismatch means the cached node SPLIT, so k is usually in the
+    // sibling one `next` hop away. Following it costs one round trip; a full
+    // descent costs ~11, measured invariantly across every cell of two
+    // twelve-cell sweeps (10.80 to 11.85, all client counts, all budgets).
+    //
+    // IT LOST 12% UNTIL THE HOP ALSO REPAIRED THE DIRECTORY. Reconciliation
+    // used to be a side effect of descending, so a recovered hop answered the
+    // get and left the stale entry in place; staleness compounded 16.3% ->
+    // 39.4% at 8 clients and dragged the write path with it. With the repair,
+    // on workload A uniform, 3 servers, --ts faa --offset-hint 0:
+    //
+    //      clients   budget 0   budget 1   budget 2   staleness (b0->b1)
+    //          8        455.3     +8.6%     +11.4%    16.3 -> 16.5%
+    //         16        598.3     +9.2%      +7.2%    21.2 -> 21.5%
+    //         32        566.1     +5.0%      +0.7%    23.6 -> 24.0%
+    //         64        462.9     +9.9%      +7.3%    24.0 -> 24.3%
+    //
+    // Budget 1 wins at 16, 32 and 64; budget 2 only at 8, and by 32 it has
+    // decayed to +0.7%. So ONE is the robust setting and is what this default
+    // is. Staleness per operation is flat across the budget in all twelve
+    // cells, which is the mechanism: the repair keeps the directory as fresh
+    // as descending did, and only then is the saved descent free.
+    //
+    // The 64-client budget-1 cell was nearly lost: run.sh called the run
+    // unresponsive and the parser ran three minutes before the clients wrote.
+    // See wait_for_logs in experiments/compare/lib.sh.
+    //
+    // MEASURED ON WORKLOAD A ONLY so far. A is the right place to measure it --
+    // write-heavy, so splits are frequent and hints go stale 16-24% of the time
+    // -- but the effect must scale with split rate, so read-mostly workloads
+    // should see less and C, which writes nothing, should see nothing. Set
+    // --hint-hops 0 to recover the previous behaviour exactly.
+    layout.hint_hops         = 1;
     layout.ts_mode           = ds::TsMode::Clock;
     layout.measure_latency   = true;
 
@@ -561,12 +595,15 @@ int main(int argc, char** argv) {
             "is legal for YCSB A-D. See ds_ts.hpp.") |
         lyra::opt(layout.hint_hops, "hint_hops").optional()["--hint-hops"](
             "Sideways `next` hops a stale cache hint may follow before giving "
-            "up and descending from the head (default 0). A k_min mismatch "
+            "up and descending from the head (default 1). A k_min mismatch "
             "means the named node SPLIT, so k is probably in the sibling one "
             "hop away: a recovery saves a ~4-trip descent, a failure costs a "
-            "trip and still pays it. Measured once at 0/2/4 and it lost -- but "
-            "budget 1 was never measured, and that commit also fixed a preload "
-            "bug, so the provenance is not clean. See GetStats::hops_taken.") |
+            "trip and still pays it, so it only pays if a RECOVERED HOP ALSO "
+            "REPAIRS THE DIRECTORY -- without that it lost 12%, because "
+            "reconciliation was a side effect of descending and staleness "
+            "compounded. With it: +8.6/+9.2/+5.0/+9.9% at 8/16/32/64 clients "
+            "on workload A, with staleness per operation flat across the "
+            "budget. 0 restores the previous behaviour.") |
         lyra::opt(run_ml_workload, "ml").optional()["--ml"] |
         lyra::opt(think_time, "think").optional()["--think"];
 
