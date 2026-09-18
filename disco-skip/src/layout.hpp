@@ -66,12 +66,11 @@ struct Layout {
     // remote index node, so the addresses cost no round trip at all.
     //
     // This is the one that addresses the measured ceiling. A range walks
-    // next_id one node per DEPENDENT round trip -- ~11 for a 100-key scan --
-    // and workload E caps at ~192 kops from 8 clients to 64 regardless. Two
-    // other explanations were tested and eliminated: --ts clock measured
-    // identically, so it is not the timestamp counter, and n=1 replica measured
-    // identically on roughly a quarter of the physical reads, so it is not
-    // bandwidth. What is left is the serial chain, and the cache already holds
+    // next_id one node per DEPENDENT round trip, and workload E's throughput
+    // is flat across client counts. Two other explanations were tested and
+    // eliminated: --ts clock measured identically, so it is not the timestamp
+    // counter, and n=1 replica measured identically on a fraction of the
+    // physical reads, so it is not bandwidth. What is left is the serial chain, and the cache already holds
     // every address it walks -- including the capacity-split orphans a remote
     // index node does not name, which is why the index-sourced --batched-walk
     // lost at every scan length.
@@ -88,6 +87,16 @@ struct Layout {
     /// shipped behaviour. See GetStats::hops_taken for the derivation and for
     /// why the previous measurement of this is not conclusive.
     uint32_t hint_hops;
+    /// The same budget for the WRITE path, and a SENTINEL so the two are not
+    /// accidentally independent in shipped runs.
+    ///
+    /// kPutHopsFollowGet means "whatever hint_hops is", which is the shipped
+    /// behaviour: one knob, both paths, symmetric. A separate value exists
+    /// only so an experiment can hold one path fixed and vary the other --
+    /// without it, changing the budget moves BOTH paths and the write path's
+    /// own contribution cannot be separated within a single run.
+    uint32_t put_hint_hops;
+    static constexpr uint32_t kPutHopsFollowGet = 0xFFFFFFFFu;
     /// DIAGNOSTIC, AND DELIBERATELY INCORRECT: issue every batch CAS as a
     /// plain 8-byte RDMA WRITE of the desired value.
     ///
@@ -552,9 +561,9 @@ class VecOffsetHint {
     /// likely to already hold the newest handle -- so it hit. Rotating the
     /// target by `offset % n` sends it to replicas that systematically lag by
     /// one chain position, and each rejection costs a wasted vector read.
-    /// Measured on workload C at 32 clients: the offset hint stayed at 0.987
-    /// either way, yet total server bytes out rose 7.1 -> 10.5 GB, which is
-    /// ~5.9 M extra vector reads and nothing else.
+    /// Measured on a read-mostly workload: the offset hint's hit rate was
+    /// unchanged either way, yet total server bytes out rose substantially,
+    /// which is extra vector reads and nothing else.
     ///
     /// So remember the replica that actually won last time and aim there. It
     /// is still spread -- vecSourceFor picks from the winners starting at

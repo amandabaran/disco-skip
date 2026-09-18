@@ -103,13 +103,14 @@ class RdmaAsyncOps {
     //
     // It was hardcoded to replica 0, and that -- not the winner selection --
     // is where the load imbalance actually lived. The offset hint runs at a
-    // 0.964 hit rate on workload E, so ~96% of vector reads are this
-    // speculative one, issued BEFORE any winner is known; the winner-based
-    // spreading in resolveWalkHeader only decides anything on a spec MISS.
+    // The speculation hits most of the time on a scan workload, so nearly
+    // all vector reads are this speculative one, issued BEFORE any winner is
+    // known; the winner-based spreading in resolveWalkHeader only decides
+    // anything on a spec MISS.
     //
-    // Measured: with only the winner path spread, w1 still carried 4.07x the
-    // bytes of w2/w3 (down from 4.68) -- just 650 MB of 11,804 MB of vector
-    // traffic moved, 5.5%, which is the miss rate and nothing more.
+    // Measured: with only the winner path spread, one server still carried
+    // several times the vector bytes of the others -- the traffic that moved
+    // was just the miss rate and nothing more.
     //
     // Same spread key as the winner path (offset % n) so a walk's consecutive
     // nodes speculate against different replicas.
@@ -132,7 +133,8 @@ class RdmaAsyncOps {
     // must agree for a handle to reach a majority. Under write contention they
     // often do not -- the code already records "under sustained write
     // contention on one key the replicas are essentially never in agreement",
-    // 76,311 failed reads on workload D at 8 clients -- and each disagreement
+    // a large number of failed reads on a write-contended workload -- and
+    // each disagreement
     // then costs a retry that asking all n would have avoided. Expect this to
     // win on read-heavy workloads and lose on write-contended ones; that is
     // why it is a toggle and not a default.
@@ -349,7 +351,7 @@ class RdmaAsyncOps {
   /// next_id, and each hop is a round trip because the next address is not
   /// known until the current node is read. Measured on workload E: 10.9 nodes
   /// per range at scan length 100, rising to 26.2 at 255 -- so the walk cost
-  /// grows linearly with scan length and caps our throughput at ~0.41x of a
+  /// grows linearly with scan length and caps our throughput at a fraction of a
   /// local LSM no matter how long the scan (measured 8 through 255; the ratio
   /// plateaus).
   ///
@@ -381,7 +383,7 @@ class RdmaAsyncOps {
     //
     // This used to call postSendSingle n * replicas times -- 24 verbs calls for
     // an 8-node backbone across 3 replicas. Every ibv_post_send takes a
-    // per-queue-pair spinlock, and perf put pthread_spin_lock at 15.9% of this
+    // per-queue-pair spinlock, and perf put pthread_spin_lock high in this
     // client's CPU on workload E: the cost scales with the NUMBER OF CALLS, not
     // with bytes or round trips. That is why batching reads into fewer round
     // trips measured flat -- it left the call count alone.
@@ -545,6 +547,13 @@ class RdmaAsyncOps {
   /// Sideways hops a stale hint may spend before descending. See
   /// Layout::hint_hops and GetStats::hops_taken.
   [[nodiscard]] uint32_t hintHops() const { return layout_.hint_hops; }
+  /// The write path's budget, which FOLLOWS hintHops() unless pinned. See
+  /// Layout::put_hint_hops for why the sentinel exists.
+  [[nodiscard]] uint32_t putHintHops() const {
+    return layout_.put_hint_hops == Layout::kPutHopsFollowGet
+               ? layout_.hint_hops
+               : layout_.put_hint_hops;
+  }
 
   /// ── Snapshot acquisition ───────────────────────────────────────────────
   ///
@@ -605,7 +614,8 @@ class RdmaAsyncOps {
   /// essentially never in agreement: each write CASes them in a chain, so a
   /// reader sampling all three lands mid-flight, and re-polling does not help
   /// because the next write is already arriving. Workload D at 8 clients failed
-  /// 76,311 reads this way, every single one of them here and none at any other
+  /// a large number of reads this way, every single one of them here and none
+  /// at any other
   /// guard.
   ///
   /// WHY MAX-RAW AND NOT MAX-TAG. tag() is (struct_ver, content_ver) and is NOT

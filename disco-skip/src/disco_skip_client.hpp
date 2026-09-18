@@ -105,8 +105,8 @@ public:
             // size() as both the input capacity and the output count, so it
             // shrinks to the number polled and has to be regrown before the
             // next tick -- and std::vector::resize value-initialises, zeroing
-            // 48-byte ibv_wc structs on every poll of every server. perf put
-            // _M_default_append at 9.6% of this client's CPU on workload E.
+            // 48-byte ibv_wc structs on every poll of every server, which perf
+            // showed as a material share of this client's CPU.
             int const want = tp < static_cast<int64_t>(kWcBufMax)
                                  ? static_cast<int>(tp)
                                  : static_cast<int>(kWcBufMax);
@@ -179,12 +179,13 @@ public:
     SvFuture<ClientCache>& getFreeFuture() {
         // ROUND-ROBIN, not restart-from-zero.
         //
-        // perf put this at 13.0% of client CPU on workload E, with tickRdma at
-        // a further 12.3%. Most of that is the WAIT itself: when every future is
+        // perf attributes a large share of client CPU to this loop and to
+        // tickRdma. Most of that is the WAIT itself: when every future is
         // awaiting completions the loop spins, and spinning is how an RDMA
-        // client waits -- there is nothing else for it to do. So this is not a
-        // 13% saving, and the real reductions are elsewhere (the completion
-        // buffer, and chaining work requests so fewer verbs calls are made).
+        // client waits -- there is nothing else for it to do. So it is not a
+        // saving of that size, and the real reductions are elsewhere (the
+        // completion buffer, and chaining work requests so fewer verbs calls
+        // are made).
         //
         // What it does remove is the redundant re-scan: starting at 0 every
         // iteration re-tests the same busy futures before reaching the one that
@@ -389,6 +390,13 @@ public:
         fmt::print(FMT_STRING("              {} hinted, {} hint misses, {} hint rejected\n"),
                    pstats.hinted_writes, pstats.hint_misses,
                    pstats.hint_rejected);
+        // PRINTED UNCONDITIONALLY, because the budget-0 arm takes no hops and
+        // would otherwise have no descent count -- leaving the comparison with
+        // nothing to be measured against. pstats.traversals counts every put
+        // descent, stale-hint and cold-cache alike.
+        fmt::print(FMT_STRING("              write descents: {} (traversals), "
+                              "{} restarts\n"),
+                   pstats.traversals, pstats.restarts);
         if (pstats.hint_hops_taken != 0 || pstats.hint_hops_exhausted != 0) {
             // Printed in the same shape as the get side's "sideways hops" line
             // so the two paths can be compared without re-deriving anything.
@@ -397,12 +405,14 @@ public:
                       static_cast<double>(pstats.hint_hops_taken)
                 : 0.0;
             fmt::print(FMT_STRING("              write hops: {} taken, {} recovered "
-                                  "({:.1f}%), {} budgets spent\n"),
+                                  "({:.1f}%), {} budgets spent, {} reconciles, "
+                                  "{} descents\n"),
                        pstats.hint_hops_taken, pstats.hint_hops_recovered,
-                       rate, pstats.hint_hops_exhausted);
-            // A recovered hop that does not repair the directory is exactly the
-            // bug that made hopping lose 12% on the read path, so the identity
-            // is asserted in the output rather than left to be trusted.
+                       rate, pstats.hint_hops_exhausted,
+                       pstats.hop_reconciles, pstats.traversals);
+            // A recovered hop that does not repair the directory is exactly
+            // the failure that made hopping a net loss on the read path, so
+            // the identity is asserted in the output rather than trusted.
             if (pstats.hop_reconciles != pstats.hint_hops_recovered) {
                 fmt::print(FMT_STRING("              *** {} recovered hops but {} "
                                       "reconciles -- REPAIR IS MISSING\n"),
@@ -430,8 +440,8 @@ public:
                        rstats.snapshot_violations == 0 ? " (none)" : "  *** ");
             // WHY A RANGE GAVE UP, not merely that one did. The walk has eight
             // done(false) exits and `failures` alone cannot tell them apart:
-            // a hot scan run failed 4 of 1,119,888 ranges with 0 violations
-            // and no refused FAA round, and there was no way to name the cause
+            // a hot scan run failed a handful of ranges with no violations and
+            // no refused FAA round, and there was no way to name the cause
             // without guessing. Printed only when something failed, so a clean
             // run does not gain a line of zeros.
             if (rstats.failures != 0) {
@@ -557,10 +567,10 @@ public:
         // The offset hint's own hit rate is reported above and answers a
         // DIFFERENT question: was the guessed OFFSET right. This one answers
         // whether the replica the speculation was issued to turned out to hold
-        // the winning handle, because L4 accepts the bytes only then. On
-        // workload C at 32 clients the offset hint read 0.987 with and without
-        // spreading while server bytes out went 7.1 -> 10.5 GB: the whole
-        // difference was here, and invisible.
+        // the winning handle, because L4 accepts the bytes only then. On a
+        // read-mostly workload the offset hint reads the same with and without
+        // spreading while server bytes out rise sharply: the whole difference
+        // is here, and was invisible.
         {
             uint64_t const sp = qstats.spec_hits + qstats.spec_misses;
             fmt::print("              speculation: {} hit / {} rejected by L4"
@@ -573,17 +583,18 @@ public:
         // ROUND TRIPS PER OPERATION -- the comparison that explains a slow
         // workload. A point get is 1-2; a scan-100 walks ~10.9 data nodes, so
         // it is one per node unless the batched or cache walk collapses them.
-        // At a measured ~3.7 us per round trip, trips/op times 3.7 should
-        // account for the operation's latency; where it does not, the cost is
-        // NOT round trips and looking for it there is wasted effort.
+        // Multiplied by the per-trip service time, trips/op should account
+        // for the operation's latency; where it does not, the cost is NOT
+        // round trips and looking for it there is wasted effort.
         // THE DENOMINATOR IS THE WHOLE POINT OF THIS LINE, AND IT WAS WRONG.
         //
         // It used gstats.traversals, which is NOT the number of gets -- it
-        // counts gets the cache could NOT answer, so it is a small fraction of
-        // them. On workload C at -I 1200000 that was 101,914 against 2,450,000
-        // actual gets, and the printed ratio came out 31.34 round trips per
-        // "op" when the truth is 1.30. A ratio computed over 4% of the
-        // operations is worse than no ratio, because it looks like a finding.
+        // counts gets the cache could NOT answer, so it is a small fraction
+        // of them. On a read-mostly workload that denominator was a few
+        // percent of the actual gets, and the printed ratio came out more than
+        // an order of magnitude too high. A ratio computed over a small slice
+        // of the operations is worse than no ratio, because it looks like a
+        // finding.
         //
         // A get is counted the same way the `gets:` line above counts it:
         // cache_hits + traversals, the hits plus the ones that went remote.

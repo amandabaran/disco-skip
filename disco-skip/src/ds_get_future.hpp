@@ -179,18 +179,11 @@ class GetOperation {
     }
     // The budget is spent or there is nowhere to hop: descend.
     //
-    // An earlier version of this comment said "DO NOT just hop sideways here,
-    // it was built and measured, and it loses", with a table showing budget 2
-    // and 4 losing at 8 and 16 clients. That measurement was real but it was
-    // taken WITHOUT the directory repair in answerFromHint: a recovered hop
-    // answered the get and left the stale entry behind, so staleness
-    // compounded and the same budget that now wins was then losing 12%. With
-    // the repair, budget 1 gives +8.6 / +9.2 / +5.0 / +9.9% at 8 / 16 / 32 /
-    // 64 clients on workload A with staleness flat across the budget.
-    //
-    // Kept as a note rather than deleted, because the old table is the reason
-    // to distrust "we measured it and it lost" when the mechanism changed
-    // underneath the measurement.
+    // This used to carry a table concluding that hopping loses. It was
+    // measured WITHOUT the directory repair in answerFromHint, which is the
+    // thing that makes hopping pay -- so the verdict was overturned by
+    // changing the mechanism, not by re-reading the numbers. Worth
+    // remembering before trusting any "we measured it and it lost".
     return beginTraversal();
   }
 
@@ -220,8 +213,8 @@ class GetOperation {
       // REPAIR THE DIRECTORY, which is the whole reason hopping used to lose.
       // Reconciliation was a side effect of descending, so a hop that answered
       // the get left the stale entry in place and the next get on this key
-      // paid the mismatch again -- compounding staleness 16.3% -> 39.4% at 8
-      // clients and pushing put hint rejections from 38,520 to 89,444.
+      // paid the mismatch again -- compounding staleness and pushing the write
+      // path's hint rejections up with it.
       //
       // No path is needed and none is available: mirror_reconcile treats
       // levels = 0 as "entry repair only", and the data routing entry is
@@ -268,8 +261,9 @@ class GetOperation {
         ++stats_.not_found;
       } else {
         // Attribute it. "The operation failed" was previously all the log
-        // said, which made 61,019 failed gets on workload D at 8 clients
-        // impossible to explain -- and the three causes want different fixes:
+        // said, which made a large failed-get count on a write-contended
+        // workload impossible to explain -- and the three causes want
+        // different fixes:
         // NoMajority is quorum-read churn on a hot handle, SettleStuck is a
         // reader helping faster than writers re-dirty, TooManyHops is a
         // runaway right-walk.

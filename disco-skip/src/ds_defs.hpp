@@ -114,8 +114,8 @@ inline constexpr size_t kLevelRatio = size_t{1} << kIdxExp;
 // node boundary with probability 1/kLevelRatio, so runs of height-0 keys are
 // geometric with mean (1-p)/p ~= kLevelRatio. A ceiling of TWICE that mean
 // leaves room for the tail of the distribution, which is what keeps capacity
-// splits rare: measured 7.2:1 height-driven to capacity-driven at ratio 8
-// (17,987 against 2,505).
+// splits rare -- height-driven splits outnumber capacity-driven ones by
+// roughly an order of magnitude at ratio 8.
 //
 // SEPARATING THE TWO EXPONENTS MADE THIS BREAKABLE, hence the assert. A
 // capacity below 2 * target inverts the regime -- capacity splits become the
@@ -123,7 +123,7 @@ inline constexpr size_t kLevelRatio = size_t{1} << kIdxExp;
 // the height distribution, which is the one thing the split statistics say
 // governs it. Going the other way (capacity well above 2 * target) is merely
 // wasteful: it was measured inert, since 8x the capacity at a fixed ratio left
-// node and entry counts identical (2238 nodes, 13,927 vs 13,926 entries).
+// the node and entry counts essentially unchanged.
 static_assert(kNodeCapacity >= 2 * kLevelRatio,
               "max capacity must be at least 2 << kIdxExp, i.e. twice the "
               "target size, or capacity splits dominate and occupancy is "

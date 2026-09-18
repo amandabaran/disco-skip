@@ -42,12 +42,10 @@ struct GetStats {
   // ── WHAT A CACHE MISMATCH COSTS, which was not measurable ────────────────
   //
   // The cache's HIT RATE was already answerable and is not the interesting
-  // number. Measured on workload A at 16 clients over 3.87 M gets: 77.5% hit
-  // and were correct, 20.8% hit and were WRONG (C4 k_min mismatch, so the
-  // named node no longer covers k), and 0.0017% -- 67 gets -- missed
-  // outright. The directory almost always names a node; it names a STALE one
-  // in one get in five. So "cache miss" is the wrong thing to think about
-  // here, and the mismatch rate is the whole cost.
+  // number: the directory almost always names a node, and outright misses are
+  // negligible. What costs is naming a STALE one -- a C4 k_min mismatch, where
+  // the named node no longer covers k. So "cache miss" is the wrong thing to
+  // think about here and the mismatch rate is the whole cost.
   //
   // What that cost IS could not be stated. The client prints one pooled
   // `round trips` figure over gets, puts and ranges -- 5.81 per op on that
@@ -81,21 +79,20 @@ struct GetStats {
   // case was "~2 trips saved against ~2.4 spent", and at a budget of 1 at most
   // one can be spent. The commit that recorded those numbers ALSO fixed a
   // preload bug under which every client inserted the whole key set, and its
-  // two tables disagree about 16-client throughput (405 kops in the hop table,
-  // 303 in the preload note), so which preload the hop arms ran on cannot be
-  // established from the history.
+  // two tables disagree with each other about 16-client throughput, so which
+  // preload the hop arms ran on cannot be established from the history.
   //
   /// Gets whose hint went stale, counted ONCE PER OPERATION.
   ///
   /// THE COUNTER THE ORIGINAL TEST NEEDED AND DID NOT HAVE. kmin_mismatch
   /// counts DETECTIONS, and each failed hop lands on another node that also
-  /// fails to cover k -- which inflated it 24,232 -> 127,121 across those arms
-  /// and made the staleness rate look 5x worse instead of holding constant. So
-  /// the arms could not be compared on the quantity the experiment was about.
-  /// This one is invariant to the hop budget by construction.
+  /// fails to cover k -- so it inflates with the hop budget and made the
+  /// staleness rate look worse at higher budgets instead of holding constant.
+  /// The arms then could not be compared on the quantity the experiment was
+  /// about. This one is invariant to the hop budget by construction.
   uint64_t hint_stale_ops = 0;
   /// Sideways hops actually taken, and how many landed on a node covering k.
-  /// The ratio is the hit rate the bet turns on -- previously 42-54%, inferred
+  /// The ratio is the hit rate the bet turns on, which used to be inferred
   /// from arm-to-arm differences rather than counted.
   uint64_t hops_taken = 0;
   uint64_t hops_recovered = 0;
@@ -105,17 +102,14 @@ struct GetStats {
   /// Directory repairs performed by a RECOVERED HOP rather than by a descent.
   ///
   /// THE FIX FOR WHY HOPPING LOST. Reconciliation used to happen only after a
-  /// traversal -- `reconciles` tracked `traversals` exactly in every cell of a
-  /// twelve-cell sweep -- so a hop that answered the get left the stale
-  /// directory entry in place and the next get on that key was stale again.
-  /// Staleness compounded from 16.3% to 39.4% at 8 clients, and the damage
-  /// reached the write path too: put hint rejections went 38,520 to 89,444 per
-  /// client, because writes consult the same directory.
+  /// traversal -- `reconciles` tracked `traversals` exactly -- so a hop that
+  /// answered the get left the stale directory entry in place and the next get
+  /// on that key was stale again. Staleness compounded, and the damage reached
+  /// the write path too, because writes consult the same directory.
   ///
-  /// So the hop was winning its own bet -- 64.9 to 75.9% recovery, a measured
-  /// +6.3 to +7.2 round trips net per hop -- and losing 12% of throughput
-  /// anyway, because it skipped a repair worth more than the ~11 trips it
-  /// saved. A traversal's real product is the CACHE REPAIR, not the answer.
+  /// So the hop was winning its own bet on round trips and losing throughput
+  /// anyway, because it skipped a repair worth more than the trips it saved.
+  /// A traversal's real product is the CACHE REPAIR, not the answer.
   ///
   /// Repairing on a recovered hop needs no path: mirror_reconcile's contract
   /// documents `levels = 0` as "entry repair only" and the data routing entry

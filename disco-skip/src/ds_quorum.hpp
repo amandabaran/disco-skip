@@ -285,9 +285,10 @@ class QuorumOps {
         // BUT RE-POLLING IS NOT ALWAYS ENOUGH. Under sustained write contention
         // on one key the replicas are essentially never in agreement -- each
         // write CASes them in a chain, so a reader sampling all three lands
-        // mid-flight and the next write is already arriving. On the cluster this
-        // failed 76,311 reads on workload D at 8 clients, every one of them
-        // here. So on the last attempt, fall back to L2 and REPAIR: adopt a
+        // mid-flight and the next write is already arriving. On the cluster
+        // this failed a large number of reads on a write-contended workload,
+        // every one of them here. So on the last attempt, fall back to L2 and
+        // REPAIR: adopt a
         // handle deterministically and CAS it onto the laggards, which is ABD's
         // read phase completing a partial write.
         //

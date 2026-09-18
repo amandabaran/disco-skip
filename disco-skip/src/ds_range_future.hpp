@@ -294,10 +294,10 @@ class RangeOperation {
   // 16, so a scan of L keys touches ceil(L/6.2) nodes.
   //
   //   SERIAL: 1 round trip per node. The header and a SPECULATED vector read
-  //   are chained on one queue pair (postHeaders + guess), and the offset hint
-  //   hits 96.4% of the time, so a node costs one trip rather than two. That
-  //   makes serial a stronger baseline than a naive count suggests: 9 trips for
-  //   a 50-key scan, 17 for a 100-key one.
+  //   are chained on one queue pair (postHeaders + guess), and the offset
+  //   hint almost always hits on a scan workload, so a node costs one trip
+  //   rather than two. That makes serial a stronger baseline than a naive
+  //   count suggests.
   //
   //   BATCHED: 2 round trips per batch, and no fewer. The vector offsets are
   //   not known until the headers come back, so the two volleys are dependent
@@ -308,14 +308,14 @@ class RangeOperation {
   // batch covers the range. Two sizing mistakes each destroyed it:
   //
   //   * asking by hi, which OpScan leaves unbounded (a YCSB scan is
-  //     count-bounded; 178073 of 178074 ranges ended on the entry cap). The
-  //     batch then always asked for the full fanout and fetched ~4x the nodes
-  //     it used. Measured 201 kops against serial's 320.
+  //     count-bounded, so nearly every range ends on the entry cap). The
+  //     batch then always asked for the full fanout and fetched several times
+  //     the nodes it used, and measured SLOWER than serial.
   //
-  //   * asking by kNodeCapacity, which assumes full nodes. At 6.2 entries a
-  //     50-key scan needs ~9 nodes and was asked for 5, so the batch covered
-  //     half the range and refilled four times -- 8 round trips, against
-  //     serial's 11. Measured 229 against 433.
+  //   * asking by kNodeCapacity, which assumes full nodes. At the observed
+  //     occupancy a scan needs about twice the nodes it was asked for, so the
+  //     batch covered part of the range and refilled repeatedly -- and again
+  //     measured slower than serial.
   //
   // Hence sizing by ceil(remaining / (kNodeCapacity/2)) + 1: simulated against
   // the measured occupancy that is 2 batches, 4 round trips, and 17 nodes
@@ -344,12 +344,10 @@ class RangeOperation {
     // BOUND IT BY THE REMAINING ENTRY CAP, not only by hi.
     //
     // A YCSB scan is COUNT-bounded and OpScan passes hi = kUnboundedKey, so hi
-    // limits nothing: the cache returns its full width every time. Measured
-    // 15.9 addresses per backbone for a mean 50-key scan that needs ~4 nodes,
-    // and 178073 of 178074 ranges ended on the entry cap rather than on hi.
-    // The batch then reads ~4x the nodes it uses, and the cache walk measured
-    // 201 kops against the serial walk's 320 -- SLOWER, entirely from
-    // over-fetching.
+    // limits nothing: the cache returns its full width every time, which was
+    // several times the nodes a mean scan actually needs, and nearly every
+    // range ended on the entry cap rather than on hi. The cache walk then
+    // measured SLOWER than the serial walk, entirely from over-fetching.
     //
     // +1 node because the first contributes only its entries >= lo, so a cap
     // of exactly one node's worth can still span two.
@@ -357,13 +355,11 @@ class RangeOperation {
     size_t const want = have >= cap_ ? 0 : cap_ - have;
 
     // DIVIDE BY OBSERVED OCCUPANCY, NOT CAPACITY. A level-0 node holds
-    // kNodeCapacity = 16 entries but averages 6.2 in practice (13516 entries
-    // over 2184 nodes, measured), because a split leaves both halves partly
-    // full. Dividing by 16 underestimated the nodes a scan needs by ~2.6x: a
-    // 50-key scan needs ~9 nodes and was asked for 5, so the batch covered half
-    // the range and refilled about four times -- 732332 backbones for 178000
-    // ranges at 2.4 addresses each, which is a round trip per refill and most
-    // of the benefit gone.
+    // kNodeCapacity entries but averages well under half that in practice,
+    // because a split leaves both halves partly full. Dividing by the capacity
+    // underestimated the nodes a scan needs, so the batch covered only part of
+    // the range and refilled repeatedly -- a round trip per refill, and most of
+    // the benefit gone.
     //
     // Half capacity is the standard occupancy assumption for a split-on-full
     // structure and matches the measurement closely enough: ceil(50/8)+1 = 8
@@ -794,7 +790,8 @@ class RangeOperation {
         // snapshot, walkToSnapshot() chased old_ver past it, and a COMMITTED
         // write became permanently invisible to range queries: the counter
         // would need ~2.7e13 more values to catch up, which is centuries at
-        // the measured 2.70 Mops/s. Point reads never noticed, because they do
+        // the counter's measured throughput ceiling. Point reads never
+        // noticed, because they do
         // not compare ts.
         if (tsIsRemote(ops_.tsMode())) {
           tsClaimOn(b, ops_.tsMode());

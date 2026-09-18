@@ -121,10 +121,10 @@
 //
 // FAA: an RDMA fetch-and-add on one well-known word in memory-server memory.
 // Gives a genuine total order with no clock assumption whatsoever. Measured on
-// this testbed (docs/clock-measurements.md): an uncontended FAA costs 1.89 us,
-// the same as an 8-byte read, and the word sustains 2.70 Mops/s -- flat from one
-// to eight client machines, and equally flat with each QP on its own cache line,
-// so that ceiling is the responder NIC's atomic unit rather than contention.
+// this testbed (docs/clock-measurements.md): an uncontended FAA costs about the
+// same as an 8-byte read, and the word's throughput ceiling is flat from one to
+// eight client machines and equally flat with each QP on its own cache line, so
+// that ceiling is the responder NIC's atomic unit rather than contention.
 //
 //   ORDERING IS THE WHOLE POINT, AND IT IS EASY TO GET BACKWARDS. The FAA must
 //   happen AFTER the publishing CAS. Allocating a timestamp before the version
@@ -142,7 +142,7 @@
 //   order just as well.
 //
 // TSC: a local counter read, no round trip. rdtscp is serialising, so it is not
-// reordered out of the operation, and costs 20.1 ns measured.
+// reordered out of the operation, and costs tens of nanoseconds.
 //
 //   NOT CORRECT ACROSS MACHINES, and not pretending to be. Relative TSC
 //   frequency error across these 12 nodes is 14.31 ppm, which is 143 us of
@@ -151,8 +151,9 @@
 //   more than one it does, and the verifier's chain check is where it shows.
 //
 //   Making this mode correct is a one-line change in tscNow(): read
-//   CLOCK_REALTIME through the vDSO instead, which costs 31.4 ns rather than
-//   20.1 ns -- 11 ns more, 0.6% of an operation -- and is continuously
+//   CLOCK_REALTIME through the vDSO instead, which costs a few nanoseconds
+//   more than a raw rdtscp -- negligible against an operation -- and is
+//   continuously
 //   rate-corrected by the kernel once ptp4l and phc2sys are running. The
 //   clocksource on these nodes is already `tsc`, so that read IS an rdtsc plus
 //   a kernel-maintained scale and offset. Left as raw rdtscp because this mode's
@@ -411,8 +412,8 @@ inline void tsClaimOn(B &b, TsMode m) {
 /// steady_clock this replaces "ordered nothing across clients".
 ///
 /// The clocksource on these nodes is already `tsc`, so this read IS an rdtsc
-/// plus a scale and offset maintained by kernel timekeeping: 31.4 ns measured
-/// against rdtscp's 20.1 ns, so 11 ns more, or 0.6% of a 2 us operation. What
+/// plus a scale and offset maintained by kernel timekeeping, costing a few
+/// nanoseconds more than rdtscp -- negligible against an operation. What
 /// the 11 ns buys is continuous RATE correction -- the thing a one-shot reset
 /// cannot give, and without which the 14.31 ppm measured between these nodes
 /// accumulates to 143 us over a 10 s run.
@@ -513,7 +514,8 @@ inline void tsClaimOn(B &b, TsMode m) {
 ///
 /// The tiebreak that makes a REPLICATED counter's timestamp unique. See
 /// tsFromFaa. 16 bits is 65536 clients; the remaining 48 bits of counter at the
-/// measured 2.70 Mops/s ceiling is about 3300 years, so neither field is tight.
+/// counter's measured throughput ceiling is many centuries, so neither field
+/// is tight.
 inline constexpr unsigned kFaaClientBits = 16;
 inline constexpr uint64_t kFaaClientMask = (1ull << kFaaClientBits) - 1;
 

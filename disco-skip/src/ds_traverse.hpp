@@ -47,7 +47,8 @@ enum class TraversalStatus {
 /// recorded rather than collapsed.
 ///
 /// This existed only as "some bound was hit" until workload D at 8 clients
-/// produced 61,019 failed gets and there was no way to say which bound. Every
+/// produced a large number of failed gets and there was no way to say which
+/// bound. Every
 /// value here is a LIVELOCK GUARD firing, not an error: nothing is broken, the
 /// operation is being starved by other clients writing the same key.
 enum class TraversalGaveUp : uint8_t {
@@ -105,9 +106,10 @@ struct TraversalResult {
   /// all.
   ///
   /// This exists to answer "what does a cache mismatch COST". The client's
-  /// `round trips` is a single pooled figure over gets, puts and ranges, so
-  /// the 5.81 per op measured on workload A cannot be split -- and 20.8% of
-  /// gets there traverse, which is the largest single lever nobody had priced.
+  /// `round trips` is a single pooled figure over gets, puts and ranges, so it
+  /// cannot be split by operation -- and on a write-heavy workload a
+  /// substantial share of gets traverse, which was the largest single lever
+  /// nobody had priced.
   uint32_t round_trips = 0;
 
   /// Which guard fired, when status is not Ok. See TraversalGaveUp.

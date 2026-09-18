@@ -111,10 +111,10 @@ class TraversalFuture {
 
   /// Traversal state for the non-termination watchdog (ds_futures.hpp).
   ///
-  /// NEEDED BECAUSE THE BOUNDS HERE CANNOT FIRE. kMaxHopsPerLevel is 1<<20 =
-  /// 1,048,576 right-hops and kMaxReadRepairs is small, but the future
-  /// watchdog aborts at 4,097 STEPS -- and every right-hop, re-poll and repair
-  /// is one step. So the watchdog always wins by ~256x and the graceful
+  /// NEEDED BECAUSE THE BOUNDS HERE CANNOT FIRE. kMaxHopsPerLevel is 1<<20
+  /// right-hops and kMaxReadRepairs is small, but the future watchdog aborts
+  /// after far fewer STEPS -- and every right-hop, re-poll and repair is one
+  /// step. So the watchdog always wins by a wide margin and the graceful
   /// TooManyHops / NoMajority paths are unreachable, which makes a long-but-
   /// legitimate descent look identical to a livelock. These counters are what
   /// tell the two apart: large hops_ means it is walking the level chain,

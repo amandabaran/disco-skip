@@ -117,10 +117,10 @@ struct RangeStats {
   // ── WHY A FAILURE COUNT WITHOUT A REASON IS NOT ENOUGH ───────────────────
   //
   // `failures` alone says a range gave up and nothing else, and the walk has
-  // eight distinct done(false) exits. Measured: the hot scan workload at 16
-  // clients failed 4 of 1,119,888 ranges, snapshot_violations was 0, and no
-  // FAA round was refused -- so the cause was one of the bounded-retry exits
-  // and there was no way to say which without guessing. Same principle the
+  // eight distinct done(false) exits. On the hot scan workload a handful of
+  // ranges failed with no snapshot violations and no refused FAA round -- so
+  // the cause was one of the bounded-retry exits and there was no way to say
+  // which without guessing. Same principle the
   // violation check is here for: finding none is a result, not looking is a
   // gap. These sum to `failures` by construction.
   //

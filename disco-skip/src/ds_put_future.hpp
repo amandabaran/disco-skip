@@ -96,9 +96,9 @@ class PutOperation {
     // and the put costs one node fetch plus one chained batch.
     //
     // This was missing, and measurably so. The parallelism sweep put the
-    // cache's benefit at 4.7-6.3x on a read-only workload and only 1.3-1.5x on
-    // 50/50 -- because the write half never asked. Roughly seven puts in eight
-    // are height 0, so this is most of that gap.
+    // cache's benefit as several-fold on a read-only workload and marginal on
+    // a 50/50 one -- because the write half never asked. Most puts are height
+    // 0, so this is most of that gap.
     //
     // A BAD HINT IS DETECTED, NOT TRUSTED. actInsert checks covers() before
     // touching anything and returns to a traversal when the node does not own
@@ -408,7 +408,7 @@ class PutOperation {
   /// the guard is written out because it costs one comparison and the
   /// alternative is a silent walk to the tail if that ever stops being true.
   size_t onRejectedTarget(Key key) {
-    bool const budget_left = hops_ < ops_.hintHops();
+    bool const budget_left = hops_ < ops_.putHintHops();
     if (from_hint_ && budget_left && key >= rangeEnd(node_, vec_)) {
       RemoteAddr const next = nextNode(node_, vec_);
       if (!next.isNull()) {
@@ -426,7 +426,7 @@ class PutOperation {
       // No successor: this is the tail, so descending is the only option and
       // the budget is irrelevant. Not counted as exhausted -- that bucket is
       // for budgets actually spent.
-    } else if (from_hint_ && !budget_left && ops_.hintHops() != 0) {
+    } else if (from_hint_ && !budget_left && ops_.putHintHops() != 0) {
       // Paid the hops AND the descent: the case that makes the bet lose.
       ++stats_.hint_hops_exhausted;
     }
@@ -453,9 +453,8 @@ class PutOperation {
     // DESCENDING, so a recovery that skipped the descent also skipped the
     // repair, left the stale entry in place, and made the next operation on
     // this key pay the same mismatch. On the read path that compounded
-    // staleness 16.3% -> 39.4% at 8 clients and turned a winning bet into a
-    // 12% loss. The write path reaches this line by the same shortcut and
-    // needs the same repair.
+    // staleness until hopping became a net loss. The write path reaches this
+    // line by the same shortcut and needs the same repair.
     //
     // `target_` is the address just read and confirmed to cover `key`, and
     // node_.k_min is immutable once the node exists, so this is the pair

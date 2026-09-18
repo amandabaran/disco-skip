@@ -393,29 +393,23 @@ int main(int argc, char** argv) {
     layout.nodes_per_client  = 1 << 16;
     layout.vecs_per_client   = 1 << 18;
     // OFF BY DEFAULT AS OF 17 SEP 2026, MEASURED. The speculative vector read
-    // appends 576 B to every header fan-out and L4 discards 47.5% of them on
-    // workload A, because every write moves the vector to a freshly allocated
-    // offset. Turning it off does MORE round trips per operation and is
-    // faster anyway:
-    //
-    //   16 clients  492.5 -> 599.3 kops  (+21.7%)  trips/op 4.81 -> 5.81
-    //   32 clients  371.9 -> 533.7 kops  (+43.5%)  trips/op 5.14 -> 6.17
-    //
-    // because per-trip service time falls 16.73 -> 9.71 us at 32 clients. What
-    // saturates is priced in WORK PER ROUND TRIP, not in round trips, so
-    // inflating every operation to save a trip on half of them is a losing
-    // trade -- and it compounds with client count. It also halves the
-    // 16-to-32 cliff: retention 0.76x -> 0.89x.
+    // appends the guessed vector to every header fan-out, and on a
+    // write-heavy workload most of those are discarded, because every write
+    // moves the vector to a freshly allocated offset. Turning it off does MORE
+    // round trips per operation and is faster anyway, because per-trip service
+    // time falls: what saturates is priced in WORK PER ROUND TRIP, not in
+    // round trips, so inflating every operation to save a trip on some of
+    // them is a losing trade, and it compounds with client count.
     //
     // The justification in layout.hpp -- that this trades "rNIC and PCIe
     // bandwidth, which is the scarce resource under write-heavy load" -- had
-    // the premise backwards. Workload A at its cliff uses 7.4% of one server's
-    // FDR link. Bandwidth being idle is exactly WHY the trade is bad: the hint
-    // spends the plentiful resource to save the scarce one.
+    // the premise backwards: bandwidth sits mostly idle at the cliff, which is
+    // exactly WHY the trade is bad. The hint spends the plentiful resource to
+    // save the scarce one.
     //
     // Left as a toggle rather than deleted: on a read-mostly workload the
-    // guess is almost always right (workload C hits 0.987) and the saved trip
-    // is real. --offset-hint 1 restores it.
+    // guess is almost always right and the saved trip is real. --offset-hint 1
+    // restores it.
     layout.offset_hint       = false;
     layout.batched_walk      = false;
     layout.cache_walk        = false;
@@ -424,41 +418,38 @@ int main(int argc, char** argv) {
     layout.read_quorum       = false;
     layout.consult_cache     = DS_CACHE_ENABLED ? true : false;
     layout.writeback         = DS_REG_WRITEBACK_ENABLED ? true : false;
-    // ONE SIDEWAYS HOP BY DEFAULT.
+    // ONE SIDEWAYS HOP BY DEFAULT, ON BOTH PATHS.
     //
-    // A k_min mismatch means the cached node SPLIT, so k is usually in the
-    // sibling one `next` hop away. Following it costs one round trip; a full
-    // descent costs ~11, measured invariantly across every cell of two
-    // twelve-cell sweeps (10.80 to 11.85, all client counts, all budgets).
+    // A k_min mismatch means the cached node SPLIT, so the key is usually in
+    // the sibling one `next` hop away. Following it costs one round trip; a
+    // full descent from the head costs roughly an order of magnitude more.
     //
-    // IT LOST 12% UNTIL THE HOP ALSO REPAIRED THE DIRECTORY. Reconciliation
-    // used to be a side effect of descending, so a recovered hop answered the
-    // get and left the stale entry in place; staleness compounded 16.3% ->
-    // 39.4% at 8 clients and dragged the write path with it. With the repair,
-    // on workload A uniform, 3 servers, --ts faa --offset-hint 0:
+    // IT ONLY PAYS IF A RECOVERED HOP ALSO REPAIRS THE DIRECTORY.
+    // Reconciliation used to be a side effect of descending, so a hop that
+    // answered the operation left the stale entry in place and the next
+    // operation on that key paid the mismatch again -- staleness compounded
+    // and the write path was dragged down with it. With the repair the loop
+    // runs the other way: a fresher directory means each path also cuts the
+    // OTHER path's traversals, which is where most of the benefit comes from
+    // rather than from the descents this operation itself avoided.
     //
-    //      clients   budget 0   budget 1   budget 2   staleness (b0->b1)
-    //          8        455.3     +8.6%     +11.4%    16.3 -> 16.5%
-    //         16        598.3     +9.2%      +7.2%    21.2 -> 21.5%
-    //         32        566.1     +5.0%      +0.7%    23.6 -> 24.0%
-    //         64        462.9     +9.9%      +7.3%    24.0 -> 24.3%
+    // --hint-hops covers both paths; --put-hint-hops pins the write path
+    // alone and exists only to isolate one path in an experiment.
     //
-    // Budget 1 wins at 16, 32 and 64; budget 2 only at 8, and by 32 it has
-    // decayed to +0.7%. So ONE is the robust setting and is what this default
-    // is. Staleness per operation is flat across the budget in all twelve
-    // cells, which is the mechanism: the repair keeps the directory as fresh
-    // as descending did, and only then is the saved descent free.
+    // Larger budgets were swept and are not distinguishable from 1: they
+    // remove nearly all remaining descents while buying little, because a
+    // failed chain pays every hop AND the descent anyway. So 1 takes the
+    // available gain at the smallest worst-case latency.
     //
-    // The 64-client budget-1 cell was nearly lost: run.sh called the run
-    // unresponsive and the parser ran three minutes before the clients wrote.
-    // See wait_for_logs in experiments/compare/lib.sh.
-    //
-    // MEASURED ON WORKLOAD A ONLY so far. A is the right place to measure it --
-    // write-heavy, so splits are frequent and hints go stale 16-24% of the time
-    // -- but the effect must scale with split rate, so read-mostly workloads
+    // MEASURED ON WORKLOAD A ONLY so far. A is the right place to measure it,
+    // being write-heavy, so splits are frequent and hints go stale often --
+    // but the effect must scale with split rate, so read-mostly workloads
     // should see less and C, which writes nothing, should see nothing. Set
     // --hint-hops 0 to recover the previous behaviour exactly.
     layout.hint_hops         = 1;
+    // Follow hint_hops on the write path: one knob, both paths. Pinning it is
+    // for isolating one path in an experiment, not for shipping.
+    layout.put_hint_hops     = ds::Layout::kPutHopsFollowGet;
     layout.ts_mode           = ds::TsMode::Clock;
     layout.measure_latency   = true;
 
@@ -473,6 +464,11 @@ int main(int argc, char** argv) {
     bool run_ml_workload = false;
     bool run_selftest = false;
     uint64_t think_time = 0;
+
+    // -1 means "not given", so the write path keeps following --hint-hops.
+    // Signed because the sentinel has to be distinguishable from a real 0,
+    // and 0 is a meaningful value here (pin the write path OFF).
+    int64_t put_hint_hops_arg = -1;
 
     // Parsed into layout.ts_mode below: lyra binds strings, not enums.
     std::string ts_mode_name = "clock";
@@ -601,9 +597,17 @@ int main(int argc, char** argv) {
             "trip and still pays it, so it only pays if a RECOVERED HOP ALSO "
             "REPAIRS THE DIRECTORY -- without that it lost 12%, because "
             "reconciliation was a side effect of descending and staleness "
-            "compounded. With it: +8.6/+9.2/+5.0/+9.9% at 8/16/32/64 clients "
-            "on workload A, with staleness per operation flat across the "
-            "budget. 0 restores the previous behaviour.") |
+            "compounded. Applies to BOTH the read and the write path (see "
+            "--put-hint-hops). Most of the benefit is not the descents this "
+            "operation avoids: repairing on a recovered hop leaves the shared "
+            "directory fresher, so each path also cuts the OTHER path's "
+            "traversals. 0 restores the previous behaviour.") |
+        lyra::opt(put_hint_hops_arg, "put_hint_hops").optional()["--put-hint-hops"](
+            "Hop budget for the WRITE path alone. Defaults to whatever "
+            "--hint-hops is, which is the shipped behaviour -- both paths "
+            "symmetric. Pin it only to isolate one path: --hint-hops moves "
+            "BOTH, so the write path's own contribution cannot be separated "
+            "from that comparison alone.") |
         lyra::opt(run_ml_workload, "ml").optional()["--ml"] |
         lyra::opt(think_time, "think").optional()["--think"];
 
@@ -624,15 +628,13 @@ int main(int argc, char** argv) {
     // It was (iter_count + warmup) / 4. Every client runs the same fixed
     // iter_count, so a FAST client finishes its window early and, once keepwarm
     // runs out, stops issuing entirely -- and the slow clients then measure a
-    // system carrying less than the intended load. Measured per-client spread
-    // on this cluster is up to 1.7x (22 vs 13 kops for the two clients on one
-    // node), so the fast client must keep loading for ~0.7x of its own window
-    // after finishing. A quarter does not cover that; iter_count covers a 2x
-    // spread.
+    // system carrying less than the intended load. The per-client spread on
+    // this cluster means a fast client must keep loading for a large fraction
+    // of its own window after finishing. A quarter does not cover that;
+    // iter_count covers up to a 2x spread.
     //
-    // Costs 33% more wall clock per cell (warmup + iter + keepwarm goes from
-    // 187.5k to 250k ops at -I 100000 -W 50000). That is the price of the sum
-    // over clients meaning anything.
+    // Costs more wall clock per cell, since keepwarm is added to warmup and
+    // iter. That is the price of the sum over clients meaning anything.
     const uint64_t keepwarm           = iter_count;
     const uint64_t start_measurements = warmup;
     const uint64_t stop_measurements  = start_measurements + iter_count;
@@ -648,6 +650,21 @@ int main(int argc, char** argv) {
         std::cerr << "--layers must be in (1, " << DS_MAX_LAYERS
                   << "], got " << layout.cache_layers << std::endl;
         return 1;
+    }
+
+    if (put_hint_hops_arg >= 0) {
+        if (put_hint_hops_arg > 64) {
+            std::cerr << "--put-hint-hops must be 0..64, got "
+                      << put_hint_hops_arg << std::endl;
+            return 1;
+        }
+        layout.put_hint_hops = static_cast<uint32_t>(put_hint_hops_arg);
+        std::cerr << "NOTE: --put-hint-hops pinned to "
+                  << layout.put_hint_hops << " while --hint-hops is "
+                  << layout.hint_hops
+                  << ". The two paths are ASYMMETRIC in this run, which is an "
+                     "experiment setting and not the shipped configuration."
+                  << std::endl;
     }
 
     if (!ds::parseTsMode(ts_mode_name, layout.ts_mode)) {
@@ -1053,22 +1070,23 @@ int main(int argc, char** argv) {
             // `kvIndex = 0; kvIndex < inserts.size()` on EVERY client, so all
             // of them inserted the whole key set.
             //
-            // At 64 clients that is 6.4 M put operations to build a 100,000-key
-            // structure, and it was wrong in three ways at once:
+            // At high client counts that is millions of put operations to
+            // build a key set of a hundred thousand, and it was wrong in three
+            // ways at once:
             //
             //  1. WRONG WORKLOAD. Only the first client to reach a key inserts
-            //     it; the other 63 perform UPDATES. So the "load" phase ran
-            //     ~98% updates, which is not what loading a structure means,
-            //     and the split history that comes out of it -- orphan counts,
-            //     occupancy, level populations -- is shaped by 6.4 M writes
-            //     rather than 100,000.
+            //     it; every other client performs an UPDATE. So the "load"
+            //     phase ran almost entirely updates, which is not what loading
+            //     a structure means, and the split history that comes out of
+            //     it -- orphan counts, occupancy, level populations -- is
+            //     shaped by those writes rather than by the key set.
             //  2. WRONG ARENA. Every put allocates a vector (copy-on-write, no
-            //     reclamation), so the preload alone reserved ~100,000 vectors
-            //     PER CLIENT. At 64 clients the arena reached 10.54 GiB of the
-            //     servers' 15.1 GiB available, and throughput collapsed from
-            //     303 kops at 16 clients to 64 at 64 -- which looked like a
-            //     scaling limit and was memory pressure.
-            //  3. WRONG SETUP TIME. 64x the necessary work before every run.
+            //     reclamation), so the preload alone reserved a vector per key
+            //     PER CLIENT. At high client counts the arena approached the
+            //     servers' available memory and throughput collapsed -- which
+            //     looked like a scaling limit and was memory pressure.
+            //  3. WRONG SETUP TIME. Work proportional to the client count
+            //     before every run, all of it unnecessary.
             //
             // Striding by client_idx gives each client a disjoint share, so the
             // total is the key set exactly once. finishAllFutures below plus
@@ -1314,18 +1332,18 @@ int main(int argc, char** argv) {
                     // part of the load, and the sweep summed those rates into a
                     // total the system never delivered.
                     //
-                    // OBSERVED, workload E, 16 clients, --cache-walk 1, same
-                    // binary, fixed 100k measured ops each:
-                    //   r1/r2: windows all ~7 s   -> 217, 216 kops
-                    //   r3:    windows 1 s / 3 s / 4 s -> 418 kops
-                    // In r3 one client did its 100k operations in ONE second
-                    // (100 kops) -- faster than a single UNCONTENDED client on
-                    // this cluster (63 kops) -- while its own sibling on the
-                    // same node took three seconds. Both cannot be right about
-                    // a shared system unless they measured different stretches
-                    // of wall-clock time. The excursion is ABOVE the ~216 that
-                    // reproduces whenever the windows are tight, so the error
-                    // flatters us.
+                    // OBSERVED on workload E from the same binary with a
+                    // fixed number of measured operations each: runs whose
+                    // per-client windows all had the same duration agreed with
+                    // each other, while a run whose windows differed by several
+                    // times reported roughly double. In that run one client
+                    // finished its whole allocation faster than a single
+                    // UNCONTENDED client can go on this cluster, while its own
+                    // sibling on the same node took several times as long.
+                    // Both cannot be right about a shared system unless they
+                    // measured different stretches of wall-clock time. The
+                    // excursion is ABOVE the figure that reproduces whenever
+                    // the windows are tight, so the error flatters us.
                     //
                     // memstore::barrier is an atomic increment-and-wait and it
                     // THROWS if the count passes wait_for, so a counter left
@@ -1434,19 +1452,20 @@ int main(int argc, char** argv) {
             //
             // This printed an INTEGER number of kops per client. Per-client
             // throughput falls as clients are added -- workload A at 64
-            // clients is about 4 kops each -- so the smallest representable
-            // difference was 1 kops/client, which at 64 clients is 64 kops, or
-            // 25% of the total. Every client in a cell reported the identical
-            // integer and the summed total landed on an exact multiple of the
-            // client count: 11,11,11... = 352 then 12,12,12... = 384.
+            // clients is a few kops each -- so the smallest representable
+            // difference was 1 kops/client, which across all of them is a
+            // large share of the total, or
+            // a large share of the total. Every client in a cell reported the
+            // identical integer and the summed total landed on an exact
+            // multiple of the client count.
             //
-            // That is not a rounding nuisance, it manufactured findings. The
-            // kIdxExp result at 64 clients was reported as 2.00x (128 -> 256
-            // kops) when it is 2 versus 4 kops per client -- two quantization
-            // steps, true value anywhere from roughly 1.5x to 2.5x. It also
-            // masqueraded as run-to-run variance, and an instrumented
-            // (--latency 1) run appeared 25% FASTER than an uninstrumented one
-            // at 64 clients purely by landing one step up.
+            // That is not a rounding nuisance, it manufactured findings. A
+            // kIdxExp comparison at high client counts came out as a clean
+            // doubling when the underlying per-client figures were two
+            // quantization steps apart, so the true ratio was anywhere in a
+            // wide band. It also masqueraded as run-to-run variance, and an
+            // instrumented (--latency 1) run could appear FASTER than an
+            // uninstrumented one purely by landing one step up.
             //
             // Computed in double rather than truncating integer division for
             // the same reason. lib.sh's total_kops and the plotter's

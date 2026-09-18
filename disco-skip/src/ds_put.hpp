@@ -54,18 +54,15 @@ struct PutStats {
   uint64_t hint_rejected = 0; ///< ... where it had one and it no longer covered k
   /// Sideways `next` hops taken after a rejected hint, and what came of them.
   ///
-  /// The write path had NO recovery from a stale hint: it detected one and
-  /// descended from the head, ~11 round trips, every time. Once the read path
-  /// started hopping that became the dominant cost in the system -- at 64
-  /// clients on workload A the get path fell to 503,918 full traversals while
-  /// the put path still paid 3,611,238, a 7.2x asymmetry between two paths
-  /// that had been within 6% of each other at budget 0.
+  /// The write path used to have NO recovery from a stale hint: it detected
+  /// one and descended from the head every time. Once the read path started
+  /// hopping, that made the write path the dominant source of full descents.
   ///
   /// `hint_hops_recovered / hint_hops_taken` is the hit rate, and
   /// `hop_reconciles` must track `hint_hops_recovered` exactly -- a recovered
-  /// hop that does not repair the directory is the bug that made hopping lose
-  /// 12% on the read path, so the two counters existing separately is what
-  /// makes that visible rather than inferred.
+  /// hop that does not repair the directory is the failure that made hopping
+  /// a net loss on the read path, so keeping the two counters separate is
+  /// what makes that visible rather than inferred.
   uint64_t hint_hops_taken = 0;
   uint64_t hint_hops_recovered = 0;  ///< ... that landed on the covering node
   uint64_t hint_hops_exhausted = 0;  ///< ... budget spent, descended anyway

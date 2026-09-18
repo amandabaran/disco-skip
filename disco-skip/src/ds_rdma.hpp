@@ -597,7 +597,7 @@ class RdmaOps : public RdmaNodeReader<Conns> {
   /// Measured on this testbed (docs/clock-measurements.md): relative TSC
   /// frequency error across the 12 nodes is 14.31 ppm, so a one-shot reset
   /// accumulates 143 us of skew over a 10 s run against ~2 us operations. A
-  /// disciplined CLOCK_REALTIME read costs 31.4 ns against rdtscp's 20.1 ns,
+  /// disciplined CLOCK_REALTIME read costs a few nanoseconds more than rdtscp,
   /// so the fix is to keep rdtsc as the source and let the kernel correct the
   /// rate -- not to hand-roll the counter. Nothing on the point-read, F1 or F2
   /// paths compares timestamps, so that change is not a prerequisite for them.
