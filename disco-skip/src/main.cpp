@@ -410,6 +410,544 @@ static bool pinThreadToCore(unsigned core) {
     return true;
 }
 
+/// Everything one client does, from constructing its DsClient to its last line
+/// of output.
+///
+/// EXTRACTED FROM main SO THAT A NODE'S CLIENTS CAN BE THREADS. It was 500
+/// lines inside `if (is_client)`, which made one client per process a
+/// structural fact rather than a choice. Nothing about the work changed; it
+/// only became callable more than once, with its own proc id, its own queue
+/// pairs, its own slice of the registered region and its own log, sharing
+/// whatever NodeCache the caller hands it.
+///
+/// `layout` is BY VALUE deliberately: client_local_region differs per thread,
+/// so a shared reference would have every thread reading and writing one
+/// another's scratch buffers -- silent corruption, not an error.
+///
+/// Returns 0 on success. These returns used to exit main directly, so the
+/// caller now has to aggregate them: one failing client must still fail the
+/// process rather than being swallowed by a thread nobody checked.
+static int runClient(ds::Layout layout,
+                     ds::ProcId proc_id,
+                     dory::conn::RcConnectionExchanger<ds::ProcId> &ce,
+                     dory::memstore::MemoryStore &store,
+#if DS_CACHE_ENABLED
+                     ds::NodeCache &node_cache,
+#endif
+                     std::string const &workload,
+                     std::string const &ycsb_path,
+                     uint64_t iter_count,
+                     uint64_t warmup,
+                     uint64_t keepwarm,
+                     uint64_t start_measurements,
+                     uint64_t stop_measurements,
+                     uint64_t total_iter_count,
+                     bool detailed,
+                     bool run_selftest,
+                     bool run_ml_workload,
+                     uint64_t think_time) {
+#if DS_CACHE_ENABLED
+    ds::DsClient client{layout, ce, proc_id, node_cache};
+#else
+    ds::DsClient client{layout, ce, proc_id};
+#endif
+    ds::DsState& state = client.getState();
+
+    // ─── Bootstrap the skip vector ─────────────────────────────
+    //
+    // The first client writes the initial structure. Everything below this
+    // point runs after the "initialized" barrier that every process already
+    // waits on, so there is no need for a barrier of our own: no client
+    // traverses before that barrier, and the writes complete before we
+    // announce.
+    bool const is_initializer = (proc_id == layout.firstClientId());
+    if (is_initializer) {
+        bootstrap_structure(state);
+    }
+
+#if DS_CACHE_ENABLED
+    // Hand the cache its head addresses. These are reserved constants, so
+    // this needs no discovery -- but it does need doing, because a cache
+    // that was never told them reports a miss for every key left of the
+    // first boundary at every level, which is correct but silently slow
+    // (interface doc §5).
+    ds::bootstrapHeads(state.cache_sv,
+                       ds::headAddrs(static_cast<uint32_t>(layout.cache_layers)));
+    if (!ds::headsBootstrapped(state.cache_sv)) {
+        std::cerr << "Cache heads were not bootstrapped" << std::endl;
+        return 1;
+    }
+#endif
+
+    // ─── Structure selftest ────────────────────────────────────
+    //
+    // Its own path, so it needs neither YCSB nor a workload file. It has to
+    // run after every client has passed the barrier, since a concurrent
+    // bootstrap write would look like corruption to a sequential checker.
+    if (run_selftest) {
+        ce.announceReady(store, "qp", "initialized");
+        ce.waitReadyAll(store, "qp", "initialized");
+
+        int const rc = run_structure_selftest(state);
+        state.reportCache();
+
+        ce.announceReady(store, "qp", "finished");
+        ce.waitReadyAll(store, "qp", "finished");
+        ce.unannounceReady(store, "qp", "initialized");
+        ce.unannounceReady(store, "qp", "connected");
+        ds::clientOut() << "###DONE###" << std::endl;
+        return rc;
+    }
+
+    // SWARM PATTERN: First client triggers initial data loading phase
+    if (proc_id == (layout.num_servers + 1)) {
+        ds::clientOut() << "Querying YCSB for the set of initial key-pairs... " << std::flush;
+        std::vector<std::pair<std::string, std::string>> inserts = {};
+
+        {
+            auto fp = exec(ycsb_path + " load basic -P " + workload + " -s 2> /dev/null");
+            char buffer[1024];
+            while (fgets(buffer, sizeof(buffer), fp.get()) != nullptr) {
+                std::string line(buffer);
+                if (std::strncmp("INSERT ", line.c_str(), 7) != 0) {
+                    continue;
+                }
+                auto keystart = std::string("INSERT usertable ").length();
+                auto keyend = line.find(" [", keystart);
+                auto key = line.substr(keystart, keyend - keystart);
+
+                auto start = keyend + std::string(" [ field0=").length();
+                auto end = line.length() - std::string(" ]\n").length();
+                auto value = line.substr(start, end - start);
+
+                inserts.emplace_back(key, value);
+            }
+        }
+        ds::clientOut() << "Done." << std::endl;
+
+        ds::clientOut() << "Inserting the initial key-pairs... " << std::flush;
+        // Same seed rule as the measured phase: reproducible per client,
+        // and different between clients so two do not make an identical
+        // structural decision for the same key.
+        std::mt19937_64 pop_rng(0xB0B ^ proc_id);
+        // PARTITION THE PRELOAD ACROSS CLIENTS. It used to be
+        // `kvIndex = 0; kvIndex < inserts.size()` on EVERY client, so all
+        // of them inserted the whole key set.
+        //
+        // At high client counts that is millions of put operations to
+        // build a key set of a hundred thousand, and it was wrong in three
+        // ways at once:
+        //
+        //  1. WRONG WORKLOAD. Only the first client to reach a key inserts
+        //     it; every other client performs an UPDATE. So the "load"
+        //     phase ran almost entirely updates, which is not what loading
+        //     a structure means, and the split history that comes out of
+        //     it -- orphan counts, occupancy, level populations -- is
+        //     shaped by those writes rather than by the key set.
+        //  2. WRONG ARENA. Every put allocates a vector (copy-on-write, no
+        //     reclamation), so the preload alone reserved a vector per key
+        //     PER CLIENT. At high client counts the arena approached the
+        //     servers' available memory and throughput collapsed -- which
+        //     looked like a scaling limit and was memory pressure.
+        //  3. WRONG SETUP TIME. Work proportional to the client count
+        //     before every run, all of it unnecessary.
+        //
+        // Striding by client_idx gives each client a disjoint share, so the
+        // total is the key set exactly once. finishAllFutures below plus
+        // the "initialized" barrier still order the whole load before any
+        // client starts measuring, so no client can observe a partially
+        // loaded structure.
+        uint64_t const preload_stride = layout.num_clients;
+        uint64_t const preload_start = state.client_idx;
+        for (size_t kvIndex = preload_start; kvIndex < inserts.size();
+             kvIndex += preload_stride) {
+            
+            // Extract numerical representation of key string for the register mapping
+            uint64_t target_reg = std::stoull(inserts[kvIndex].first.substr(4)) % layout.num_registers;
+            // ds::clientOut() << "Inserting register: " << target_reg << std::endl;
+            // Population, so heights are drawn: this is what builds the
+            // index the measured phase then traverses. A populated
+            // structure with no index would measure a linked list.
+            uint32_t const ph = ds::drawHeight(
+                pop_rng, static_cast<uint32_t>(layout.cache_layers));
+            client.getFreeFuture().doPut(target_reg, 69, ph, false);
+        }
+        client.finishAllFutures();
+        ds::clientOut() << " Done." << std::endl;
+    }
+
+    if (run_ml_workload) {
+        // Trackers are assigned based on a normalized structural index 
+        // sequence. If this is client #1 (proc_id == num_servers + 1), it becomes ID 0 (Tracker).
+        uint64_t global_thread_id = proc_id - layout.num_servers - 1;
+
+        ds::clientOut() << "Running single-threaded ML tracker workload. ID=" << global_thread_id  << "Registers=" << layout.num_registers << "Clients=" << layout.num_clients << std::endl;
+        
+        // Sync with cluster deployment infrastructure
+        ce.announceReady(store, "qp", "initialized");
+        ce.waitReadyAll(store, "qp", "initialized");
+
+        run_ml_prog_tracker_workload(client, global_thread_id,
+                         layout.num_clients, iter_count,
+                         think_time, store);
+
+        ce.announceReady(store, "qp", "finished");
+        ce.waitReadyAll(store, "qp", "finished");
+        ce.unannounceReady(store, "qp", "initialized");
+    } 
+    else {
+        ds::clientOut() << "Configuring Client " << proc_id << std::endl;
+        
+        // SWARM PATTERN: Load continuous execution operations
+        ds::clientOut() << "Querying YCSB for the list of operations... " << std::flush;
+
+        {
+            auto fp = exec(ycsb_path + " run basic -P " + workload + " -s 2> /dev/null");
+            char buffer[1024];
+            while (fgets(buffer, sizeof(buffer), fp.get()) != nullptr) {
+                std::string line(buffer);
+                
+                if (!(std::strncmp("READ ", line.c_str(), 5))) {
+                    auto keystart = std::string("READ usertable ").length();
+                    auto keyend = line.find(" [", keystart);
+                    auto key = line.substr(keystart, keyend - keystart);
+
+                    uint64_t target_reg = std::stoull(key.substr(4)) % layout.num_registers;
+                    operations.push_back({target_reg, OpGet, 0});
+                } 
+                else if (!(std::strncmp("UPDATE ", line.c_str(), 7))) {
+                    auto keystart = std::string("UPDATE usertable ").length();
+                    auto keyend = line.find(" [", keystart);
+                    auto key = line.substr(keystart, keyend - keystart);
+
+                    uint64_t target_reg = std::stoull(key.substr(4)) % layout.num_registers;
+                    operations.push_back({target_reg, OpPut, 0});
+                } 
+                else if (!(std::strncmp("INSERT ", line.c_str(), 7))) {
+                    auto keystart = std::string("INSERT usertable ").length();
+                    auto keyend = line.find(" [", keystart);
+                    auto key = line.substr(keystart, keyend - keystart);
+
+                    // INSERTS GET THEIR OWN KEY BAND, above everything the
+                    // load phase wrote. Not the same mapping as the other ops,
+                    // and not the raw key either -- both are wrong here:
+                    //
+                    //  * `% num_registers`, as READ/UPDATE/SCAN and the load
+                    //    phase all use, folds insert keys straight back onto
+                    //    loaded keys. Every insert becomes an update and the
+                    //    only difference between D or E and B or C disappears.
+                    //
+                    //  * the raw key does not work either. YCSB's default
+                    //    insertorder is `hashed`, so these are not a counter
+                    //    from recordcount -- they are hashed 64-bit values
+                    //    spanning ~2e16 to ~9.2e18 (checked against the real
+                    //    generator). Using them raw scatters inserts across the
+                    //    whole key space, nowhere near the [0, num_registers)
+                    //    band everything else touches, and brushes up against
+                    //    kReservedKey (UINT64_MAX) as a sentinel collision.
+                    //
+                    // So: hash into a band of 4*num_registers starting at
+                    // num_registers. Keys are genuinely new (disjoint from the
+                    // loaded range by construction), bounded, adjacent to the
+                    // loaded data so the structure stays compact, and clear of
+                    // the sentinel. The band is 4x wider than the insert count
+                    // a standard run issues (5% of operationcount), which keeps
+                    // insert-on-insert collisions low without being sparse.
+                    //
+                    // BUDGET THE ARENA FOR THESE. An insert allocates a vector
+                    // and may split, and nothing is reclaimed, so
+                    // --vecs-per-client has to cover recordcount plus the
+                    // inserts the run will issue.
+                    uint64_t const raw = std::stoull(key.substr(4));
+                    uint64_t const band = layout.num_registers * 4;
+                    uint64_t const insert_key =
+                        layout.num_registers + (raw % band);
+                    operations.push_back({insert_key, OpInsert, 0});
+                }
+                else if (!(std::strncmp("SCAN ", line.c_str(), 5))) {
+                    auto keystart = std::string("SCAN usertable ").length();
+                    auto keyend = line.find(" ", keystart);
+                    auto key = line.substr(keystart, keyend - keystart);
+
+                    auto countstart = keyend + 1;
+                    auto countend = line.find(" [", countstart);
+                    uint64_t scan_len = std::stoull(line.substr(countstart, countend - countstart));
+
+                    uint64_t target_reg = std::stoull(key.substr(4)) % layout.num_registers;
+                    operations.push_back({target_reg, OpScan, scan_len});
+                }
+            }
+        }
+        {
+            // Report the mix. The run phase used to parse READ/UPDATE/SCAN
+            // and drop INSERT on the floor, so a workload with inserts ran
+            // silently short and looked like a different workload. Printing
+            // the breakdown is how that stays visible.
+            size_t n_get = 0, n_put = 0, n_scan = 0, n_ins = 0;
+            for (auto const &o : operations) {
+                switch (o.type) {
+                    case OpGet:    ++n_get;  break;
+                    case OpPut:    ++n_put;  break;
+                    case OpScan:   ++n_scan; break;
+                    case OpInsert: ++n_ins;  break;
+                }
+            }
+            ds::clientOut() << "Done. Packed " << operations.size()
+                      << " operations: " << n_get << " read, " << n_put
+                      << " update, " << n_scan << " scan, " << n_ins
+                      << " insert." << std::endl;
+
+            // --ts none WITH SCANS IS A CONFIGURATION ERROR, and it has to
+            // fail HERE rather than per range.
+            //
+            // Nothing in the arena is stamped in that mode, so a range has
+            // no snapshot to answer at and RangeOperation refuses. If the
+            // run proceeded, every scan would count as a failure and the
+            // throughput number would describe a workload that answered
+            // 95% of its operations with an error -- a plausible-looking
+            // figure for something that did no useful work. Refusing up
+            // front costs one line of output instead of a void sweep.
+            //
+            // The check lives after the census because that is the first
+            // point at which the operation mix is known: the mode is a
+            // flag, but whether the workload scans is a property of the
+            // YCSB file.
+            // THE BACKSTOP. The cap is derived from the workload file
+            // before the memory region is sized, and the refusal above
+            // compares a PINNED value against that same file -- so both
+            // rest on having read the file correctly. This checks the
+            // operations that were actually packed, which is the thing
+            // that matters and the only place it can be known exactly.
+            //
+            // Cannot be fixed by resizing here: bulkBufsSize() was
+            // registered long before this point. So it refuses, for the
+            // same reason the pinned check does -- a truncated scan
+            // measures a workload nobody asked for.
+            {
+                uint64_t widest = 0;
+                for (auto const &o : operations) {
+                    if (o.type == OpScan && o.scan_len > widest) {
+                        widest = o.scan_len;
+                    }
+                }
+                if (widest > state.layout.max_range) {
+                    std::cerr << "\n*** the packed workload contains a scan "
+                                 "of " << widest << " entries but maxrange "
+                                 "is " << state.layout.max_range
+                              << ".\n*** Every longer scan would be "
+                                 "silently truncated. This is a harness "
+                                 "bug:\n*** the cap is derived from the "
+                                 "workload file, so the file and the packed "
+                                 "\n*** operations disagree."
+                              << std::endl;
+                    return 1;
+                }
+            }
+
+            if (!ds::tsStamps(state.layout.ts_mode) && n_scan > 0) {
+                std::cerr << "\n*** --ts none cannot run a workload with "
+                          << "scans: " << n_scan << " of "
+                          << operations.size() << " operations are scans."
+                          << "\n*** No version is stamped in that mode, so "
+                          << "a range has no snapshot to answer at."
+                          << "\n*** Use --ts faa (or clock/tsc) for scan "
+                          << "workloads; --ts none is for the point-only "
+                          << "workloads (YCSB A-D)." << std::endl;
+                return 1;
+            }
+        }
+
+        ds::clientOut() << "Waiting for the initialization of other clients... " << std::flush;
+        ce.announceReady(store, "qp", "initialized");
+        ce.waitReadyAll(store, "qp", "initialized");
+        ds::clientOut() << "Done." << std::endl;
+
+        ds::clientOut() << "Running the benchmark (YCSB Swarm Engine)... " << std::endl;
+
+        std::chrono::steady_clock::time_point start_time;
+        std::chrono::steady_clock::time_point end_time;
+        bool measuring = false;
+        size_t skipped = 0;
+
+        // Heights are drawn here rather than inside the put, because the
+        // cache's geometry expects a geometric distribution with
+        // p = 1/kLevelRatio and the drawing has to be reproducible for a
+        // given seed. Seeded per client so two clients do not make an
+        // identical structural decision for the same key.
+        std::mt19937_64 height_rng(0x5EED ^ proc_id);
+
+        for (size_t i = 0; i < total_iter_count; i++) {
+            auto& op = operations[(i + skipped) % operations.size()];
+
+            if (i == start_measurements) {
+                // Drain before starting the clock: otherwise operations
+                // issued during warmup complete inside the measured window
+                // and are counted as its throughput.
+                client.finishAllFutures();
+
+                // BARRIER, OR THE SUM OVER CLIENTS IS MEANINGLESS.
+                //
+                // There is a barrier at initialization but there was none
+                // here, so each client ran `warmup` operations at its own
+                // pace and began measuring whenever it personally arrived.
+                // Client start times therefore drifted, and once the drift
+                // exceeded keepwarm the per-client windows stopped
+                // overlapping: every client measured a system carrying only
+                // part of the load, and the sweep summed those rates into a
+                // total the system never delivered.
+                //
+                // OBSERVED on workload E from the same binary with a
+                // fixed number of measured operations each: runs whose
+                // per-client windows all had the same duration agreed with
+                // each other, while a run whose windows differed by several
+                // times reported roughly double. In that run one client
+                // finished its whole allocation faster than a single
+                // UNCONTENDED client can go on this cluster, while its own
+                // sibling on the same node took several times as long.
+                // Both cannot be right about a shared system unless they
+                // measured different stretches of wall-clock time. The
+                // excursion is ABOVE the figure that reproduces whenever
+                // the windows are tight, so the error flatters us.
+                //
+                // memstore::barrier is an atomic increment-and-wait and it
+                // THROWS if the count passes wait_for, so a counter left
+                // over from a previous run fails loudly instead of letting
+                // the barrier through. remote-memc.sh restarts memcached
+                // per run, so it starts clean. Only clients reach this
+                // loop (is_client == proc_id > num_servers), hence
+                // num_clients and not num_clients + num_servers -- waiting
+                // on the servers here would hang forever, because they
+                // never enter the benchmark.
+                store.barrier("measure-start", layout.num_clients);
+
+                measuring = true;
+                start_time = std::chrono::steady_clock::now();
+            } else if (i == stop_measurements) {
+                // And drain before stopping it, so operations issued inside
+                // the window are paid for inside it. Without this the tail
+                // of the pipeline is free and the number is inflated by
+                // roughly async_parallelism operations.
+                //
+                // NO BARRIER HERE, DELIBERATELY. Every client runs the same
+                // iter_count, so a barrier before end_time would park the
+                // fast clients until the slow ones caught up and count that
+                // idle wait inside their own measured window -- deflating
+                // exactly the clients that were working hardest. The starts
+                // are what must coincide; enlarged keepwarm (above) keeps
+                // the finished clients loading the system through the tail.
+                client.finishAllFutures();
+                measuring = false;
+                end_time = std::chrono::steady_clock::now();
+            }
+            switch (op.type) {
+                case OpGet: {
+                    // target_reg is the workload's key. It indexed a flat
+                    // register array; it is now a skip-vector key, which is
+                    // the same integer used for a different thing -- so
+                    // these numbers are a fresh baseline and not comparable
+                    // with any register-path measurement.
+                    client.getFreeFuture().doGet(op.target_reg, measuring);
+                    break;
+                }
+                case OpScan: {
+                    // A10: the SKIP-VECTOR range. This used to go to the
+                    // register RangeFuture over the old flat array, which
+                    // meant a scan-heavy workload measured the previous
+                    // structure -- and, worse, that E's scans and its
+                    // inserts touched two disjoint structures, so the
+                    // inserts never grew the thing being scanned.
+                    //
+                    // The interval is a KEY RANGE now, not a register span.
+                    // YCSB gives a start key and a count, and the skip
+                    // vector is ordered, so the count becomes an upper
+                    // bound on the entries returned rather than a bound on
+                    // the key distance -- which is what a scan means for an
+                    // ordered structure and what dLSM's iterator does too.
+                    // The key window is left open at the top and the CAP is
+                    // what stops it; a fixed key width would return a
+                    // wildly variable number of entries depending on how
+                    // dense the keyspace is there.
+                    uint64_t len = op.scan_len;
+                    if (len > layout.max_range) len = layout.max_range;
+                    if (len == 0) len = 1;
+                    client.getFreeFuture().doRange(
+                        op.target_reg, ds::kUnboundedKey, len, measuring);
+                    break;
+                }
+                case OpPut: {
+                    uint32_t const h = ds::drawHeight(
+                        height_rng, static_cast<uint32_t>(layout.cache_layers));
+                    client.getFreeFuture().doPut(op.target_reg, 69, h, measuring);
+                    break;
+                }
+                case OpInsert: {
+                    // Mechanically the same call as OpPut -- a put of an
+                    // absent key IS an insert, and F1/F2 decide which by
+                    // looking at the node. Kept as its own case so the
+                    // counts below can separate "rewrote a loaded key" from
+                    // "grew the structure", which are different costs: an
+                    // insert is the only op that can force a split.
+                    //
+                    // CAVEAT ON LONG RUNS. `operations` is cycled when
+                    // total_iter_count exceeds its length, so on the second
+                    // pass these keys already exist and the op degrades to
+                    // an update. The counter below reports issued inserts,
+                    // not distinct keys.
+                    uint32_t const h = ds::drawHeight(
+                        height_rng, static_cast<uint32_t>(layout.cache_layers));
+                    client.getFreeFuture().doPut(op.target_reg, 69, h, measuring);
+                    break;
+                }
+                default:
+                    break;
+            }
+            // NO DRAIN HERE. The loop used to call finishAllFutures() every
+            // iteration, which made the client synchronous: one operation
+            // in flight at a time, so async_parallelism did nothing at all.
+            // getFreeFuture() is what bounds concurrency now -- it returns
+            // a slot only once that slot's operation has finished.
+        }
+
+        client.finishAllFutures();
+        ds::clientOut() << "Done. Results:" << std::endl;
+
+        client.reportStats(detailed);
+        // THREE DECIMALS, AND THE RESOLUTION IS THE WHOLE REASON.
+        //
+        // This printed an INTEGER number of kops per client. Per-client
+        // throughput falls as clients are added -- workload A at 64
+        // clients is a few kops each -- so the smallest representable
+        // difference was 1 kops/client, which across all of them is a
+        // large share of the total, or
+        // a large share of the total. Every client in a cell reported the
+        // identical integer and the summed total landed on an exact
+        // multiple of the client count.
+        //
+        // That is not a rounding nuisance, it manufactured findings. A
+        // kIdxExp comparison at high client counts came out as a clean
+        // doubling when the underlying per-client figures were two
+        // quantization steps apart, so the true ratio was anywhere in a
+        // wide band. It also masqueraded as run-to-run variance, and an
+        // instrumented (--latency 1) run could appear FASTER than an
+        // uninstrumented one purely by landing one step up.
+        //
+        // Computed in double rather than truncating integer division for
+        // the same reason. lib.sh's total_kops and the plotter's
+        // _TPUT_PATTERNS both accept a decimal now.
+        fmt::print("Local tput: {:.3f} kops\n",
+                static_cast<double>(iter_count) * 1e6
+                / static_cast<double>((end_time - start_time).count()));
+        fmt::print("Local duration: {}s\n", 
+        static_cast<uint64_t>((end_time - start_time).count() / 1000000000));
+        ds::clientOut() << std::flush;
+        
+        ce.announceReady(store, "qp", "finished");
+        ce.waitReadyAll(store, "qp", "finished");
+        ce.unannounceReady(store, "qp", "initialized");
+    }
+    return 0;
+}
+
 int main(int argc, char** argv) {
     ds::ProcId proc_id = 0;
     bool show_help = false;
@@ -533,6 +1071,20 @@ int main(int argc, char** argv) {
     // writes, and the comparison would then confound cache sharing with both.
     int64_t client_threads = 1;
     int64_t thread_stride = 1;
+    // SHARING IS SEPARABLE FROM THREADING, AND HAS TO BE.
+    //
+    // Hosting a node's clients as threads does two things at once: it lets
+    // them share one directory, and it removes seven of every eight
+    // per-process ControlBlocks, registered MRs, CQ sets and polling loops. If
+    // the threaded arm wins, either could be responsible, and the experiment
+    // as designed cannot say which.
+    //
+    // So --share-cache 0 with --threads > 1 gives each thread its OWN cache:
+    // the same launch, the same overhead saving, none of the sharing. Then
+    // (threads, own cache) minus (processes) is the consolidation alone, and
+    // (threads, shared) minus (threads, own) is the sharing alone. Costs one
+    // flag, because NodeCache is already a separate object.
+    int64_t share_cache = 1;
 
     // -1 means "not given". The guard below must distinguish a contradictory
     // EXPLICIT request (--cache-walk 1 --cache 0, which is a mistake worth
@@ -680,6 +1232,13 @@ int main(int argc, char** argv) {
             "operation avoids: repairing on a recovered hop leaves the shared "
             "directory fresher, so each path also cuts the OTHER path's "
             "traversals. 0 restores the previous behaviour.") |
+        lyra::opt(share_cache, "share_cache").optional()["--share-cache"](
+            "Whether the client threads in this process SHARE one per-node "
+            "cache (1, default) or each keep their own (0). 0 exists to "
+            "separate the two effects of threading: with --threads > 1 it "
+            "keeps the reduced per-process overhead while removing the "
+            "sharing, so the two can be attributed separately. Meaningless at "
+            "--threads 1, where there is nothing to share with.") |
         lyra::opt(client_threads, "client_threads").optional()["--threads"](
             "Client THREADS this process hosts, sharing one per-node cache "
             "(default 1, which is one client per process and one cache per "
@@ -876,13 +1435,24 @@ int main(int argc, char** argv) {
                   << std::endl;
         return 1;
     }
+    if (share_cache != 0 && share_cache != 1) {
+        std::cerr << "--share-cache must be 0 or 1, got " << share_cache
+                  << std::endl;
+        return 1;
+    }
     if (client_threads > 1) {
         // Say it out loud: a run that shares a cache is not comparable with one
         // that does not, and the whole point is to tell them apart.
         std::cerr << "NOTE: hosting " << client_threads
                   << " client threads in this process, proc ids "
-                  << proc_id << " step " << thread_stride
-                  << ", sharing ONE per-node cache." << std::endl;
+                  << proc_id << " step " << thread_stride << ", "
+                  << (share_cache ? "SHARING one per-node cache"
+                                  : "each with its OWN cache (sharing off)")
+                  << "." << std::endl;
+    } else if (share_cache == 0) {
+        std::cerr << "NOTE: --share-cache 0 with --threads 1 changes nothing; "
+                     "there is no co-located thread to share with."
+                  << std::endl;
     }
 
     bool const cache_walk_explicit = cache_walk_arg >= 0;
@@ -1015,6 +1585,12 @@ int main(int argc, char** argv) {
                   << " (put)"
                   << "  idx-exp: " << ds::kIdxExp
                   << "  node-capacity: " << ds::kNodeCapacity
+                  << "\n"
+                  << "  client-threads: " << client_threads
+                  << "  cache: "
+                  << (client_threads > 1
+                          ? (share_cache ? "shared per node" : "per thread")
+                          : "per process")
                   << std::endl;
     }
 
@@ -1128,512 +1704,25 @@ int main(int argc, char** argv) {
     ce.unannounceReady(store, "qp", "prepared");
 
     if (is_client) {
-        // ONE CACHE PER NODE, not per client. Constructed outside the client so
-        // that when this process hosts several client THREADS they all consult
-        // and repair the same directory -- which is what the cache was written
-        // for, and what eight separate processes on a node were throwing away.
-        // At one client per process this is exactly today's arrangement, which
-        // is what makes the split verifiable before any threads exist.
+        // ONE CACHE PER NODE, or one per thread with --share-cache 0. Built
+        // here rather than inside the client so several client threads in this
+        // process can be handed the same one; at --threads 1 it is one cache
+        // for one client, which is what it has always been.
 #if DS_CACHE_ENABLED
         ds::NodeCache node_cache{layout.cache_layers};
-        ds::DsClient client{layout, ce, proc_id, node_cache};
+        int const client_rc =
+            runClient(layout, proc_id, ce, store, node_cache, workload,
+                      ycsb_path, iter_count, warmup, keepwarm,
+                      start_measurements, stop_measurements, total_iter_count,
+                      detailed, run_selftest, run_ml_workload, think_time);
 #else
-        ds::DsClient client{layout, ce, proc_id};
+        int const client_rc =
+            runClient(layout, proc_id, ce, store, workload,
+                      ycsb_path, iter_count, warmup, keepwarm,
+                      start_measurements, stop_measurements, total_iter_count,
+                      detailed, run_selftest, run_ml_workload, think_time);
 #endif
-        ds::DsState& state = client.getState();
-
-        // ─── Bootstrap the skip vector ─────────────────────────────
-        //
-        // The first client writes the initial structure. Everything below this
-        // point runs after the "initialized" barrier that every process already
-        // waits on, so there is no need for a barrier of our own: no client
-        // traverses before that barrier, and the writes complete before we
-        // announce.
-        bool const is_initializer = (proc_id == layout.firstClientId());
-        if (is_initializer) {
-            bootstrap_structure(state);
-        }
-
-#if DS_CACHE_ENABLED
-        // Hand the cache its head addresses. These are reserved constants, so
-        // this needs no discovery -- but it does need doing, because a cache
-        // that was never told them reports a miss for every key left of the
-        // first boundary at every level, which is correct but silently slow
-        // (interface doc §5).
-        ds::bootstrapHeads(state.cache_sv,
-                           ds::headAddrs(static_cast<uint32_t>(layout.cache_layers)));
-        if (!ds::headsBootstrapped(state.cache_sv)) {
-            std::cerr << "Cache heads were not bootstrapped" << std::endl;
-            return 1;
-        }
-#endif
-
-        // ─── Structure selftest ────────────────────────────────────
-        //
-        // Its own path, so it needs neither YCSB nor a workload file. It has to
-        // run after every client has passed the barrier, since a concurrent
-        // bootstrap write would look like corruption to a sequential checker.
-        if (run_selftest) {
-            ce.announceReady(store, "qp", "initialized");
-            ce.waitReadyAll(store, "qp", "initialized");
-
-            int const rc = run_structure_selftest(state);
-            state.reportCache();
-
-            ce.announceReady(store, "qp", "finished");
-            ce.waitReadyAll(store, "qp", "finished");
-            ce.unannounceReady(store, "qp", "initialized");
-            ce.unannounceReady(store, "qp", "connected");
-            ds::clientOut() << "###DONE###" << std::endl;
-            return rc;
-        }
-
-        // SWARM PATTERN: First client triggers initial data loading phase
-        if (proc_id == (layout.num_servers + 1)) {
-            ds::clientOut() << "Querying YCSB for the set of initial key-pairs... " << std::flush;
-            std::vector<std::pair<std::string, std::string>> inserts = {};
-
-            {
-                auto fp = exec(ycsb_path + " load basic -P " + workload + " -s 2> /dev/null");
-                char buffer[1024];
-                while (fgets(buffer, sizeof(buffer), fp.get()) != nullptr) {
-                    std::string line(buffer);
-                    if (std::strncmp("INSERT ", line.c_str(), 7) != 0) {
-                        continue;
-                    }
-                    auto keystart = std::string("INSERT usertable ").length();
-                    auto keyend = line.find(" [", keystart);
-                    auto key = line.substr(keystart, keyend - keystart);
-
-                    auto start = keyend + std::string(" [ field0=").length();
-                    auto end = line.length() - std::string(" ]\n").length();
-                    auto value = line.substr(start, end - start);
-
-                    inserts.emplace_back(key, value);
-                }
-            }
-            ds::clientOut() << "Done." << std::endl;
-
-            ds::clientOut() << "Inserting the initial key-pairs... " << std::flush;
-            // Same seed rule as the measured phase: reproducible per client,
-            // and different between clients so two do not make an identical
-            // structural decision for the same key.
-            std::mt19937_64 pop_rng(0xB0B ^ proc_id);
-            // PARTITION THE PRELOAD ACROSS CLIENTS. It used to be
-            // `kvIndex = 0; kvIndex < inserts.size()` on EVERY client, so all
-            // of them inserted the whole key set.
-            //
-            // At high client counts that is millions of put operations to
-            // build a key set of a hundred thousand, and it was wrong in three
-            // ways at once:
-            //
-            //  1. WRONG WORKLOAD. Only the first client to reach a key inserts
-            //     it; every other client performs an UPDATE. So the "load"
-            //     phase ran almost entirely updates, which is not what loading
-            //     a structure means, and the split history that comes out of
-            //     it -- orphan counts, occupancy, level populations -- is
-            //     shaped by those writes rather than by the key set.
-            //  2. WRONG ARENA. Every put allocates a vector (copy-on-write, no
-            //     reclamation), so the preload alone reserved a vector per key
-            //     PER CLIENT. At high client counts the arena approached the
-            //     servers' available memory and throughput collapsed -- which
-            //     looked like a scaling limit and was memory pressure.
-            //  3. WRONG SETUP TIME. Work proportional to the client count
-            //     before every run, all of it unnecessary.
-            //
-            // Striding by client_idx gives each client a disjoint share, so the
-            // total is the key set exactly once. finishAllFutures below plus
-            // the "initialized" barrier still order the whole load before any
-            // client starts measuring, so no client can observe a partially
-            // loaded structure.
-            uint64_t const preload_stride = layout.num_clients;
-            uint64_t const preload_start = state.client_idx;
-            for (size_t kvIndex = preload_start; kvIndex < inserts.size();
-                 kvIndex += preload_stride) {
-                
-                // Extract numerical representation of key string for the register mapping
-                uint64_t target_reg = std::stoull(inserts[kvIndex].first.substr(4)) % layout.num_registers;
-                // ds::clientOut() << "Inserting register: " << target_reg << std::endl;
-                // Population, so heights are drawn: this is what builds the
-                // index the measured phase then traverses. A populated
-                // structure with no index would measure a linked list.
-                uint32_t const ph = ds::drawHeight(
-                    pop_rng, static_cast<uint32_t>(layout.cache_layers));
-                client.getFreeFuture().doPut(target_reg, 69, ph, false);
-            }
-            client.finishAllFutures();
-            ds::clientOut() << " Done." << std::endl;
-        }
-
-        if (run_ml_workload) {
-            // Trackers are assigned based on a normalized structural index 
-            // sequence. If this is client #1 (proc_id == num_servers + 1), it becomes ID 0 (Tracker).
-            uint64_t global_thread_id = proc_id - layout.num_servers - 1;
-
-            ds::clientOut() << "Running single-threaded ML tracker workload. ID=" << global_thread_id  << "Registers=" << layout.num_registers << "Clients=" << layout.num_clients << std::endl;
-            
-            // Sync with cluster deployment infrastructure
-            ce.announceReady(store, "qp", "initialized");
-            ce.waitReadyAll(store, "qp", "initialized");
-
-            run_ml_prog_tracker_workload(client, global_thread_id,
-                             layout.num_clients, iter_count,
-                             think_time, store);
-
-            ce.announceReady(store, "qp", "finished");
-            ce.waitReadyAll(store, "qp", "finished");
-            ce.unannounceReady(store, "qp", "initialized");
-        } 
-        else {
-            ds::clientOut() << "Configuring Client " << proc_id << std::endl;
-            
-            // SWARM PATTERN: Load continuous execution operations
-            ds::clientOut() << "Querying YCSB for the list of operations... " << std::flush;
-
-            {
-                auto fp = exec(ycsb_path + " run basic -P " + workload + " -s 2> /dev/null");
-                char buffer[1024];
-                while (fgets(buffer, sizeof(buffer), fp.get()) != nullptr) {
-                    std::string line(buffer);
-                    
-                    if (!(std::strncmp("READ ", line.c_str(), 5))) {
-                        auto keystart = std::string("READ usertable ").length();
-                        auto keyend = line.find(" [", keystart);
-                        auto key = line.substr(keystart, keyend - keystart);
-
-                        uint64_t target_reg = std::stoull(key.substr(4)) % layout.num_registers;
-                        operations.push_back({target_reg, OpGet, 0});
-                    } 
-                    else if (!(std::strncmp("UPDATE ", line.c_str(), 7))) {
-                        auto keystart = std::string("UPDATE usertable ").length();
-                        auto keyend = line.find(" [", keystart);
-                        auto key = line.substr(keystart, keyend - keystart);
-
-                        uint64_t target_reg = std::stoull(key.substr(4)) % layout.num_registers;
-                        operations.push_back({target_reg, OpPut, 0});
-                    } 
-                    else if (!(std::strncmp("INSERT ", line.c_str(), 7))) {
-                        auto keystart = std::string("INSERT usertable ").length();
-                        auto keyend = line.find(" [", keystart);
-                        auto key = line.substr(keystart, keyend - keystart);
-
-                        // INSERTS GET THEIR OWN KEY BAND, above everything the
-                        // load phase wrote. Not the same mapping as the other ops,
-                        // and not the raw key either -- both are wrong here:
-                        //
-                        //  * `% num_registers`, as READ/UPDATE/SCAN and the load
-                        //    phase all use, folds insert keys straight back onto
-                        //    loaded keys. Every insert becomes an update and the
-                        //    only difference between D or E and B or C disappears.
-                        //
-                        //  * the raw key does not work either. YCSB's default
-                        //    insertorder is `hashed`, so these are not a counter
-                        //    from recordcount -- they are hashed 64-bit values
-                        //    spanning ~2e16 to ~9.2e18 (checked against the real
-                        //    generator). Using them raw scatters inserts across the
-                        //    whole key space, nowhere near the [0, num_registers)
-                        //    band everything else touches, and brushes up against
-                        //    kReservedKey (UINT64_MAX) as a sentinel collision.
-                        //
-                        // So: hash into a band of 4*num_registers starting at
-                        // num_registers. Keys are genuinely new (disjoint from the
-                        // loaded range by construction), bounded, adjacent to the
-                        // loaded data so the structure stays compact, and clear of
-                        // the sentinel. The band is 4x wider than the insert count
-                        // a standard run issues (5% of operationcount), which keeps
-                        // insert-on-insert collisions low without being sparse.
-                        //
-                        // BUDGET THE ARENA FOR THESE. An insert allocates a vector
-                        // and may split, and nothing is reclaimed, so
-                        // --vecs-per-client has to cover recordcount plus the
-                        // inserts the run will issue.
-                        uint64_t const raw = std::stoull(key.substr(4));
-                        uint64_t const band = layout.num_registers * 4;
-                        uint64_t const insert_key =
-                            layout.num_registers + (raw % band);
-                        operations.push_back({insert_key, OpInsert, 0});
-                    }
-                    else if (!(std::strncmp("SCAN ", line.c_str(), 5))) {
-                        auto keystart = std::string("SCAN usertable ").length();
-                        auto keyend = line.find(" ", keystart);
-                        auto key = line.substr(keystart, keyend - keystart);
-
-                        auto countstart = keyend + 1;
-                        auto countend = line.find(" [", countstart);
-                        uint64_t scan_len = std::stoull(line.substr(countstart, countend - countstart));
-
-                        uint64_t target_reg = std::stoull(key.substr(4)) % layout.num_registers;
-                        operations.push_back({target_reg, OpScan, scan_len});
-                    }
-                }
-            }
-            {
-                // Report the mix. The run phase used to parse READ/UPDATE/SCAN
-                // and drop INSERT on the floor, so a workload with inserts ran
-                // silently short and looked like a different workload. Printing
-                // the breakdown is how that stays visible.
-                size_t n_get = 0, n_put = 0, n_scan = 0, n_ins = 0;
-                for (auto const &o : operations) {
-                    switch (o.type) {
-                        case OpGet:    ++n_get;  break;
-                        case OpPut:    ++n_put;  break;
-                        case OpScan:   ++n_scan; break;
-                        case OpInsert: ++n_ins;  break;
-                    }
-                }
-                ds::clientOut() << "Done. Packed " << operations.size()
-                          << " operations: " << n_get << " read, " << n_put
-                          << " update, " << n_scan << " scan, " << n_ins
-                          << " insert." << std::endl;
-
-                // --ts none WITH SCANS IS A CONFIGURATION ERROR, and it has to
-                // fail HERE rather than per range.
-                //
-                // Nothing in the arena is stamped in that mode, so a range has
-                // no snapshot to answer at and RangeOperation refuses. If the
-                // run proceeded, every scan would count as a failure and the
-                // throughput number would describe a workload that answered
-                // 95% of its operations with an error -- a plausible-looking
-                // figure for something that did no useful work. Refusing up
-                // front costs one line of output instead of a void sweep.
-                //
-                // The check lives after the census because that is the first
-                // point at which the operation mix is known: the mode is a
-                // flag, but whether the workload scans is a property of the
-                // YCSB file.
-                // THE BACKSTOP. The cap is derived from the workload file
-                // before the memory region is sized, and the refusal above
-                // compares a PINNED value against that same file -- so both
-                // rest on having read the file correctly. This checks the
-                // operations that were actually packed, which is the thing
-                // that matters and the only place it can be known exactly.
-                //
-                // Cannot be fixed by resizing here: bulkBufsSize() was
-                // registered long before this point. So it refuses, for the
-                // same reason the pinned check does -- a truncated scan
-                // measures a workload nobody asked for.
-                {
-                    uint64_t widest = 0;
-                    for (auto const &o : operations) {
-                        if (o.type == OpScan && o.scan_len > widest) {
-                            widest = o.scan_len;
-                        }
-                    }
-                    if (widest > state.layout.max_range) {
-                        std::cerr << "\n*** the packed workload contains a scan "
-                                     "of " << widest << " entries but maxrange "
-                                     "is " << state.layout.max_range
-                                  << ".\n*** Every longer scan would be "
-                                     "silently truncated. This is a harness "
-                                     "bug:\n*** the cap is derived from the "
-                                     "workload file, so the file and the packed "
-                                     "\n*** operations disagree."
-                                  << std::endl;
-                        return 1;
-                    }
-                }
-
-                if (!ds::tsStamps(state.layout.ts_mode) && n_scan > 0) {
-                    std::cerr << "\n*** --ts none cannot run a workload with "
-                              << "scans: " << n_scan << " of "
-                              << operations.size() << " operations are scans."
-                              << "\n*** No version is stamped in that mode, so "
-                              << "a range has no snapshot to answer at."
-                              << "\n*** Use --ts faa (or clock/tsc) for scan "
-                              << "workloads; --ts none is for the point-only "
-                              << "workloads (YCSB A-D)." << std::endl;
-                    return 1;
-                }
-            }
-
-            ds::clientOut() << "Waiting for the initialization of other clients... " << std::flush;
-            ce.announceReady(store, "qp", "initialized");
-            ce.waitReadyAll(store, "qp", "initialized");
-            ds::clientOut() << "Done." << std::endl;
-
-            ds::clientOut() << "Running the benchmark (YCSB Swarm Engine)... " << std::endl;
-
-            std::chrono::steady_clock::time_point start_time;
-            std::chrono::steady_clock::time_point end_time;
-            bool measuring = false;
-            size_t skipped = 0;
-
-            // Heights are drawn here rather than inside the put, because the
-            // cache's geometry expects a geometric distribution with
-            // p = 1/kLevelRatio and the drawing has to be reproducible for a
-            // given seed. Seeded per client so two clients do not make an
-            // identical structural decision for the same key.
-            std::mt19937_64 height_rng(0x5EED ^ proc_id);
-
-            for (size_t i = 0; i < total_iter_count; i++) {
-                auto& op = operations[(i + skipped) % operations.size()];
-
-                if (i == start_measurements) {
-                    // Drain before starting the clock: otherwise operations
-                    // issued during warmup complete inside the measured window
-                    // and are counted as its throughput.
-                    client.finishAllFutures();
-
-                    // BARRIER, OR THE SUM OVER CLIENTS IS MEANINGLESS.
-                    //
-                    // There is a barrier at initialization but there was none
-                    // here, so each client ran `warmup` operations at its own
-                    // pace and began measuring whenever it personally arrived.
-                    // Client start times therefore drifted, and once the drift
-                    // exceeded keepwarm the per-client windows stopped
-                    // overlapping: every client measured a system carrying only
-                    // part of the load, and the sweep summed those rates into a
-                    // total the system never delivered.
-                    //
-                    // OBSERVED on workload E from the same binary with a
-                    // fixed number of measured operations each: runs whose
-                    // per-client windows all had the same duration agreed with
-                    // each other, while a run whose windows differed by several
-                    // times reported roughly double. In that run one client
-                    // finished its whole allocation faster than a single
-                    // UNCONTENDED client can go on this cluster, while its own
-                    // sibling on the same node took several times as long.
-                    // Both cannot be right about a shared system unless they
-                    // measured different stretches of wall-clock time. The
-                    // excursion is ABOVE the figure that reproduces whenever
-                    // the windows are tight, so the error flatters us.
-                    //
-                    // memstore::barrier is an atomic increment-and-wait and it
-                    // THROWS if the count passes wait_for, so a counter left
-                    // over from a previous run fails loudly instead of letting
-                    // the barrier through. remote-memc.sh restarts memcached
-                    // per run, so it starts clean. Only clients reach this
-                    // loop (is_client == proc_id > num_servers), hence
-                    // num_clients and not num_clients + num_servers -- waiting
-                    // on the servers here would hang forever, because they
-                    // never enter the benchmark.
-                    store.barrier("measure-start", layout.num_clients);
-
-                    measuring = true;
-                    start_time = std::chrono::steady_clock::now();
-                } else if (i == stop_measurements) {
-                    // And drain before stopping it, so operations issued inside
-                    // the window are paid for inside it. Without this the tail
-                    // of the pipeline is free and the number is inflated by
-                    // roughly async_parallelism operations.
-                    //
-                    // NO BARRIER HERE, DELIBERATELY. Every client runs the same
-                    // iter_count, so a barrier before end_time would park the
-                    // fast clients until the slow ones caught up and count that
-                    // idle wait inside their own measured window -- deflating
-                    // exactly the clients that were working hardest. The starts
-                    // are what must coincide; enlarged keepwarm (above) keeps
-                    // the finished clients loading the system through the tail.
-                    client.finishAllFutures();
-                    measuring = false;
-                    end_time = std::chrono::steady_clock::now();
-                }
-                switch (op.type) {
-                    case OpGet: {
-                        // target_reg is the workload's key. It indexed a flat
-                        // register array; it is now a skip-vector key, which is
-                        // the same integer used for a different thing -- so
-                        // these numbers are a fresh baseline and not comparable
-                        // with any register-path measurement.
-                        client.getFreeFuture().doGet(op.target_reg, measuring);
-                        break;
-                    }
-                    case OpScan: {
-                        // A10: the SKIP-VECTOR range. This used to go to the
-                        // register RangeFuture over the old flat array, which
-                        // meant a scan-heavy workload measured the previous
-                        // structure -- and, worse, that E's scans and its
-                        // inserts touched two disjoint structures, so the
-                        // inserts never grew the thing being scanned.
-                        //
-                        // The interval is a KEY RANGE now, not a register span.
-                        // YCSB gives a start key and a count, and the skip
-                        // vector is ordered, so the count becomes an upper
-                        // bound on the entries returned rather than a bound on
-                        // the key distance -- which is what a scan means for an
-                        // ordered structure and what dLSM's iterator does too.
-                        // The key window is left open at the top and the CAP is
-                        // what stops it; a fixed key width would return a
-                        // wildly variable number of entries depending on how
-                        // dense the keyspace is there.
-                        uint64_t len = op.scan_len;
-                        if (len > layout.max_range) len = layout.max_range;
-                        if (len == 0) len = 1;
-                        client.getFreeFuture().doRange(
-                            op.target_reg, ds::kUnboundedKey, len, measuring);
-                        break;
-                    }
-                    case OpPut: {
-                        uint32_t const h = ds::drawHeight(
-                            height_rng, static_cast<uint32_t>(layout.cache_layers));
-                        client.getFreeFuture().doPut(op.target_reg, 69, h, measuring);
-                        break;
-                    }
-                    case OpInsert: {
-                        // Mechanically the same call as OpPut -- a put of an
-                        // absent key IS an insert, and F1/F2 decide which by
-                        // looking at the node. Kept as its own case so the
-                        // counts below can separate "rewrote a loaded key" from
-                        // "grew the structure", which are different costs: an
-                        // insert is the only op that can force a split.
-                        //
-                        // CAVEAT ON LONG RUNS. `operations` is cycled when
-                        // total_iter_count exceeds its length, so on the second
-                        // pass these keys already exist and the op degrades to
-                        // an update. The counter below reports issued inserts,
-                        // not distinct keys.
-                        uint32_t const h = ds::drawHeight(
-                            height_rng, static_cast<uint32_t>(layout.cache_layers));
-                        client.getFreeFuture().doPut(op.target_reg, 69, h, measuring);
-                        break;
-                    }
-                    default:
-                        break;
-                }
-                // NO DRAIN HERE. The loop used to call finishAllFutures() every
-                // iteration, which made the client synchronous: one operation
-                // in flight at a time, so async_parallelism did nothing at all.
-                // getFreeFuture() is what bounds concurrency now -- it returns
-                // a slot only once that slot's operation has finished.
-            }
-
-            client.finishAllFutures();
-            ds::clientOut() << "Done. Results:" << std::endl;
-
-            client.reportStats(detailed);
-            // THREE DECIMALS, AND THE RESOLUTION IS THE WHOLE REASON.
-            //
-            // This printed an INTEGER number of kops per client. Per-client
-            // throughput falls as clients are added -- workload A at 64
-            // clients is a few kops each -- so the smallest representable
-            // difference was 1 kops/client, which across all of them is a
-            // large share of the total, or
-            // a large share of the total. Every client in a cell reported the
-            // identical integer and the summed total landed on an exact
-            // multiple of the client count.
-            //
-            // That is not a rounding nuisance, it manufactured findings. A
-            // kIdxExp comparison at high client counts came out as a clean
-            // doubling when the underlying per-client figures were two
-            // quantization steps apart, so the true ratio was anywhere in a
-            // wide band. It also masqueraded as run-to-run variance, and an
-            // instrumented (--latency 1) run could appear FASTER than an
-            // uninstrumented one purely by landing one step up.
-            //
-            // Computed in double rather than truncating integer division for
-            // the same reason. lib.sh's total_kops and the plotter's
-            // _TPUT_PATTERNS both accept a decimal now.
-            fmt::print("Local tput: {:.3f} kops\n",
-                    static_cast<double>(iter_count) * 1e6
-                    / static_cast<double>((end_time - start_time).count()));
-            fmt::print("Local duration: {}s\n", 
-            static_cast<uint64_t>((end_time - start_time).count() / 1000000000));
-            ds::clientOut() << std::flush;
-            
-            ce.announceReady(store, "qp", "finished");
-            ce.waitReadyAll(store, "qp", "finished");
-            ce.unannounceReady(store, "qp", "initialized");
-        }
+        if (client_rc != 0) return client_rc;
     } else {
         std::cout << "Server " << proc_id << " online." << std::endl;
         ce.announceReady(store, "qp", "initialized");
