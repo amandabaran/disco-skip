@@ -446,6 +446,7 @@ int main(int argc, char* argv[]) {
         measure_batches, death_point, iter_count};
 
     std::unique_ptr<ScanLock<Layout>> range_lock;
+
     if (layout.lock_stripes > 0) {
       if (layout.async_parallelism != 1) {
         throw std::runtime_error(

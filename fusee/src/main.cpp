@@ -150,6 +150,14 @@ int main(int argc, char* argv[]) {
               "non-linearizable baseline; 1 = one global lock; N = the key "
               "space striped N ways). Writers take the lock too, which they "
               "must for a scan to be linearizable at all.") |
+      lyra::opt(layout.lock_mode, "lock_mode")
+          .optional()["--lock-mode"](
+              "Which lock, when --lock-stripes > 0: 0 striped (default, "
+              "range_lock.hpp -- a scan rounds up to whole stripes and blocks "
+              "writers to keys it never reads), 1 range table "
+              "(range_table_lock.hpp -- one slot per client, a scan blocks "
+              "exactly the keys it reads). Same guarantee either way; they "
+              "differ in how many false conflicts they manufacture.") |
       lyra::opt(layout.key_size, "key_size").optional()["-k"]["--keysize"] |
       lyra::opt(layout.value_size, "value_size")
           .optional()["-v"]["--valuesize"] |

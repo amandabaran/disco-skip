@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #include <dory/conn/rc-exchanger.hpp>
@@ -192,7 +193,10 @@ class RangeLock {
       }
       if (wces.empty()) continue;
       if (wces[0].status != IBV_WC_SUCCESS) {
-        throw std::runtime_error("RangeLock: CAS work completion failed");
+        throw std::runtime_error(
+            std::string("RangeLock: work completion failed: ") +
+            ibv_wc_status_str(wces[0].status) + " (status " +
+            std::to_string(wces[0].status) + ")");
       }
       if (wces[0].wr_id != kLockWrId) {
         throw std::runtime_error(

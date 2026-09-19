@@ -5,6 +5,7 @@
 #include <cstring>
 #include <ctime>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #include <dory/conn/rc-exchanger.hpp>
@@ -140,8 +141,27 @@ class RangeTableLock {
       // free, which is the one bug this class exists not to have.
       throw std::runtime_error("RangeTableLock: owner id 0 is the free marker");
     }
-    slot_ = ownerSlot(owner_);
-    table_.resize(slots_ * kSlotWords);
+    // SLOTS ARE INDEXED FROM THE FIRST CLIENT, NOT FROM 1. proc ids are
+    // global: servers take 1..num_servers and clients follow, so with 3
+    // servers client 1 is proc 4. Subtracting only 1 shifted every slot up by
+    // num_servers, left slots 0..num_servers-1 permanently unused, and pushed
+    // the LAST num_servers clients off the end of the table -- which is
+    // exactly how this first failed on the cluster: clients 14, 15 and 16 of
+    // 16 died with "Lock stripe out of range: 16/17/18" while 1..13 ran, and
+    // the survivors then hung forever at the barrier waiting for the dead.
+    slot_ = ownerSlot(owner_, layout_.num_servers);
+    if (slot_ >= slots_) {
+      throw std::runtime_error(
+          "RangeTableLock: owner " + std::to_string(owner_) + " maps to slot " +
+          std::to_string(slot_) + " but the table has only " +
+          std::to_string(slots_) +
+          " slots. The table needs one slot per client; check that "
+          "--lock-mode 1 sized it from num_clients.");
+    }
+    // The table lands in REGISTERED memory immediately after the staging
+    // cacheline. A std::vector here is ordinary heap, and an RDMA read into
+    // it fails the work completion -- see Layout::lockScratchSize.
+    table_ = scratch_ + kSlotWords;
   }
 
   /// Lock [start_key, start_key + count - 1] for a scan.
@@ -178,7 +198,9 @@ class RangeTableLock {
   }
 
  private:
-  static uint64_t ownerSlot(uint64_t owner) { return owner - 1; }
+  static uint64_t ownerSlot(uint64_t owner, uint64_t num_servers) {
+    return owner - (num_servers + 1);
+  }
 
   /// Monotonic-ish wall clock, in nanoseconds, for the fairness tie-break.
   static uint64_t stampNow() {
@@ -224,7 +246,7 @@ class RangeTableLock {
   bool validate(uint64_t state, uint64_t lo, uint64_t hi, uint64_t stamp) {
     ++validations_;
     uintptr_t const base = layout_.getLockAddress(rc_.remoteBuf(), 0);
-    postBlocking(conn::ReliableConnection::RdmaRead, table_.data(),
+    postBlocking(conn::ReliableConnection::RdmaRead, table_,
                  static_cast<uint32_t>(slots_ * kSlotBytes), base);
     for (uint64_t s = 0; s < slots_; ++s) {
       if (s == slot_) continue;
@@ -256,7 +278,10 @@ class RangeTableLock {
       }
       if (wces.empty()) continue;
       if (wces[0].status != IBV_WC_SUCCESS) {
-        throw std::runtime_error("RangeTableLock: work completion failed");
+        throw std::runtime_error(
+            std::string("RangeTableLock: work completion failed: ") +
+            ibv_wc_status_str(wces[0].status) + " (status " +
+            std::to_string(wces[0].status) + ")");
       }
       if (wces[0].wr_id != kLockWrId) {
         throw std::runtime_error(
@@ -278,7 +303,7 @@ class RangeTableLock {
   uint64_t slots_;
   uint64_t slot_ = 0;
   bool held_ = false;
-  std::vector<uint64_t> table_;
+  uint64_t *table_ = nullptr;   ///< registered, inside the lock scratch
   uint64_t acquires_ = 0;
   uint64_t retries_ = 0;
   uint64_t validations_ = 0;

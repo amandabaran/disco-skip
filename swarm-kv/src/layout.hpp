@@ -137,8 +137,10 @@ struct Layout {
   uintptr_t getLockAddress(uintptr_t region, uint64_t stripe) const {
     if (lock_stripes == 0 || stripe >= lockCells()) {
       throw std::invalid_argument(
-          fmt::format("Lock stripe out of range: {} (num: {})", stripe,
-                      lock_stripes));
+          fmt::format("Lock cell out of range: {} (cells: {}, mode: {}, "
+                      "lock_stripes: {}, num_clients: {})",
+                      stripe, lockCells(), lock_mode, lock_stripes,
+                      num_clients));
     }
     return region + lockRegionOffset() + kLockStride * stripe;
   }
@@ -157,10 +159,19 @@ struct Layout {
   /// One cacheline of client-local memory for the lock's CAS result. The CAS
   /// returns the PRE-image into local memory, so it needs a registered landing
   /// slot of its own -- reusing a log entry would corrupt an in-flight write.
-  /// One cacheline of client-local memory. The striped lock lands a CAS
-  /// pre-image here; the range table stages the four words it publishes and
-  /// they must be in registered memory to be the source of an RDMA write.
-  uint64_t lockScratchSize() const { return lock_stripes == 0 ? 0 : 64; }
+  /// Client-local REGISTERED memory for the lock.
+  ///
+  /// One cacheline for the striped lock, which lands a CAS pre-image here.
+  /// The range table needs that cacheline to stage the entry it publishes AND
+  /// a landing area for the whole table it reads back -- an RDMA read must
+  /// target registered memory, and reading into a plain std::vector fails the
+  /// work completion with a local protection error. That is exactly how the
+  /// first cluster run of the table lock died: "RangeTableLock: work
+  /// completion failed", with the buffer sitting in ordinary heap.
+  uint64_t lockScratchSize() const {
+    if (lock_stripes == 0) return 0;
+    return lock_mode == 1 ? 64 + 64 * lockCells() : 64;
+  }
   uint64_t clientSize() const { return clientLogSize() + lockScratchSize(); }
   uintptr_t getLockScratchAddress() const {
     return client_local_region + clientLogSize();
