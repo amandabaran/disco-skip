@@ -14,10 +14,56 @@
 #include "latency.hpp"
 #include "layout.hpp"
 #include "range_lock.hpp"
+#include "range_table_lock.hpp"
 #include "main.hpp"
 #include "oops_client.hpp"
 
 #include <dory/shared/match.hpp>
+
+/// Either lock, chosen at run time. Both expose acquireRange / acquireKey /
+/// release, so the call sites do not branch; only construction does.
+/// Virtual dispatch costs nothing measurable against an RDMA round trip.
+template <class Layout>
+class ScanLock {
+ public:
+  virtual ~ScanLock() = default;
+  virtual void acquireRange(uint64_t start_key, uint64_t count) = 0;
+  virtual void acquireKey(uint64_t key) = 0;
+  virtual void release() = 0;
+  virtual uint64_t acquires() const = 0;
+  virtual uint64_t retries() const = 0;
+};
+
+template <class Layout>
+class StripedScanLock : public ScanLock<Layout> {
+ public:
+  StripedScanLock(Layout const& l, dory::conn::ReliableConnection& rc,
+                  uint64_t owner, uint64_t* scratch, uint64_t stripes)
+      : impl_{l, rc, owner, scratch, stripes} {}
+  void acquireRange(uint64_t s, uint64_t c) override { impl_.acquireRange(s, c); }
+  void acquireKey(uint64_t k) override { impl_.acquireKey(k); }
+  void release() override { impl_.release(); }
+  uint64_t acquires() const override { return impl_.acquires(); }
+  uint64_t retries() const override { return impl_.retries(); }
+ private:
+  dory::RangeLock<Layout> impl_;
+};
+
+template <class Layout>
+class TableScanLock : public ScanLock<Layout> {
+ public:
+  TableScanLock(Layout const& l, dory::conn::ReliableConnection& rc,
+                uint64_t owner, uint64_t* scratch, uint64_t slots)
+      : impl_{l, rc, owner, scratch, slots} {}
+  void acquireRange(uint64_t s, uint64_t c) override { impl_.acquireRange(s, c); }
+  void acquireKey(uint64_t k) override { impl_.acquireKey(k); }
+  void release() override { impl_.release(); }
+  uint64_t acquires() const override { return impl_.acquires(); }
+  uint64_t retries() const override { return impl_.retries(); }
+  uint64_t validations() const { return impl_.validations(); }
+ private:
+  dory::RangeTableLock<Layout> impl_;
+};
 
 using namespace dory;
 using namespace dory::conn;
@@ -188,6 +234,7 @@ int main(int argc, char* argv[]) {
   // range_lock.hpp for why that matters when this is compared against a system
   // with a snapshot.
   layout.lock_stripes = 0;
+  layout.lock_mode = 0;
   uint64_t death_point = uint64_t(-1);
   bool measure_batches = false;
 
@@ -240,6 +287,14 @@ int main(int argc, char* argv[]) {
               "space striped N ways). Writers take the lock too, which they "
               "must for a scan to be linearizable at all, so this costs the "
               "write path as well as the scan path.") |
+      lyra::opt(layout.lock_mode, "lock_mode")
+          .optional()["--lock-mode"](
+              "Which lock, when --lock-stripes > 0: 0 striped (default, "
+              "range_lock.hpp -- a scan rounds up to whole stripes and blocks "
+              "writers to keys it never reads), 1 range table "
+              "(range_table_lock.hpp -- one slot per client, a scan blocks "
+              "exactly the keys it reads). Same guarantee either way; they "
+              "differ in how many false conflicts they manufacture.") |
       lyra::opt(death_point, "death_point").optional()["-D"]["--death_point"] |
       lyra::opt(measure_batches, "measure_batches")
           .optional()["-B"]["--measure_batches"] |
@@ -390,7 +445,7 @@ int main(int argc, char* argv[]) {
         layout,          ce,          proc_id,   pointer_cache_size,
         measure_batches, death_point, iter_count};
 
-    std::optional<RangeLock<Layout>> range_lock;
+    std::unique_ptr<ScanLock<Layout>> range_lock;
     if (layout.lock_stripes > 0) {
       if (layout.async_parallelism != 1) {
         throw std::runtime_error(
@@ -398,14 +453,27 @@ int main(int argc, char* argv[]) {
             "which it shares with the future machinery, so it can only be "
             "taken when nothing else is in flight.");
       }
-      range_lock.emplace(
-          layout, ce.connections().at(1), static_cast<uint64_t>(proc_id),
-          reinterpret_cast<uint64_t*>(layout.getLockScratchAddress()),
-          layout.lock_stripes);
-      std::cout << "Range lock ON: " << layout.lock_stripes
-                << (layout.lock_stripes == 1 ? " stripe (global)" : " stripes")
-                << ", " << RangeLock<Layout>::kKeysPerStripe << " keys each"
-                << std::endl;
+      // One slot per CLIENT for the table, one per stripe for the striped
+      // lock -- see Layout::lockCells.
+      uint64_t const cells = layout.lockCells();
+      if (layout.lock_mode == 1) {
+        range_lock = std::make_unique<TableScanLock<Layout>>(
+            layout, ce.connections().at(1), static_cast<uint64_t>(proc_id),
+            reinterpret_cast<uint64_t*>(layout.getLockScratchAddress()), cells);
+      } else {
+        range_lock = std::make_unique<StripedScanLock<Layout>>(
+            layout, ce.connections().at(1), static_cast<uint64_t>(proc_id),
+            reinterpret_cast<uint64_t*>(layout.getLockScratchAddress()), cells);
+      }
+      if (layout.lock_mode == 1) {
+        std::cout << "Range lock ON: TABLE, " << cells
+                  << " slots (one per client), exact intervals" << std::endl;
+      } else {
+        std::cout << "Range lock ON: STRIPED, " << cells
+                  << (cells == 1 ? " stripe (global)" : " stripes") << ", "
+                  << RangeLock<Layout>::kKeysPerStripe << " keys each"
+                  << std::endl;
+      }
     }
 
     if (proc_id == layout.firstClientId()) {

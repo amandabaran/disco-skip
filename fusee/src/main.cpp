@@ -1,5 +1,6 @@
 #include "layout.hpp"
 #include "range_lock.hpp"
+#include "range_table_lock.hpp"
 #include "client.hpp"
 #include "latency.hpp"
 #include <memory>
@@ -9,6 +10,51 @@
 
 #include <dory/shared/match.hpp>
 #include "lru-cache.hpp"
+
+/// Either lock, chosen at run time. Both expose acquireRange / acquireKey /
+/// release, so the call sites do not branch; only construction does.
+/// Virtual dispatch costs nothing measurable against an RDMA round trip.
+template <class Layout>
+class ScanLock {
+ public:
+  virtual ~ScanLock() = default;
+  virtual void acquireRange(uint64_t start_key, uint64_t count) = 0;
+  virtual void acquireKey(uint64_t key) = 0;
+  virtual void release() = 0;
+  virtual uint64_t acquires() const = 0;
+  virtual uint64_t retries() const = 0;
+};
+
+template <class Layout>
+class StripedScanLock : public ScanLock<Layout> {
+ public:
+  StripedScanLock(Layout const& l, dory::conn::ReliableConnection& rc,
+                  uint64_t owner, uint64_t* scratch, uint64_t stripes)
+      : impl_{l, rc, owner, scratch, stripes} {}
+  void acquireRange(uint64_t s, uint64_t c) override { impl_.acquireRange(s, c); }
+  void acquireKey(uint64_t k) override { impl_.acquireKey(k); }
+  void release() override { impl_.release(); }
+  uint64_t acquires() const override { return impl_.acquires(); }
+  uint64_t retries() const override { return impl_.retries(); }
+ private:
+  dory::RangeLock<Layout> impl_;
+};
+
+template <class Layout>
+class TableScanLock : public ScanLock<Layout> {
+ public:
+  TableScanLock(Layout const& l, dory::conn::ReliableConnection& rc,
+                uint64_t owner, uint64_t* scratch, uint64_t slots)
+      : impl_{l, rc, owner, scratch, slots} {}
+  void acquireRange(uint64_t s, uint64_t c) override { impl_.acquireRange(s, c); }
+  void acquireKey(uint64_t k) override { impl_.acquireKey(k); }
+  void release() override { impl_.release(); }
+  uint64_t acquires() const override { return impl_.acquires(); }
+  uint64_t retries() const override { return impl_.retries(); }
+  uint64_t validations() const { return impl_.validations(); }
+ private:
+  dory::RangeTableLock<Layout> impl_;
+};
 
 using namespace dory;
 using namespace dory::conn;
@@ -71,6 +117,7 @@ int main(int argc, char* argv[]) {
   // 0 = off: the unlocked baseline, whose SCAN is not linearizable. See
   // range_lock.hpp.
   layout.lock_stripes = 0;
+  layout.lock_mode = 0;
   layout.num_keys = 100'000;
   layout.key_size = 24;
   layout.value_size = 64;
@@ -275,16 +322,28 @@ int main(int argc, char* argv[]) {
     // TODO(zyf): handle multiple servers
     auto client = Client(layout, local_region, ce, layout.num_servers);
 
-    std::optional<RangeLock<Layout>> range_lock;
+    std::unique_ptr<ScanLock<Layout>> range_lock;
     if (layout.lock_stripes > 0) {
-      range_lock.emplace(
-          layout, ce.connections().at(1), static_cast<uint64_t>(layout.proc_id),
-          reinterpret_cast<uint64_t*>(layout.getLockScratchAddress(local_region)),
-          layout.lock_stripes);
-      std::cout << "Range lock ON: " << layout.lock_stripes
-                << (layout.lock_stripes == 1 ? " stripe (global)" : " stripes")
-                << ", " << RangeLock<Layout>::kKeysPerStripe << " keys each"
-                << std::endl;
+      // One slot per CLIENT for the table, one per stripe for the striped
+      // lock -- see Layout::lockCells.
+      uint64_t const cells = layout.lockCells();
+      auto* scratch = reinterpret_cast<uint64_t*>(
+          layout.getLockScratchAddress(local_region));
+      if (layout.lock_mode == 1) {
+        range_lock = std::make_unique<TableScanLock<Layout>>(
+            layout, ce.connections().at(1),
+            static_cast<uint64_t>(layout.proc_id), scratch, cells);
+        std::cout << "Range lock ON: TABLE, " << cells
+                  << " slots (one per client), exact intervals" << std::endl;
+      } else {
+        range_lock = std::make_unique<StripedScanLock<Layout>>(
+            layout, ce.connections().at(1),
+            static_cast<uint64_t>(layout.proc_id), scratch, cells);
+        std::cout << "Range lock ON: STRIPED, " << cells
+                  << (cells == 1 ? " stripe (global)" : " stripes") << ", "
+                  << RangeLock<Layout>::kKeysPerStripe << " keys each"
+                  << std::endl;
+      }
     }
     auto pointer_cache = LRUCache<HashedKey, uint64_t>(pointer_cache_size);
 

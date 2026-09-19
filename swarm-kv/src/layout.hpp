@@ -43,6 +43,29 @@ struct Layout {
   // do NOT share an address space. They are separate runs, never mixed.
   uint64_t lock_stripes;
 
+  // WHICH LOCK, when one is enabled at all.
+  //
+  // 0 = striped (range_lock.hpp): lock_stripes cells, each covering
+  //     kKeysPerStripe of key space, so a scan rounds up to whole stripes and
+  //     blocks writers to keys it never reads.
+  // 1 = range table (range_table_lock.hpp): ONE CELL PER CLIENT, each holding
+  //     that client's published interval, so a scan blocks exactly the keys it
+  //     reads.
+  //
+  // Both are selected by lock_stripes > 0; this only says which. Kept as a
+  // separate field rather than overloading lock_stripes, because two meanings
+  // for one value across an interface is how a disabled arm reports itself as
+  // locked -- the same mistake range_lock.hpp's header already records.
+  uint64_t lock_mode;
+
+  /// Cells in the lock region. The striped lock wants one per stripe; the
+  /// range table wants one per CLIENT, because each client publishes into a
+  /// slot it owns and no two clients ever contend on a cell.
+  uint64_t lockCells() const {
+    if (lock_stripes == 0) return 0;
+    return lock_mode == 1 ? num_clients : lock_stripes;
+  }
+
   bool guess_ts;
 
   uint64_t firstServerId() { return 1; }
@@ -108,11 +131,11 @@ struct Layout {
   /// the striped arm would silently measure the global one.
   static constexpr uint64_t kLockStride = 64;
   uint64_t lockRegionSize() const {
-    return lock_stripes == 0 ? 0 : kLockStride * lock_stripes;
+    return kLockStride * lockCells();
   }
   static uint64_t lockRegionOffset() { return 0; }
   uintptr_t getLockAddress(uintptr_t region, uint64_t stripe) const {
-    if (lock_stripes == 0 || stripe >= lock_stripes) {
+    if (lock_stripes == 0 || stripe >= lockCells()) {
       throw std::invalid_argument(
           fmt::format("Lock stripe out of range: {} (num: {})", stripe,
                       lock_stripes));
@@ -134,6 +157,9 @@ struct Layout {
   /// One cacheline of client-local memory for the lock's CAS result. The CAS
   /// returns the PRE-image into local memory, so it needs a registered landing
   /// slot of its own -- reusing a log entry would corrupt an in-flight write.
+  /// One cacheline of client-local memory. The striped lock lands a CAS
+  /// pre-image here; the range table stages the four words it publishes and
+  /// they must be in registered memory to be the source of an RDMA write.
   uint64_t lockScratchSize() const { return lock_stripes == 0 ? 0 : 64; }
   uint64_t clientSize() const { return clientLogSize() + lockScratchSize(); }
   uintptr_t getLockScratchAddress() const {
