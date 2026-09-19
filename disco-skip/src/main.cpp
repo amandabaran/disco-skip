@@ -51,7 +51,13 @@ struct YcsbOp {
     uint64_t scan_len; // Only used if OpScan
 };
 
-std::vector<YcsbOp> operations;
+// NOT A GLOBAL ANY MORE -- it is per client, and as a global it was a heap
+// corruption waiting for a second thread. Each client fills its own operation
+// list from its own YCSB subprocess, so two client threads push_back into the
+// SAME vector concurrently: both reallocate, both free the old buffer, and the
+// process dies with "double free or corruption (out)". That is exactly how the
+// first two-thread run failed, and it failed the same way for both clients at
+// the same line. Declared inside runClient instead; see there.
 
 // A safe custom deleter struct that avoids compiler attribute mismatches
 struct PipeDeleter {
@@ -451,6 +457,9 @@ static int runClient(ds::Layout layout,
 #else
     ds::DsClient client{layout, ce, proc_id};
 #endif
+    // PER CLIENT, not per process. See the note where this used to be a
+    // file-scope global.
+    std::vector<YcsbOp> operations;
     ds::DsState& state = client.getState();
 
     // ─── Bootstrap the skip vector ─────────────────────────────
