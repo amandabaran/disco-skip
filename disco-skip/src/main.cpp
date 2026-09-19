@@ -7,6 +7,8 @@
 #include <sched.h>
 #include <thread>
 
+#include <fmt/ostream.h>
+
 #include "ds_log.hpp"
 #include <iostream>
 #include <condition_variable>
@@ -1030,10 +1032,10 @@ static int runClient(ds::Layout layout,
         // Computed in double rather than truncating integer division for
         // the same reason. lib.sh's total_kops and the plotter's
         // _TPUT_PATTERNS both accept a decimal now.
-        fmt::print("Local tput: {:.3f} kops\n",
+        fmt::print(ds::clientOut(), "Local tput: {:.3f} kops\n",
                 static_cast<double>(iter_count) * 1e6
                 / static_cast<double>((end_time - start_time).count()));
-        fmt::print("Local duration: {}s\n", 
+        fmt::print(ds::clientOut(), "Local duration: {}s\n", 
         static_cast<uint64_t>((end_time - start_time).count() / 1000000000));
         ds::clientOut() << std::flush;
         
