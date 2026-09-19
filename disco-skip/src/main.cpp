@@ -9,7 +9,9 @@
 
 #include "ds_log.hpp"
 #include <iostream>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
 #include <vector>
 #include <chrono>
 #include <random>
@@ -416,6 +418,95 @@ static bool pinThreadToCore(unsigned core) {
     return true;
 }
 
+/// Collective operations for the client threads in this process.
+///
+/// WHY THIS EXISTS. dory's MemoryStore is a singleton wrapping ONE
+/// libmemcached connection, and libmemcached is not thread-safe: two client
+/// threads calling into it concurrently race on the connection's query_id and
+/// the process dies on an assertion inside memcached_get. Setup avoids this by
+/// running serially on the main thread, but runClient itself is full of
+/// collectives -- the "initialized" and "finished" rendezvous and the
+/// measure-start barrier -- and those run once the threads are going.
+///
+/// A PLAIN MUTEX DOES NOT WORK, which is the part worth knowing. MemoryStore's
+/// barrier increments once and then POLLS until the count reaches wait_for, and
+/// waitReadyAll polls likewise. Holding a lock across either deadlocks: one
+/// thread waits for a peer to increment while holding the lock that peer needs
+/// in order to do it.
+///
+/// So collectives are two-level. The threads rendezvous locally; the last one
+/// in performs the global operation alone while the others are parked on a
+/// condition variable (holding nothing); then everyone is released. Exactly one
+/// thread is ever inside libmemcached, and nobody blocks while holding
+/// anything.
+///
+/// At one thread per process the first arrival is immediately the last, so the
+/// global operation runs inline and the sequence is what it always was.
+class ClientSync {
+public:
+    ClientSync(size_t threads, dory::memstore::MemoryStore &store,
+               std::vector<std::unique_ptr<
+                   dory::conn::RcConnectionExchanger<ds::ProcId>>> &ces,
+               size_t client_processes)
+        : n_{threads}, store_{store}, ces_{ces},
+          client_processes_{client_processes} {}
+
+    /// Every identity in this process announces `state`, then ONE wait covers
+    /// the process. Waiting on the first exchanger is sufficient: its remotes
+    /// are every other participant, our own other identities included, and
+    /// those have already announced.
+    void rendezvous(char const *state) {
+        collective([&] {
+            for (auto &c : ces_) c->announceReady(store_, "qp", state);
+            ces_[0]->waitReadyAll(store_, "qp", state);
+        });
+    }
+
+    void unannounce(char const *state) {
+        collective([&] {
+            for (auto &c : ces_) c->unannounceReady(store_, "qp", state);
+        });
+    }
+
+    /// The measure-start barrier, counted in PROCESSES rather than clients.
+    ///
+    /// MemoryStore::barrier increments by one per call, so a process that
+    /// increments once on behalf of its threads must be counted once. At one
+    /// thread per process this is the client count, i.e. exactly the number
+    /// the single-threaded path has always passed.
+    void measureStart() {
+        collective([&] { store_.barrier("measure-start", client_processes_); });
+    }
+
+private:
+    template <class Op>
+    void collective(Op const &op) {
+        std::unique_lock<std::mutex> lk(m_);
+        size_t const my_gen = gen_;
+        if (++arrived_ == n_) {
+            // Last in: the others are parked on cv_ and hold nothing, so this
+            // is the only thread that can touch the store.
+            op();
+            arrived_ = 0;
+            ++gen_;
+            lk.unlock();
+            cv_.notify_all();
+        } else {
+            cv_.wait(lk, [&] { return gen_ != my_gen; });
+        }
+    }
+
+    size_t n_;
+    dory::memstore::MemoryStore &store_;
+    std::vector<std::unique_ptr<
+        dory::conn::RcConnectionExchanger<ds::ProcId>>> &ces_;
+    size_t client_processes_;
+    std::mutex m_;
+    std::condition_variable cv_;
+    size_t arrived_ = 0;
+    size_t gen_ = 0;
+};
+
 /// Everything one client does, from constructing its DsClient to its last line
 /// of output.
 ///
@@ -437,6 +528,7 @@ static int runClient(ds::Layout layout,
                      ds::ProcId proc_id,
                      dory::conn::RcConnectionExchanger<ds::ProcId> &ce,
                      dory::memstore::MemoryStore &store,
+                     ClientSync &sync,
 #if DS_CACHE_ENABLED
                      ds::NodeCache &node_cache,
 #endif
@@ -494,16 +586,14 @@ static int runClient(ds::Layout layout,
     // run after every client has passed the barrier, since a concurrent
     // bootstrap write would look like corruption to a sequential checker.
     if (run_selftest) {
-        ce.announceReady(store, "qp", "initialized");
-        ce.waitReadyAll(store, "qp", "initialized");
+        sync.rendezvous("initialized");
 
         int const rc = run_structure_selftest(state);
         state.reportCache();
 
-        ce.announceReady(store, "qp", "finished");
-        ce.waitReadyAll(store, "qp", "finished");
-        ce.unannounceReady(store, "qp", "initialized");
-        ce.unannounceReady(store, "qp", "connected");
+        sync.rendezvous("finished");
+        sync.unannounce("initialized");
+        sync.unannounce("connected");
         ds::clientOut() << "###DONE###" << std::endl;
         return rc;
     }
@@ -593,16 +683,14 @@ static int runClient(ds::Layout layout,
         ds::clientOut() << "Running single-threaded ML tracker workload. ID=" << global_thread_id  << "Registers=" << layout.num_registers << "Clients=" << layout.num_clients << std::endl;
         
         // Sync with cluster deployment infrastructure
-        ce.announceReady(store, "qp", "initialized");
-        ce.waitReadyAll(store, "qp", "initialized");
+        sync.rendezvous("initialized");
 
         run_ml_prog_tracker_workload(client, global_thread_id,
                          layout.num_clients, iter_count,
                          think_time, store);
 
-        ce.announceReady(store, "qp", "finished");
-        ce.waitReadyAll(store, "qp", "finished");
-        ce.unannounceReady(store, "qp", "initialized");
+        sync.rendezvous("finished");
+        sync.unannounce("initialized");
     } 
     else {
         ds::clientOut() << "Configuring Client " << proc_id << std::endl;
@@ -767,8 +855,7 @@ static int runClient(ds::Layout layout,
         }
 
         ds::clientOut() << "Waiting for the initialization of other clients... " << std::flush;
-        ce.announceReady(store, "qp", "initialized");
-        ce.waitReadyAll(store, "qp", "initialized");
+        sync.rendezvous("initialized");
         ds::clientOut() << "Done." << std::endl;
 
         ds::clientOut() << "Running the benchmark (YCSB Swarm Engine)... " << std::endl;
@@ -827,7 +914,7 @@ static int runClient(ds::Layout layout,
                 // num_clients and not num_clients + num_servers -- waiting
                 // on the servers here would hang forever, because they
                 // never enter the benchmark.
-                store.barrier("measure-start", layout.num_clients);
+                sync.measureStart();
 
                 measuring = true;
                 start_time = std::chrono::steady_clock::now();
@@ -950,9 +1037,8 @@ static int runClient(ds::Layout layout,
         static_cast<uint64_t>((end_time - start_time).count() / 1000000000));
         ds::clientOut() << std::flush;
         
-        ce.announceReady(store, "qp", "finished");
-        ce.waitReadyAll(store, "qp", "finished");
-        ce.unannounceReady(store, "qp", "initialized");
+        sync.rendezvous("finished");
+        sync.unannounce("initialized");
     }
     return 0;
 }
@@ -1461,6 +1547,19 @@ int main(int argc, char** argv) {
                   << std::endl;
         return 1;
     }
+    if (client_threads > 1 &&
+        layout.num_clients % static_cast<uint64_t>(client_threads) != 0) {
+        // REFUSED, because the failure is a HANG. The measure-start barrier
+        // counts client PROCESSES, derived as num_clients / threads; if that
+        // does not divide, the integer division truncates, the barrier waits
+        // for a count no one will reach, and the run sits there until the
+        // harness times it out with nothing to say about why.
+        std::cerr << "--threads " << client_threads << " does not divide "
+                  << layout.num_clients << " clients: the measure-start "
+                     "barrier counts processes and would wait forever."
+                  << std::endl;
+        return 1;
+    }
     if (client_threads > 1 && client_log_dir.empty()) {
         // REFUSED, NOT WARNED. Without it the T clients' output interleaves
         // into one stdout, the harness finds one log where it expects T, and
@@ -1834,6 +1933,17 @@ int main(int argc, char** argv) {
 #endif
         std::vector<int> rcs(static_cast<size_t>(client_threads), 0);
 
+        // Collectives go through this, because libmemcached is not
+        // thread-safe. client_processes is what the measure-start barrier
+        // counts: this process increments once on behalf of its threads, so
+        // the total must be the number of client PROCESSES. At one thread per
+        // process that is the client count, exactly as before.
+        size_t const client_processes =
+            static_cast<size_t>(layout.num_clients) /
+            static_cast<size_t>(client_threads);
+        ClientSync sync{static_cast<size_t>(client_threads), store, ces,
+                        client_processes};
+
         auto one_client = [&](size_t t) {
             // Its own stripe of the registered region.
             ds::Layout my_layout = layout;
@@ -1872,13 +1982,13 @@ int main(int argc, char** argv) {
 
 #if DS_CACHE_ENABLED
             ds::NodeCache& my_cache = *caches[share_cache ? 0 : t];
-            rcs[t] = runClient(my_layout, my_ids[t], *ces[t], store, my_cache,
+            rcs[t] = runClient(my_layout, my_ids[t], *ces[t], store, sync, my_cache,
                                workload, ycsb_path, iter_count, warmup,
                                keepwarm, start_measurements, stop_measurements,
                                total_iter_count, detailed, run_selftest,
                                run_ml_workload, think_time);
 #else
-            rcs[t] = runClient(my_layout, my_ids[t], *ces[t], store,
+            rcs[t] = runClient(my_layout, my_ids[t], *ces[t], store, sync,
                                workload, ycsb_path, iter_count, warmup,
                                keepwarm, start_measurements, stop_measurements,
                                total_iter_count, detailed, run_selftest,
