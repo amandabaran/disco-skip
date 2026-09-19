@@ -1085,6 +1085,12 @@ int main(int argc, char** argv) {
     // (threads, shared) minus (threads, own) is the sharing alone. Costs one
     // flag, because NodeCache is already a separate object.
     int64_t share_cache = 1;
+    // WHERE EACH CLIENT THREAD WRITES ITS LOG. Empty means "don't", which is
+    // right at --threads 1: invoker.sh already tees this process's stdout to
+    // exactly that path, and opening the same file here would put two writers
+    // on it. Above one thread the binary has to do it, because a process has
+    // one stdout and the harness wants one file per client.
+    std::string client_log_dir;
 
     // -1 means "not given". The guard below must distinguish a contradictory
     // EXPLICIT request (--cache-walk 1 --cache 0, which is a mistake worth
@@ -1232,6 +1238,12 @@ int main(int argc, char** argv) {
             "operation avoids: repairing on a recovered hop leaves the shared "
             "directory fresher, so each path also cuts the OTHER path's "
             "traversals. 0 restores the previous behaviour.") |
+        lyra::opt(client_log_dir, "client_log_dir").optional()["--client-log-dir"](
+            "Directory in which each CLIENT THREAD writes its own "
+            "client<N>.txt, named the way run.sh names them. Required with "
+            "--threads > 1, because a process has one stdout and every parser "
+            "in experiments/compare reads one log per client. Ignored at "
+            "--threads 1, where invoker.sh already tees stdout to that file.") |
         lyra::opt(share_cache, "share_cache").optional()["--share-cache"](
             "Whether the client threads in this process SHARE one per-node "
             "cache (1, default) or each keep their own (0). 0 exists to "
@@ -1440,6 +1452,17 @@ int main(int argc, char** argv) {
                   << std::endl;
         return 1;
     }
+    if (client_threads > 1 && client_log_dir.empty()) {
+        // REFUSED, NOT WARNED. Without it the T clients' output interleaves
+        // into one stdout, the harness finds one log where it expects T, and
+        // every cell reads as PARTIAL -- a configuration mistake that would
+        // look like a cluster fault.
+        std::cerr << "--threads " << client_threads
+                  << " needs --client-log-dir: each client thread writes its "
+                     "own client<N>.txt there, and the sweeps read one log "
+                     "per client." << std::endl;
+        return 1;
+    }
     if (client_threads > 1) {
         // Say it out loud: a run that shares a cache is not comparable with one
         // that does not, and the whole point is to tell them apart.
@@ -1636,10 +1659,22 @@ int main(int argc, char** argv) {
         // the skip vector has displaced it yet.
         size_t const server_size =
             std::max(layout.registerRegionSize(), layout.serverSize());
-        size_t const allocated_size = is_client ? layout.totalClientSize() : server_size;
+        // ONE STRIPE PER CLIENT THREAD. Every client's scratch buffers are
+        // addressed off Layout::client_local_region, so T threads in one
+        // process need T disjoint stripes -- otherwise they read and write one
+        // another's read buffers and CAS scratch, which corrupts silently
+        // rather than failing. At --threads 1 this is exactly one stripe and
+        // the arithmetic is the identity.
+        size_t const client_size =
+            layout.totalClientSize() * static_cast<size_t>(client_threads);
+        size_t const allocated_size = is_client ? client_size : server_size;
         cb.allocateBuffer("shared-buf", allocated_size, 64);
         std::cout << (is_client ? "Client" : "Server") << " region: "
                   << allocated_size << " bytes";
+        if (is_client && client_threads > 1) {
+            std::cout << " (" << client_threads << " stripes of "
+                      << layout.totalClientSize() << "B)";
+        }
         if (!is_client) {
             std::cout << " (" << layout.nodeArenaNodes() << " nodes of "
                       << sizeof(ds::NodeRecord) << "B + "
@@ -1655,18 +1690,50 @@ int main(int argc, char** argv) {
         ctrl::ControlBlock::REMOTE_READ | ctrl::ControlBlock::REMOTE_WRITE |
         ctrl::ControlBlock::REMOTE_ATOMIC);
 
-    std::vector<ds::ProcId> remote_ids;
-    for (ds::ProcId id = 1; id <= num_proc; id++) {
-        if (id == proc_id) continue;
-        remote_ids.push_back(id);
+    // ─── The identities this process owns ─────────────────────────────────
+    //
+    // One per client thread. run.sh strides a node's clients by the client
+    // machine count, so these are proc_id, proc_id + stride, ... and NOT
+    // contiguous -- preserving the exact ids keeps each client's arena stripe
+    // and quorum rotation identical to the process-per-client arrangement.
+    // At --threads 1 this is the single id it has always been.
+    std::vector<ds::ProcId> my_ids;
+    my_ids.reserve(static_cast<size_t>(client_threads));
+    for (int64_t t = 0; t < client_threads; ++t) {
+        my_ids.push_back(static_cast<ds::ProcId>(
+            proc_id + static_cast<ds::ProcId>(t * thread_stride)));
     }
 
-    for (auto const& id : remote_ids) {
-        cb.registerCq(fmt::format("cq{}", id));
+    // A CQ PER (IDENTITY, REMOTE), not per remote. The name used to be
+    // "cq{id}", which with several identities in one process would hand every
+    // thread the SAME completion queue for a given remote -- so the threads
+    // would silently share completion queues, reintroducing exactly the
+    // cross-thread coupling that keeping queue pairs per-thread exists to
+    // avoid, and making a result about the shared cache unreadable. At
+    // --threads 1 the suffix is "-0" and there is one CQ per remote as before.
+    auto cqName = [](ds::ProcId mine, ds::ProcId remote, size_t slot) {
+        (void)mine;
+        return fmt::format("cq{}-{}", remote, slot);
+    };
+
+    std::vector<std::vector<ds::ProcId>> remotes_of(my_ids.size());
+    for (size_t t = 0; t < my_ids.size(); ++t) {
+        for (ds::ProcId id = 1; id <= num_proc; id++) {
+            if (id == my_ids[t]) continue;
+            remotes_of[t].push_back(id);
+        }
+        for (auto const& id : remotes_of[t]) {
+            cb.registerCq(cqName(my_ids[t], id, t));
+        }
     }
+    // Kept for the code below that still speaks of a single identity.
+    std::vector<ds::ProcId> const& remote_ids = remotes_of[0];
 
     auto local_region = cb.mr("shared-mr").addr;
     if (is_client) {
+        // Thread 0's stripe. Each client thread is handed its own base below,
+        // computed the same way; this keeps the single-threaded path reading
+        // exactly the address it always has.
         layout.client_local_region = local_region;
     } else {
         // Zeroing is not by itself a valid empty structure -- a zeroed node has
@@ -1677,51 +1744,167 @@ int main(int argc, char** argv) {
                     std::max(layout.registerRegionSize(), layout.serverSize()));
     }
 
-    // ─── Connection exchange ───────────────────────────────────────
+    // ─── Connection exchange, PHASE BY PHASE ACROSS ALL IDENTITIES ────────
+    //
+    // NOT one exchanger at a time. waitReadyAll blocks until EVERY participant
+    // has announced, and this process now holds several of them: announcing
+    // identity 0 and then waiting would wait for identities 1..T-1 that this
+    // same thread has not announced yet, and the run would hang in setup with
+    // no output. So every identity announces, then every identity waits, then
+    // every identity connects.
+    //
+    // All of it runs on the main thread before any client thread starts, so
+    // nothing here depends on dory's ControlBlock or the memstore being
+    // thread-safe -- only the steady-state RDMA path is concurrent, and there
+    // each thread touches only its own queue pairs.
+    //
+    // At --threads 1 the loops run once and the sequence is exactly what it
+    // was.
     auto& store = memstore::MemoryStore::getInstance();
-    dory::conn::RcConnectionExchanger<ds::ProcId> ce(proc_id, remote_ids, cb);
-
-    for (auto const& id : remote_ids) {
-        auto cq = fmt::format("cq{}", id);
-        ce.configure(id, "primary", "shared-mr", cq, cq);
+    std::vector<std::unique_ptr<dory::conn::RcConnectionExchanger<ds::ProcId>>>
+        ces;
+    ces.reserve(my_ids.size());
+    for (size_t t = 0; t < my_ids.size(); ++t) {
+        ces.push_back(
+            std::make_unique<dory::conn::RcConnectionExchanger<ds::ProcId>>(
+                my_ids[t], remotes_of[t], cb));
+        for (auto const& id : remotes_of[t]) {
+            auto cq = cqName(my_ids[t], id, t);
+            ces[t]->configure(id, "primary", "shared-mr", cq, cq);
+        }
     }
 
-    ce.announceAll(store, "qp");
-    ce.announceReady(store, "qp", "prepared");
-    ce.waitReadyAll(store, "qp", "prepared");
-    ce.unannounceReady(store, "qp", "finished");
-
-    ce.connectAll(
-        store, "qp",
-        ctrl::ControlBlock::LOCAL_READ  | ctrl::ControlBlock::LOCAL_WRITE |
-        ctrl::ControlBlock::REMOTE_READ | ctrl::ControlBlock::REMOTE_WRITE |
-        ctrl::ControlBlock::REMOTE_ATOMIC);
-
-    ce.announceReady(store, "qp", "connected");
-    ce.waitReadyAll(store, "qp", "connected");
-
-    ce.unannounceAll(store, "qp");
-    ce.unannounceReady(store, "qp", "prepared");
+    for (auto& c : ces) {
+        c->announceAll(store, "qp");
+        c->announceReady(store, "qp", "prepared");
+    }
+    for (auto& c : ces) {
+        c->waitReadyAll(store, "qp", "prepared");
+        c->unannounceReady(store, "qp", "finished");
+    }
+    for (auto& c : ces) {
+        c->connectAll(
+            store, "qp",
+            ctrl::ControlBlock::LOCAL_READ  | ctrl::ControlBlock::LOCAL_WRITE |
+            ctrl::ControlBlock::REMOTE_READ | ctrl::ControlBlock::REMOTE_WRITE |
+            ctrl::ControlBlock::REMOTE_ATOMIC);
+    }
+    for (auto& c : ces) c->announceReady(store, "qp", "connected");
+    for (auto& c : ces) c->waitReadyAll(store, "qp", "connected");
+    for (auto& c : ces) {
+        c->unannounceAll(store, "qp");
+        c->unannounceReady(store, "qp", "prepared");
+    }
+    auto& ce = *ces[0];
 
     if (is_client) {
-        // ONE CACHE PER NODE, or one per thread with --share-cache 0. Built
-        // here rather than inside the client so several client threads in this
-        // process can be handed the same one; at --threads 1 it is one cache
-        // for one client, which is what it has always been.
+        // ─── One thread per client ────────────────────────────────────────
+        //
+        // CACHES: one shared per node by default, or one per thread with
+        // --share-cache 0. The second exists so the two effects of threading
+        // can be told apart -- the launch also removes most of the
+        // per-process RDMA setup, and without a per-thread-cache arm a win
+        // would be unattributable.
+        //
+        // REGION: thread t gets its own stripe. Every client addresses its
+        // scratch buffers off Layout::client_local_region, so a shared base
+        // would have the threads overwriting one another's read buffers and
+        // CAS scratch -- silent corruption, not an error.
+        //
+        // At --threads 1 this runs runClient once, on this thread, with the
+        // same id, the same exchanger and the same region base as before.
 #if DS_CACHE_ENABLED
-        ds::NodeCache node_cache{layout.cache_layers};
-        int const client_rc =
-            runClient(layout, proc_id, ce, store, node_cache, workload,
-                      ycsb_path, iter_count, warmup, keepwarm,
-                      start_measurements, stop_measurements, total_iter_count,
-                      detailed, run_selftest, run_ml_workload, think_time);
-#else
-        int const client_rc =
-            runClient(layout, proc_id, ce, store, workload,
-                      ycsb_path, iter_count, warmup, keepwarm,
-                      start_measurements, stop_measurements, total_iter_count,
-                      detailed, run_selftest, run_ml_workload, think_time);
+        size_t const n_caches =
+            share_cache ? 1u : static_cast<size_t>(client_threads);
+        std::vector<std::unique_ptr<ds::NodeCache>> caches;
+        caches.reserve(n_caches);
+        for (size_t i = 0; i < n_caches; ++i) {
+            caches.push_back(
+                std::make_unique<ds::NodeCache>(layout.cache_layers));
+        }
 #endif
+        std::vector<int> rcs(static_cast<size_t>(client_threads), 0);
+
+        auto one_client = [&](size_t t) {
+            // Its own stripe of the registered region.
+            ds::Layout my_layout = layout;
+            my_layout.client_local_region =
+                local_region + t * layout.totalClientSize();
+
+            // Its own log, named exactly as the harness expects, so a thread
+            // is indistinguishable from a process to every parser. Only
+            // opened when this process hosts more than one client: at
+            // --threads 1 invoker.sh still tees stdout to that same path, and
+            // opening it here as well would have two writers on one file.
+            std::unique_ptr<std::ofstream> log;
+            std::unique_ptr<ds::ScopedClientOut> redirect;
+            if (client_threads > 1 && !client_log_dir.empty()) {
+                log = std::make_unique<std::ofstream>(
+                    ds::clientLogPath(client_log_dir, my_ids[t],
+                                      layout.num_servers));
+                if (log->is_open()) {
+                    redirect = std::make_unique<ds::ScopedClientOut>(*log);
+                } else {
+                    std::cerr << "WARNING: client " << my_ids[t]
+                              << " could not open its log under "
+                              << client_log_dir
+                              << "; its output will be mixed into stdout and "
+                                 "the sweep will read this cell as PARTIAL."
+                              << std::endl;
+                }
+            }
+
+            if (client_threads > 1) {
+                // Placed by us now, because numactl -C can only pin a whole
+                // process. Physical cores are 0..7 here with siblings at +8,
+                // so a stride of 1 is right -- see pinThreadToCore.
+                pinThreadToCore(static_cast<unsigned>(t));
+            }
+
+#if DS_CACHE_ENABLED
+            ds::NodeCache& my_cache = *caches[share_cache ? 0 : t];
+            rcs[t] = runClient(my_layout, my_ids[t], *ces[t], store, my_cache,
+                               workload, ycsb_path, iter_count, warmup,
+                               keepwarm, start_measurements, stop_measurements,
+                               total_iter_count, detailed, run_selftest,
+                               run_ml_workload, think_time);
+#else
+            rcs[t] = runClient(my_layout, my_ids[t], *ces[t], store,
+                               workload, ycsb_path, iter_count, warmup,
+                               keepwarm, start_measurements, stop_measurements,
+                               total_iter_count, detailed, run_selftest,
+                               run_ml_workload, think_time);
+#endif
+            if (client_threads > 1) {
+                // Each client ends its own log the way the harness expects:
+                // wait_for_logs counts the files carrying this marker.
+                ds::clientOut() << "###DONE###" << std::endl;
+                ds::clientOut().flush();
+            }
+        };
+
+        if (client_threads == 1) {
+            one_client(0);
+        } else {
+            std::vector<std::thread> threads;
+            threads.reserve(static_cast<size_t>(client_threads));
+            for (int64_t t = 0; t < client_threads; ++t) {
+                threads.emplace_back(one_client, static_cast<size_t>(t));
+            }
+            for (auto& th : threads) th.join();
+        }
+
+        // ONE FAILING CLIENT MUST STILL FAIL THE PROCESS. These returns used
+        // to exit main directly; swallowing them in a thread nobody checked
+        // would turn a broken run into a quiet one.
+        for (size_t t = 0; t < rcs.size(); ++t) {
+            if (rcs[t] != 0) {
+                std::cerr << "client " << my_ids[t] << " failed with "
+                          << rcs[t] << std::endl;
+                return rcs[t];
+            }
+        }
+        int const client_rc = 0;
         if (client_rc != 0) return client_rc;
     } else {
         std::cout << "Server " << proc_id << " online." << std::endl;
