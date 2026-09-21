@@ -190,7 +190,29 @@ class RangeOperation {
            " cur.id=" + std::to_string(cur_.id) +
            " last_kmin=" + std::to_string(static_cast<uint64_t>(last_kmin_)) +
            " chain_i=" + std::to_string(chain_i_) +
-           "/" + std::to_string(chain_n_);
+           "/" + std::to_string(chain_n_) +
+           // ── THE FIELDS THAT DECIDE WHICH LOOP IS SPINNING ──────────────
+           //
+           // A live capture of this guard read
+           //   step=AwaitOldVer lo=99837 hi=18446744073709551614
+           //   cur.id=650101 last_kmin=111923 chain_i=2/0
+           // and that was not enough to name the cycle. hi is the documented
+           // kUnboundedKey sentinel for a count-bounded YCSB scan, so it is
+           // not the anomaly; chain_i=2 against chain_n=0 is, but the drain
+           // loop gates on chain_ok_ rather than chain_n_, and chain_ok_ was
+           // not printed -- so whether the cursor is genuinely past the end
+           // could not be told from the message.
+           //
+           // hops_ matters for the opposite reason: the old_ver chase IS
+           // bounded by kMaxVersionHops, so a spin that never raises hops_
+           // rules that path out rather than implicating it.
+           " chain_ok=" + std::to_string(chain_ok_) +
+           " batch_resume=" + std::to_string(batch_resume_) +
+           " hops=" + std::to_string(hops_) +
+           " orphan_until=" + (orphan_until_.isNull() ? "null" : "set") +
+           " tail_succ=" + (tail_succ_.isNull() ? "null" : "set") +
+           " chain_pending=" + (chain_pending_ ? "1" : "0") +
+           " idx_past_hi=" + (idx_past_hi_ ? "1" : "0");
   }
   [[nodiscard]] RangeResult const &result() const { return res_; }
 

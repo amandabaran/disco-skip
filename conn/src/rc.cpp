@@ -166,16 +166,41 @@ void ReliableConnection::connect(RemoteConnection const &rc,
 
   conn_attr = {};
   conn_attr.qp_state = IBV_QPS_RTR;
-  conn_attr.path_mtu = IBV_MTU_4096;
+  // The port's negotiated MTU, not a constant. A QP asking for more than the
+  // link carries never reaches RTR, and RoCE ports frequently come up at 1024
+  // where IB is at 4096 -- so hardcoding 4096 is an IB assumption.
+  conn_attr.path_mtu = cb.activeMtu();
   conn_attr.rq_psn = DefaultPsn;
 
-  conn_attr.ah_attr.is_global = 0;
   conn_attr.ah_attr.sl = 0;  // TODO(anon): Igor has it to 1
   conn_attr.ah_attr.src_path_bits = 0;
   conn_attr.ah_attr.port_num = cb.port();
 
   conn_attr.dest_qp_num = rc.rci.qpn;
-  conn_attr.ah_attr.dlid = rc.rci.lid;
+
+  // ── ADDRESS BY GID ON RoCE, BY LID ON INFINIBAND ────────────────────────
+  //
+  // An Ethernet port has no meaningful LID, so a RoCE QP is told where to
+  // send via the global routing header: the peer's GID as the destination,
+  // and OUR OWN index into OUR OWN GID table as the source. sgid_index is
+  // deliberately cb.gidIndex() and not rc.rci.gid_index -- the remote's index
+  // describes the remote's table and means nothing here, and using it is the
+  // classic way a RoCE bring-up half-works.
+  //
+  // The InfiniBand path below is byte-for-byte what it was: is_global = 0 and
+  // dlid from the peer's LID.
+  if (cb.isRoCE()) {
+    conn_attr.ah_attr.is_global = 1;
+    conn_attr.ah_attr.dlid = 0;
+    conn_attr.ah_attr.grh.dgid = rc.rci.gid;
+    conn_attr.ah_attr.grh.sgid_index = static_cast<uint8_t>(cb.gidIndex());
+    conn_attr.ah_attr.grh.hop_limit = 255;
+    conn_attr.ah_attr.grh.traffic_class = 0;
+    conn_attr.ah_attr.grh.flow_label = 0;
+  } else {
+    conn_attr.ah_attr.is_global = 0;
+    conn_attr.ah_attr.dlid = rc.rci.lid;
+  }
 
   conn_attr.max_dest_rd_atomic = 16;
   conn_attr.min_rnr_timer = 12;
@@ -461,7 +486,10 @@ bool ReliableConnection::pollCqIsOk(Cq cq,
 }
 
 RemoteConnection ReliableConnection::remoteInfo() const {
-  return RemoteConnection(cb.lid(), uniq_qp->qp_num, mr.addr, mr.size, mr.rkey);
+  return RemoteConnection(cb.lid(), cb.gid(),
+                          static_cast<uint8_t>(cb.gidIndex() < 0 ? 0
+                                                                 : cb.gidIndex()),
+                          uniq_qp->qp_num, mr.addr, mr.size, mr.rkey);
 }
 
 void ReliableConnection::queryQp(ibv_qp_attr &qp_attr,

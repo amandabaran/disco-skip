@@ -109,6 +109,12 @@ class ControlBlock {
 
   uint8_t port() const;
   uint16_t lid() const;
+  // Alongside lid(), never replacing it: an IB port connects by LID, a RoCE
+  // port by GID, and the connection layer chooses on isRoCE().
+  bool isRoCE() const;
+  union ibv_gid gid() const;
+  int gidIndex() const;
+  ibv_mtu activeMtu() const;
 
   static bool pollCqIsOk(deleted_unique_ptr<struct ibv_cq> &cq,
                          std::vector<struct ibv_wc> &entries);

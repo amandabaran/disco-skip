@@ -13,6 +13,21 @@ struct RemoteConnection {
     uint16_t lid; //Infiniband network routing
     uint32_t qpn; //queue pair number (NIC mailbox ID)
 
+    // ── RoCE ADDRESSING, CARRIED ALONGSIDE THE LID ────────────────────────
+    //
+    // An Ethernet port has no meaningful LID, so a peer on a RoCE fabric is
+    // reached by its GID in the packet's global routing header. Both travel
+    // in this struct and the receiver uses whichever its own link layer
+    // calls for; on InfiniBand the GID is simply zero and ignored, so an
+    // all-IB deployment behaves exactly as before.
+    //
+    // gid_index is the SENDER's index into its own GID table and is not
+    // meaningful remotely -- each side supplies its own sgid_index when it
+    // builds the address handle. It is exchanged only so a mismatch is
+    // visible in a log rather than silent.
+    union ibv_gid gid;
+    uint8_t gid_index;
+
     uintptr_t buf_addr; // MR virtual addr
     uint64_t buf_size; //Registered MR size 
     uint32_t rkey;  //Crypto key for MR access
@@ -20,6 +35,8 @@ struct RemoteConnection {
 
   RemoteConnection() {
     rci.lid = 0;
+    rci.gid = {};
+    rci.gid_index = 0;
     rci.qpn = 0;
     rci.buf_addr = 0;
     rci.buf_size = 0;
@@ -27,7 +44,16 @@ struct RemoteConnection {
   }
 
   RemoteConnection(uint16_t lid, uint32_t qpn, uintptr_t buf_addr,
-                   uint64_t buf_size, uint32_t rkey) {
+                   uint64_t buf_size, uint32_t rkey)
+      // `ibv_gid{}`, not `union ibv_gid{}`: an elaborated-type-specifier is
+      // not a valid expression, so the latter does not compile.
+      : RemoteConnection(lid, ibv_gid{}, 0, qpn, buf_addr, buf_size, rkey) {}
+
+  RemoteConnection(uint16_t lid, union ibv_gid gid, uint8_t gid_index,
+                   uint32_t qpn, uintptr_t buf_addr, uint64_t buf_size,
+                   uint32_t rkey) {
+    rci.gid = gid;
+    rci.gid_index = gid_index;
     rci.lid = lid;
     rci.qpn = qpn;
     rci.buf_addr = buf_addr;
@@ -37,11 +63,19 @@ struct RemoteConnection {
 
   RemoteConnection(RemoteConnectionInfo rci) : rci{rci} {}
 
+  /// The GID is appended as its two 64-bit halves rather than 16 bytes,
+  /// because ibv_gid is a union and global.{subnet_prefix,interface_id} is the
+  /// same storage viewed as two uint64. Both ends of an exchange are the same
+  /// binary on the same architecture, so no byte-order conversion is needed --
+  /// and the fields are appended at the END so the leading part of the string
+  /// is unchanged, which keeps this readable next to an older log line.
   std::string serialize() const {
     std::ostringstream os;
 
     os << std::hex << rci.lid << ":" << rci.qpn << ":" << rci.buf_addr << ":"
-       << rci.buf_size << ":" << rci.rkey;
+       << rci.buf_size << ":" << rci.rkey << ":" << rci.gid.global.subnet_prefix
+       << ":" << rci.gid.global.interface_id << ":"
+       << static_cast<unsigned>(rci.gid_index);
     return os.str();
   }
 
@@ -67,6 +101,23 @@ struct RemoteConnection {
     ss >> std::hex >> buf_size;
     ss >> std::hex >> rkey;
 
+    // Tolerate a string without the GID fields: they are zero then, which is
+    // exactly what an InfiniBand peer would have sent anyway. Reading with >>
+    // and checking the stream keeps a short string from leaving these
+    // uninitialised.
+    uint64_t gid_hi = 0, gid_lo = 0;
+    unsigned gid_index = 0;
+    ss >> std::hex >> gid_hi;
+    if (ss.fail()) { gid_hi = 0; ss.clear(); }
+    ss >> std::hex >> gid_lo;
+    if (ss.fail()) { gid_lo = 0; ss.clear(); }
+    ss >> std::hex >> gid_index;
+    if (ss.fail()) { gid_index = 0; ss.clear(); }
+
+    rci.gid = {};
+    rci.gid.global.subnet_prefix = gid_hi;
+    rci.gid.global.interface_id = gid_lo;
+    rci.gid_index = static_cast<uint8_t>(gid_index);
     rci.lid = lid;
     rci.qpn = qpn;
     rci.buf_addr = buf_addr;

@@ -305,6 +305,11 @@ uint8_t ControlBlock::port() const { return resolved_port.portId(); }
 
 uint16_t ControlBlock::lid() const { return resolved_port.portLid(); }
 
+bool ControlBlock::isRoCE() const { return resolved_port.isRoCE(); }
+union ibv_gid ControlBlock::gid() const { return resolved_port.gid(); }
+int ControlBlock::gidIndex() const { return resolved_port.gidIndex(); }
+ibv_mtu ControlBlock::activeMtu() const { return resolved_port.activeMtu(); }
+
 bool ControlBlock::pollCqIsOk(deleted_unique_ptr<struct ibv_cq> &cq,
                               std::vector<struct ibv_wc> &entries) {
   auto num =

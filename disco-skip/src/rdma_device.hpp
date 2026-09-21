@@ -140,7 +140,11 @@ inline std::vector<Candidate> surveyDevices(
   for (size_t i = 0; i < devices.size(); ++i) {
     Candidate c;
     c.index = i;
-    c.name = devices[i].devName() ? devices[i].devName() : "?";
+    // name() ("mlx5_2"), not devName() ("uverbs2"): this string is used to
+    // build a /sys/class/infiniband path in netdevRate, where only the IB
+    // device name exists. It is also the name ibstat prints, so the log lines
+    // match what a human would check by hand.
+    c.name = devices[i].name() ? devices[i].name() : "?";
     auto *ctx = devices[i].context();
     if (ctx != nullptr) {
       ibv_device_attr dev_attr{};

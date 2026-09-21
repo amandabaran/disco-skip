@@ -128,9 +128,54 @@ class ResolvedPort {
 
   uint16_t portLid() const { return port_lid; }
 
+  // ── RoCE ADDRESSING, ADDED ALONGSIDE LID -- NOT INSTEAD OF IT ────────────
+  //
+  // An InfiniBand port is addressed by LID; a RoCE port has no meaningful LID
+  // and is addressed by GID, carried in the packet's global routing header.
+  // Both are resolved here so the connection layer can pick per link layer
+  // without querying the port again, and the IB path is untouched.
+  uint8_t linkLayer() const { return link_layer; }
+  bool isRoCE() const { return link_layer == IBV_LINK_LAYER_ETHERNET; }
+
+  /// Source GID for this port. Meaningful only when isRoCE().
+  union ibv_gid const &gid() const { return port_gid; }
+
+  /// Index of that GID in the port's table, which the QP needs as
+  /// grh.sgid_index. -1 when no usable GID was found (never for IB, where it
+  /// is simply unused).
+  int gidIndex() const { return gid_index; }
+
+  /// Largest MTU the port actually negotiated. RoCE links commonly come up at
+  /// 1024 while IB is 4096, and a QP asking for more than the port carries
+  /// fails to reach RTR, so the connection layer reads this rather than
+  /// hardcoding a value.
+  ibv_mtu activeMtu() const { return active_mtu; }
+
   OpenDevice &device() { return open_dev; }
 
  private:
+  /// Pick the GID index to use on a RoCE port.
+  ///
+  /// The table holds several GIDs per port -- link-local and IPv4-mapped,
+  /// each in a RoCE v1 and a RoCE v2 flavour. On the r650 nodes, for example:
+  ///
+  ///   0  fe80::063f:72ff:fefe:dbf8   IB/RoCE v1   enp202s0f0np0
+  ///   1  fe80::063f:72ff:fefe:dbf8   RoCE v2      enp202s0f0np0
+  ///   2  ::ffff:10.10.1.4            IB/RoCE v1   enp202s0f0np0
+  ///   3  ::ffff:10.10.1.4            RoCE v2      enp202s0f0np0
+  ///
+  /// We want index 3: RoCE v2 (routable, and what current fabrics run) on the
+  /// IPv4 address of the experiment LAN. Preference order is therefore
+  /// RoCE v2 + IPv4-mapped, then RoCE v2 anything, then any non-zero GID.
+  ///
+  /// The type is read from sysfs because ibv_query_gid_type is not available
+  /// across the rdma-core versions this has to build against.
+  ///
+  /// DS_ROCE_GID_INDEX overrides the choice, for the same reason
+  /// DS_RDMA_DEVICE exists: when a heuristic picks wrong, the fix should not
+  /// require a rebuild.
+  int selectRoceGid(uint8_t port, int gid_tbl_len);
+
   static std::string linkLayerStr(uint8_t link_layer) {
     switch (link_layer) {
       case IBV_LINK_LAYER_UNSPECIFIED:
@@ -148,5 +193,9 @@ class ResolvedPort {
   int port_index;
   uint8_t port_id;
   uint16_t port_lid;
+  uint8_t link_layer = IBV_LINK_LAYER_UNSPECIFIED;
+  union ibv_gid port_gid {};
+  int gid_index = -1;
+  ibv_mtu active_mtu = IBV_MTU_4096;
 };
 }  // namespace dory::ctrl
