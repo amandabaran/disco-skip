@@ -631,11 +631,41 @@ public:
         // between two runs -- a correlation, not evidence.
         fmt::print(clientOut(), "              {} L2 read repairs, {} reached majority\n",
                    qstats.repairs, qstats.repairs_landed);
-        if (pstats.failures != 0 || gstats.failures != 0) {
-            fmt::print(clientOut(), "*** {} put and {} get operations DID NOT RESOLVE. The "
-                       "throughput above counts them as completed, so it "
-                       "OVERSTATES useful work. ***\n",
-                       pstats.failures, gstats.failures);
+        // RANGES ARE COUNTED HERE TOO, and were not before.
+        //
+        // This report is what experiments/compare/lib.sh greps for: a client
+        // log containing "DID NOT RESOLVE" makes run_warnings mark the cell
+        // UNRESOLVED-OPS, which is how a run that answered nothing is stopped
+        // from being averaged as if it had worked. With put and get only, an
+        // abandoned RANGE was invisible to that gate -- and abandoning ranges
+        // is exactly what the new kMaxRangeDescents bound does, so leaving
+        // scans out would have turned a crash into a plausible-looking
+        // throughput number for a workload that is 95% scans. That is the
+        // failure main.cpp's --ts-none check exists to prevent, arrived at
+        // from the other direction.
+        if (pstats.failures != 0 || gstats.failures != 0 ||
+            rstats.failures != 0) {
+            fmt::print(clientOut(),
+                       "*** {} put, {} get and {} range operations DID NOT "
+                       "RESOLVE. The throughput above counts them as "
+                       "completed, so it OVERSTATES useful work. ***\n",
+                       pstats.failures, gstats.failures, rstats.failures);
+            if (rstats.fail_descents != 0) {
+                // DO NOT WRITE THE WORD "terminate" HERE. run_warnings in
+                // experiments/compare/lib.sh greps client logs for
+                // terminate|what():|Segmentation and flags CRASH-OR-BAD-ARGS
+                // on a hit -- so an explanatory message using that word makes
+                // every healthy cell report a crash. The first run of this
+                // code did exactly that: 854907 ranges resolved, 41 failed,
+                // and the cell was still labelled CRASH-OR-BAD-ARGS purely
+                // because of this sentence.
+                fmt::print(clientOut(),
+                           "*** of those, {} range(s) hit the descent bound "
+                           "(kMaxRangeDescents): the outer loop made no "
+                           "progress and the operation was abandoned rather "
+                           "than aborting the process. ***\n",
+                           rstats.fail_descents);
+            }
         }
     }
 };

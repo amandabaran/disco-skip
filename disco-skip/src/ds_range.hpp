@@ -136,6 +136,11 @@ struct RangeStats {
   /// The old_ver chain ran past kMaxVersionHops. Either it is cyclic or a
   /// writer is producing versions faster than the walk consumes them.
   uint64_t fail_hops = 0;
+  /// The operation re-descended kMaxRangeDescents times without finishing.
+  /// Distinct from fail_hops: each individual walk was within its cap, and it
+  /// is the OUTER loop that did not terminate. Non-zero here means a range
+  /// livelocked and was abandoned rather than crashing the process.
+  uint64_t fail_descents = 0;
   /// A vector or index read did not resolve to a quorum.
   uint64_t fail_read = 0;
   /// The traversal could not route to `lo`, and not because nothing is there
@@ -216,6 +221,26 @@ namespace detail {
 /// the chain is cyclic or a writer is producing versions faster than we walk
 /// them, and both are better retried than spun on.
 inline constexpr uint32_t kMaxVersionHops = 1u << 16;
+
+/// How many times one range operation may RE-DESCEND before giving up.
+///
+/// kMaxVersionHops bounds a SINGLE old_ver walk, because hops_ is reset at the
+/// head of each one. That makes it useless against an outer loop that keeps
+/// returning to the reset: the counter never accumulates. A 32-client e10 cell
+/// died exactly there -- 4097 future steps at hops=31, so roughly a hundred
+/// descents of ~31 hops each, none of them individually near the cap.
+///
+/// The only backstop was the generic kMaxFutureSteps guard, which THROWS. An
+/// uncaught throw kills every client thread in the process and leaves the other
+/// nodes waiting at the barrier forever, so one stuck range took down a whole
+/// 32-client cell. A bounded descent count turns that into an ordinary
+/// unresolved range: the operation fails, the client prints DID NOT RESOLVE,
+/// and the harness marks the cell UNRESOLVED-OPS instead of CRASH.
+///
+/// 64 is far above anything legitimate -- a count-bounded scan of <=10 keys
+/// re-descends only when a writer splits a node under it -- and far below the
+/// ~100 descents the step guard allowed, so this fires first and cleanly.
+inline constexpr uint32_t kMaxRangeDescents = 64;
 }  // namespace detail
 
 /// The snapshot to read at, for /mode/. kNullTs means NO SNAPSHOT COULD BE

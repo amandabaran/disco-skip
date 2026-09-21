@@ -209,6 +209,7 @@ class RangeOperation {
            " chain_ok=" + std::to_string(chain_ok_) +
            " batch_resume=" + std::to_string(batch_resume_) +
            " hops=" + std::to_string(hops_) +
+           " descents=" + std::to_string(descents_) +
            " orphan_until=" + (orphan_until_.isNull() ? "null" : "set") +
            " tail_succ=" + (tail_succ_.isNull() ? "null" : "set") +
            " chain_pending=" + (chain_pending_ ? "1" : "0") +
@@ -224,6 +225,7 @@ class RangeOperation {
     out_ = &out;
     res_ = RangeResult{};
     hops_ = 0;
+    descents_ = 0;
     settle_tries_ = 0;
     chain_n_ = chain_ok_ = chain_i_ = 0;
     batch_resume_ = kNoResume;
@@ -840,6 +842,13 @@ class RangeOperation {
       return ops_.postBatch(last_batch_);
     }
     settle_tries_ = 0;
+    // BOUND THE OUTER LOOP. hops_ is about to be reset, which is what makes
+    // kMaxVersionHops unable to see a cycle through this point -- so count the
+    // descents themselves. See kMaxRangeDescents.
+    if (++descents_ > detail::kMaxRangeDescents) {
+      ++stats_.fail_descents;
+      return done(false);
+    }
     hops_ = 0;
     // Capture the CURRENT successor now, before the old_ver walk overwrites
     // vec_.
@@ -1063,6 +1072,7 @@ class RangeOperation {
   VecRecord vec_{};
   bool have_vec_ = false;
   uint32_t hops_ = 0;
+  uint32_t descents_ = 0;   ///< outer-loop bound; see kMaxRangeDescents
   uint32_t settle_tries_ = 0;
   Batch last_batch_{};
   /// The snapshot claim, and then its write-back. A MEMBER, not a local: the
