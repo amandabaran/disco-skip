@@ -1,5 +1,6 @@
 #pragma once
 
+#include "../rdma_device.hpp"
 #include <vector>
 
 #include <dory/conn/rc-exchanger.hpp>
@@ -14,6 +15,8 @@
 #include "buckets.hpp"
 
 namespace dory::race {
+
+
 
 class ServerIndex {
   LOGGER_DECL_INIT(logger, "ServerIndex");
@@ -32,7 +35,7 @@ class ServerIndex {
  public:
   ServerIndex(ProcId const id, std::vector<ProcId> const& client_ids,
               size_t const bucket_bits, std::string const& name = "default")
-      : bucket_bits{bucket_bits}, device{std::move(ctrl::Devices().list().back())} {
+      : bucket_bits{bucket_bits}, device{std::move(rdmasel::openBestDevice())} {
     size_t const allocated_size = indexSize(bucket_bits);
 
     ctrl::ResolvedPort port{device};

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "../rdma_device.hpp"
 #include <array>
 #include <atomic>
 #include <optional>
@@ -29,6 +30,8 @@
 #include "types.hpp"
 
 namespace dory::race {
+
+
 
 class ClientIndex: public std::enable_shared_from_this<ClientIndex> {
 public:
@@ -120,7 +123,7 @@ private:
 public:
   ClientIndex(ProcId const id, ProcId const server_id, size_t const bucket_bits, std::string const& name="default")
   : bucket_bits{bucket_bits},
-    device{std::move(ctrl::Devices().list().back())} {
+    device{std::move(rdmasel::openBestDevice())} {
   
     static size_t constexpr AllocatedSize = WrContext::BufferSize * NbContexts;
 

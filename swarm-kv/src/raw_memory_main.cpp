@@ -1,3 +1,4 @@
+#include "rdma_device.hpp"
 #include <memory>
 
 #include <lyra/lyra.hpp>
@@ -165,18 +166,14 @@ int main(int argc, char* argv[]) {
 
   // Get the last device
   auto& available_devices = d.list();
-  size_t target_index = 0; // This corresponds to the 3rd device (uverbs2 or mlx5_2)
-
-  if (available_devices.size() > target_index) {
-      od = std::move(available_devices[target_index]);
-      std::cout << "Selected device: " << od.devName() << std::endl;
-  } else {
-      std::cerr << "Error: Device index " << target_index << " not available." << std::endl;
-      std::cerr << "Available devices: ";
-      for (auto const& dev : available_devices) std::cerr << dev.devName() << " ";
-      std::cerr << std::endl;
-      return 1;
-  }
+  // WAS target_index = 0 with a comment claiming it is "the 3rd device
+  // (uverbs2 or mlx5_2)", which index 0 is not. Only ever correct because the
+  // r320 nodes have one device. On the r650 nodes index 0 is mlx5_0, the
+  // ACTIVE 25G management NIC, while the experiment LAN is mlx5_2 at 100G --
+  // so it runs, reports nothing wrong, and measures a 4x slower fabric.
+  // See rdma_device.hpp.
+  size_t const target_index = rdmasel::pickDevice(available_devices);
+  od = std::move(available_devices[target_index]);
 
 
   std::cout << od.name() << " " << od.devName() << " "

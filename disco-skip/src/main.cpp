@@ -9,6 +9,7 @@
 
 #include <fmt/ostream.h>
 
+#include "rdma_device.hpp"
 #include "ds_log.hpp"
 #include <iostream>
 #include <condition_variable>
@@ -200,6 +201,59 @@ void bootstrap_structure(ds::DsState& state) {
 // That split exists because this file cannot be compiled off-cluster at all, so
 // code in it is unverified until a build. Six builds have now been lost that
 // way, the last to a mistyped VerifyReport field.
+/// Walk the structure after a WORKLOAD and check invariants.md §1.
+///
+/// WHY THIS EXISTS SEPARATELY FROM THE SELFTEST. run_structure_selftest is
+/// invoked at 1 server and 1 client, and at one client a timestamp mode cannot
+/// be caught ordering anything wrongly -- ds_ts.hpp says so directly: "At one
+/// client that does not matter, because one clock orders its own writes
+/// perfectly." So the existing verifier cannot detect the failure mode that
+/// clock skew produces, which is an old_ver chain that does not decrease in ts
+/// because two writers on DIFFERENT machines stamped out of order.
+///
+/// That needs concurrent cross-machine writes with contention -- which is a
+/// workload, not a selftest -- followed by a check. Hence this.
+///
+/// IT MUST RUN QUIESCENT. verifyStructure is a sequential checker: a peer
+/// still writing looks exactly like corruption, and the run would report
+/// invariant violations that are really just concurrency. The caller runs it
+/// after the "finished" rendezvous, when every client has stopped.
+///
+/// ONE CLIENT RUNS IT. The structure is shared, so a second checker re-reads
+/// the whole thing to reach the same answer.
+int verify_after_run(ds::DsState& state) {
+    uint32_t const layers = static_cast<uint32_t>(state.layout.cache_layers);
+    ds::RdmaReplicaSet<decltype(state.server_conns)> replicas(
+        state.server_conns, state.layout, state.layout.getNodeBufs(0),
+        state.layout.getVecBufs(0), state.layout.getCasBufs(0),
+        state.layout.getStageNode(0), state.layout.getStageVec(0),
+        &state.node_alloc, &state.vec_alloc, &state.vec_hint);
+    replicas.setTsMode(state.layout.ts_mode);
+    replicas.setClientIdx(state.client_idx);
+    ds::QuorumStats qstats;
+    ds::QuorumOps<decltype(replicas)> ops(replicas, qstats, nullptr);
+
+    ds::clientOut() << "\n################ Post-workload verify ("
+                    << ds::tsModeName(state.layout.ts_mode) << "):" << std::endl;
+    ds::VerifyReport const rep = ds::verifyStructure(ops, layers);
+    ds::clientOut() << "index nodes:  " << rep.nodes_visited << " ("
+                    << rep.orphans << " orphans, " << rep.entries
+                    << " entries)" << std::endl;
+    ds::clientOut() << "data nodes:   " << rep.data_nodes << " ("
+                    << rep.data_entries << " entries)" << std::endl;
+    ds::clientOut() << "old versions: " << rep.old_versions
+                    << "   <- the chains the ts check walks" << std::endl;
+    if (!rep.ok()) {
+        for (auto const& e : rep.errors) ds::clientOut() << "  " << e << std::endl;
+        ds::clientOut() << "VERIFY FAIL: I1-I4 do NOT hold after this workload"
+                        << std::endl;
+        return 1;
+    }
+    ds::clientOut() << "VERIFY PASS: I1-I4 hold after this workload, and every "
+                       "old_ver chain decreases in ts" << std::endl;
+    return 0;
+}
+
 int run_structure_selftest(ds::DsState& state) {
     uint32_t const layers = static_cast<uint32_t>(state.layout.cache_layers);
 
@@ -470,6 +524,16 @@ public:
         });
     }
 
+    /// A CLIENTS-ONLY barrier, on the memstore counter.
+    ///
+    /// A CE rendezvous cannot do this: waitReadyAll waits for every remote,
+    /// servers included, and a server never announces a client-only state, so
+    /// the clients would wait forever. The counter is incremented once per
+    /// process, like measureStart, and counts only who arrives.
+    void barrierAll(char const *key) {
+        collective([&] { store_.barrier(key, client_processes_); });
+    }
+
     /// The measure-start barrier, counted in PROCESSES rather than clients.
     ///
     /// MemoryStore::barrier increments by one per call, so a process that
@@ -544,6 +608,7 @@ static int runClient(ds::Layout layout,
                      uint64_t total_iter_count,
                      bool detailed,
                      bool run_selftest,
+                     bool verify_after,
                      bool run_ml_workload,
                      uint64_t think_time) {
 #if DS_CACHE_ENABLED
@@ -554,6 +619,7 @@ static int runClient(ds::Layout layout,
     // PER CLIENT, not per process. See the note where this used to be a
     // file-scope global.
     std::vector<YcsbOp> operations;
+    int verify_rc = 0;
     ds::DsState& state = client.getState();
 
     // ─── Bootstrap the skip vector ─────────────────────────────
@@ -1039,7 +1105,40 @@ static int runClient(ds::Layout layout,
         static_cast<uint64_t>((end_time - start_time).count() / 1000000000));
         ds::clientOut() << std::flush;
         
+        // THE VERIFY MUST HAPPEN BEFORE "finished", NOT AFTER.
+        //
+        // The server branch announces "finished", waits for everyone, and
+        // then CLOSES ITS CONNECTION. Verifying after that rendezvous means
+        // reading from servers that are tearing down, and the walk hangs on a
+        // read that can never complete -- which is exactly what it did, twice,
+        // while being misdiagnosed first as too much data and then as an
+        // undrained completion queue. A two-second workload followed by
+        // fifteen minutes of silence was the tell.
+        //
+        // So: a clients-only barrier to establish quiescence while the servers
+        // are still up, the verify, then a second barrier so the other clients
+        // do not announce "finished" and kill the servers underneath it.
+        sync.barrierAll("verify-quiesce");
+        if (verify_after && proc_id == layout.firstClientId()) {
+            // DRAIN FIRST. The verifier posts reads and polls the send CQ
+            // blindly, and that CQ is shared with the future machinery -- the
+            // same contract range_lock.hpp's casBlocking documents. The
+            // selftest gets away without this because no future has ever run
+            // in that path; here twenty thousand operations just did, and the
+            // verify hung waiting for a completion that was already consumed.
+            // It presented as "the walk is too slow", and the run was resized
+            // twice before the cause was read off the log: a 2-second
+            // workload followed by fifteen minutes of nothing.
+            client.finishAllFutures();
+            verify_rc = verify_after_run(client.getState());
+        }
+        if (verify_after) sync.barrierAll("verify-done");
+
         sync.rendezvous("finished");
+        if (verify_rc != 0) {
+            sync.unannounce("initialized");
+            return verify_rc;
+        }
         sync.unannounce("initialized");
     }
     return 0;
@@ -1182,6 +1281,10 @@ int main(int argc, char** argv) {
     // (threads, shared) minus (threads, own) is the sharing alone. Costs one
     // flag, because NodeCache is already a separate object.
     int64_t share_cache = 1;
+    // Check the structure after the workload, on one client, once everyone has
+    // stopped writing. Off by default: it costs a full walk of the structure
+    // and a throughput run does not want it.
+    bool verify_after = false;
     // WHERE EACH CLIENT THREAD WRITES ITS LOG. Empty means "don't", which is
     // right at --threads 1: invoker.sh already tees this process's stdout to
     // exactly that path, and opening the same file here would put two writers
@@ -1341,6 +1444,13 @@ int main(int argc, char** argv) {
             "--threads > 1, because a process has one stdout and every parser "
             "in experiments/compare reads one log per client. Ignored at "
             "--threads 1, where invoker.sh already tees stdout to that file.") |
+        lyra::opt(verify_after, "verify_after").optional()["--verify-after"](
+            "After the workload, once every client has stopped writing, have "
+            "ONE client walk the structure and check invariants.md I1-I4 -- "
+            "including that every old_ver chain DECREASES in ts. This is the "
+            "check that can catch a timestamp mode ordering two machines' "
+            "writes wrongly; --selftest cannot, because it runs at one client "
+            "and one clock orders its own writes perfectly.") |
         lyra::opt(share_cache, "share_cache").optional()["--share-cache"](
             "Whether the client threads in this process SHARE one per-node "
             "cache (1, default) or each keep their own (0). 0 exists to "
@@ -1731,18 +1841,14 @@ int main(int argc, char** argv) {
     ctrl::Devices d;
     ctrl::OpenDevice od;
     auto& available_devices = d.list();
-    size_t target_index = 0; // This corresponds to the 3rd device (uverbs2 or mlx5_2)
-
-    if (available_devices.size() > target_index) {
-        od = std::move(available_devices[target_index]);
-        std::cout << "Selected device: " << od.devName() << std::endl;
-    } else {
-        std::cerr << "Error: Device index " << target_index << " not available." << std::endl;
-        std::cerr << "Available devices: ";
-        for (auto const& dev : available_devices) std::cerr << dev.devName() << " ";
-        std::cerr << std::endl;
-        return 1;
-    }
+    // WAS target_index = 0, under a comment claiming index 0 "corresponds to
+    // the 3rd device (uverbs2 or mlx5_2)" -- which it does not. On the r320
+    // nodes there is only mlx4_0 so it did not matter; on the r650 nodes
+    // index 0 is mlx5_0, the ACTIVE 25G management NIC, while the experiment
+    // LAN is mlx5_2 at 100G. That picks a working but four-times-slower
+    // fabric and reports nothing wrong. See rdma_device.hpp.
+    size_t const target_index = rdmasel::pickDevice(available_devices);
+    od = std::move(available_devices[target_index]);
 
     std::cout << od.name() << " " << od.devName() << " "
             << ctrl::OpenDevice::typeStr(od.nodeType()) << " "
@@ -1988,13 +2094,13 @@ int main(int argc, char** argv) {
                                workload, ycsb_path, iter_count, warmup,
                                keepwarm, start_measurements, stop_measurements,
                                total_iter_count, detailed, run_selftest,
-                               run_ml_workload, think_time);
+                               verify_after, run_ml_workload, think_time);
 #else
             rcs[t] = runClient(my_layout, my_ids[t], *ces[t], store, sync,
                                workload, ycsb_path, iter_count, warmup,
                                keepwarm, start_measurements, stop_measurements,
                                total_iter_count, detailed, run_selftest,
-                               run_ml_workload, think_time);
+                               verify_after, run_ml_workload, think_time);
 #endif
             if (client_threads > 1) {
                 // Each client ends its own log the way the harness expects:
