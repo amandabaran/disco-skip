@@ -9,6 +9,8 @@
 #include <stdexcept>
 
 #include <fmt/chrono.h>
+
+#include "ds_log.hpp"  // clientOut(): see the note in report()
 #include <fmt/core.h>
 
 class LatencyProfiler {
@@ -67,7 +69,7 @@ class LatencyProfiler {
     total_time += d;
 
     if (d < std::chrono::nanoseconds(0)) {
-      fmt::print("!PROFILER WARNING! Duration underflow: {}\n", d);
+      fmt::print(ds::clientOut(), "!PROFILER WARNING! Duration underflow: {}\n", d);
       return;
     }
 
@@ -137,23 +139,32 @@ class LatencyProfiler {
     return fmt::format("{:.3f}ms", ns_count / 1000000.0);
   }
 
+  /// PRINTS TO clientOut(), NOT STDOUT, AND THAT IS THE WHOLE BUG FIX.
+  ///
+  /// From 09-19, when threads-per-node became the harness default, a process
+  /// hosting 2+ client threads redirected each thread's clientOut() to its own
+  /// log while these lines still went to the shared process stdout -- so every
+  /// latency measurement above 8 clients was recorded correctly and then
+  /// thrown away. reportStats prints a section only when
+  /// getMeasurementCount() > 0, so the symptom was a MISSING SECTION rather
+  /// than a zero, and it went unnoticed for four days.
   void report(bool detailed = false) const {
-    fmt::print("Number of measurements: {}.\n", measurement_idx);
-    fmt::print("Average latency: {}.\n", measurement_idx > 0
+    fmt::print(ds::clientOut(), "Number of measurements: {}.\n", measurement_idx);
+    fmt::print(ds::clientOut(), "Average latency: {}.\n", measurement_idx > 0
                                              ? prettyTime(total_time / measurement_idx)
                                              : prettyTime(total_time));
     if (detailed) {
-      fmt::print("{}%: {}.\n", 0.1, prettyTime(percentile(0.1)));
+      fmt::print(ds::clientOut(), "{}%: {}.\n", 0.1, prettyTime(percentile(0.1)));
       for (auto ptile = 1; ptile < 100; ptile++) {
-        fmt::print("{}%: {}.\n", ptile, prettyTime(percentile(ptile)));
+        fmt::print(ds::clientOut(), "{}%: {}.\n", ptile, prettyTime(percentile(ptile)));
       }
     } else {
-      fmt::print("{}%: {},  ", 0.1, prettyTime(percentile(0.1)));
+      fmt::print(ds::clientOut(), "{}%: {},  ", 0.1, prettyTime(percentile(0.1)));
       for (auto ptile : {5, 25, 50, 75, 95}) {
-        fmt::print("{}%: {},  ", ptile, prettyTime(percentile(ptile)));
+        fmt::print(ds::clientOut(), "{}%: {},  ", ptile, prettyTime(percentile(ptile)));
       }
     }
-    fmt::print("{}%: {}.\n", 99.9, prettyTime(percentile(99.9)));
+    fmt::print(ds::clientOut(), "{}%: {}.\n", 99.9, prettyTime(percentile(99.9)));
   }
 
   void reportOnce(bool detailed = false) {
@@ -165,7 +176,7 @@ class LatencyProfiler {
 
   void reportBuckets() const {
     for (auto &g : grp) {
-      fmt::print("Reporting detailed data for range (in ns) [{},{})\n",
+      fmt::print(ds::clientOut(), "Reporting detailed data for range (in ns) [{},{})\n",
                  prettyTime(g.start), prettyTime(g.end));
 
       for (size_t i = 0; i < g.indices; i++) {
@@ -174,10 +185,10 @@ class LatencyProfiler {
           continue;
         }
 
-        fmt::print("[{},{}) {}\n", g.start + i * g.granularity,
+        fmt::print(ds::clientOut(), "[{},{}) {}\n", g.start + i * g.granularity,
                    g.start + (i + 1) * g.granularity, f);
       }
-      fmt::print("\n");
+      fmt::print(ds::clientOut(), "\n");
     }
   }
 

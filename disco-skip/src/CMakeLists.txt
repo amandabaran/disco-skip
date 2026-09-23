@@ -31,7 +31,7 @@ set(DS_N_REPLICAS    1)
 # See that run's FINDINGS.md for the mechanism -- larger nodes cut splits,
 # which is what invalidates a cache that caches structure.
 set(DS_MAX_LAYERS 8)
-set(DS_IDX_EXP    4)
+set(DS_IDX_EXP    3)
 
 # DATA node capacity, separate from the index fan-out above.
 #
@@ -42,7 +42,7 @@ set(DS_IDX_EXP    4)
 #
 # VecRecord stays a multiple of 64 bytes at every value, with keys[] and vals[]
 # both cache-line aligned -- see the layout note in ds_node.hpp.
-set(DS_DATA_EXP   4)
+set(DS_DATA_EXP   3)
 
 # Maximum threads per client process. Currently one client thread per process,
 # but this sizes the cache's hazard-pointer arrays, so it must be >= the real

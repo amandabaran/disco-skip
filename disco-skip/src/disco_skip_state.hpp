@@ -15,6 +15,7 @@
 #include "ds_cache.hpp"
 #endif
 #include "layout.hpp"
+#include "ds_log.hpp"    // clientOut(): the THREAD-LOCAL client stream
 #include "latency.hpp"   // Swarm's LatencyProfiler
 
 namespace ds {
@@ -203,59 +204,59 @@ public:
     // client has drained its futures.
     void reportCache() const {
 #if DS_CACHE_ENABLED
-        fmt::print("\n################ Cache:\n");
-        fmt::print("consulted:               {}\n",
+        fmt::print(clientOut(), "\n################ Cache:\n");
+        fmt::print(clientOut(), "consulted:               {}\n",
                    layout.consult_cache ? "yes" : "no (no-cache baseline)");
-        fmt::print("heads bootstrapped:      {}\n",
+        fmt::print(clientOut(), "heads bootstrapped:      {}\n",
                    headsBootstrapped(cache_sv) ? "yes" : "NO (every head lookup misses)");
-        fmt::print("levels:                  {}\n", layout.cache_layers);
-        fmt::print("node capacity:           {}\n", kNodeCapacity);
-        fmt::print("offset hint:             {}\n",
+        fmt::print(clientOut(), "levels:                  {}\n", layout.cache_layers);
+        fmt::print(clientOut(), "node capacity:           {}\n", kNodeCapacity);
+        fmt::print(clientOut(), "offset hint:             {}\n",
                    vec_hint.enabled()
                        ? fmt::format("{:.3f} hit rate ({} hit / {} miss)",
                                      vec_hint.hitRate(), vec_hint.hits(),
                                      vec_hint.misses())
                        : std::string("disabled"));
-        fmt::print("nodes allocated:         {} of {}\n",
+        fmt::print(clientOut(), "nodes allocated:         {} of {}\n",
                    node_alloc.allocated(), node_alloc.capacity());
-        fmt::print("vectors allocated:       {} of {}\n",
+        fmt::print(clientOut(), "vectors allocated:       {} of {}\n",
                    vec_alloc.allocated(), vec_alloc.capacity());
         for (uint32_t L = 0; L < layout.cache_layers && L < kMaxLayers; ++L) {
             LevelStats const st = levelStats(cache_sv, L);
-            fmt::print("level {}: {} nodes, {} orphans, {} entries\n",
+            fmt::print(clientOut(), "level {}: {} nodes, {} orphans, {} entries\n",
                        L, st.nodes, st.orphans, st.entries);
         }
 #else
-        fmt::print("\n################ Cache: disabled (DS_CACHE_ENABLED=0)\n");
+        fmt::print(clientOut(), "\n################ Cache: disabled (DS_CACHE_ENABLED=0)\n");
 #endif
     }
 
     // ─── Reporting (mirroring OopsState::reportStats) ──────────────
     void reportStats(bool detailed = false) {
         reportCache();
-        fmt::print("\n################ Counters:\n");
-        fmt::print("rdma_reads:              {}\n", rdma_reads);
-        fmt::print("rdma_cas_attempts:       {}\n", rdma_cas_attempts);
-        fmt::print("rdma_cas_failures:       {}\n", rdma_cas_failures);
-        fmt::print("gets_with_writeback:     {}\n", gets_with_writeback);
-        fmt::print("gets_without_writeback:  {}\n", gets_without_writeback);
-        fmt::print("put_retries:             {}\n", put_retries);
+        fmt::print(clientOut(), "\n################ Counters:\n");
+        fmt::print(clientOut(), "rdma_reads:              {}\n", rdma_reads);
+        fmt::print(clientOut(), "rdma_cas_attempts:       {}\n", rdma_cas_attempts);
+        fmt::print(clientOut(), "rdma_cas_failures:       {}\n", rdma_cas_failures);
+        fmt::print(clientOut(), "gets_with_writeback:     {}\n", gets_with_writeback);
+        fmt::print(clientOut(), "gets_without_writeback:  {}\n", gets_without_writeback);
+        fmt::print(clientOut(), "put_retries:             {}\n", put_retries);
 
-        fmt::print("\n################ Main stats:\n");
+        fmt::print(clientOut(), "\n################ Main stats:\n");
 
         if (get_profiler.getMeasurementCount() > 0) {
-            fmt::print("######## GET stats:\n");
+            fmt::print(clientOut(), "######## GET stats:\n");
             get_profiler.report(detailed);
         }
         if (put_profiler.getMeasurementCount() > 0) {
-            fmt::print("######## PUT stats:\n");
+            fmt::print(clientOut(), "######## PUT stats:\n");
             put_profiler.report(detailed);
         }
         if (range_profiler.getMeasurementCount() > 0) {
-            fmt::print("######## RANGE stats:\n");
+            fmt::print(clientOut(), "######## RANGE stats:\n");
             range_profiler.report(detailed);
         }
-        fmt::print("\n");
+        fmt::print(clientOut(), "\n");
     }
 };
 

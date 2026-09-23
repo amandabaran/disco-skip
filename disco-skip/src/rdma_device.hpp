@@ -1,11 +1,15 @@
 #pragma once
 
+#include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <fstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <infiniband/verbs.h>
@@ -124,11 +128,34 @@ inline double netdevRate(std::string const &ibdev, uint8_t port) {
   }
 }
 
+/// A FAILED PORT QUERY IS NOT A DOWN LINK, AND CONFLATING THEM COST A NIGHT.
+///
+/// This loop used to `continue` when ibv_query_port failed, so a device whose
+/// ports could not be queried surveyed identically to one whose ports were
+/// genuinely down: `[0]mlx4_0 down 0G`, then "no RDMA device has an ACTIVE
+/// port. Check the fabric". On 2026-09-22 that message appeared four times on
+/// w4 while `ibstat` reported State: Active, Rate: 56 and the port's
+/// link_downed counter read 0 on a freshly booted host -- and in the fusee
+/// logs it appeared SECONDS AFTER the same process had opened the device,
+/// registered an RDMA buffer and connected its queue pairs. A link that was
+/// down could not have done that. It sent us looking at the fabric, then
+/// power-cycling two machines, for a transient query failure.
+///
+/// So: retry the query, and record the two cases separately. `ports_seen` is
+/// how many ports answered; `ports_failed` how many never did. A survey with
+/// ports_seen == 0 and ports_failed > 0 is "could not ask", which pickDevice
+/// reports as such rather than blaming the cable.
+constexpr int kPortQueryAttempts = 4;
+constexpr int kPortQueryRetryMs = 25;
+
 struct Candidate {
   size_t index = 0;
   std::string name;
   bool active = false;
   double rate = 0.0;
+  unsigned ports_seen = 0;    ///< ports ibv_query_port actually answered for
+  unsigned ports_failed = 0;  ///< ports that failed every attempt
+  int last_errno = 0;         ///< errno from the last failed attempt
 };
 
 /// Describe every device, in list order. Never throws: a device that cannot be
@@ -154,7 +181,18 @@ inline std::vector<Candidate> surveyDevices(
         // the port that actually carries traffic.
         for (uint8_t p = 1; p <= dev_attr.phys_port_cnt; ++p) {
           ibv_port_attr pa{};
-          if (ibv_query_port(ctx, p, &pa) != 0) continue;
+          // Retry rather than give up: the failures observed were transient,
+          // on a device the same process had just used successfully.
+          int qrc = -1;
+          for (int attempt = 0; attempt < kPortQueryAttempts; ++attempt) {
+            qrc = ibv_query_port(ctx, p, &pa);
+            if (qrc == 0) break;
+            c.last_errno = errno;
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(kPortQueryRetryMs));
+          }
+          if (qrc != 0) { ++c.ports_failed; continue; }
+          ++c.ports_seen;
           bool const act = (pa.state == IBV_PORT_ACTIVE);
           double r = portRate(pa);
           // `r <= 0.0`, not `r == 0.0`: the build runs -Werror=float-equal,
@@ -171,6 +209,29 @@ inline std::vector<Candidate> surveyDevices(
   return out;
 }
 
+/// Say WHICH failure this is. "Check the fabric" is the right advice for a
+/// down link and the wrong advice for a query that never got an answer, and
+/// the old message gave it unconditionally.
+inline std::string errmsg(std::vector<Candidate> const &survey) {
+  bool any_seen = false, any_failed = false;
+  int err = 0;
+  for (auto const &c : survey) {
+    if (c.ports_seen > 0) any_seen = true;
+    if (c.ports_failed > 0) { any_failed = true; err = c.last_errno; }
+  }
+  if (!any_seen && any_failed) {
+    return std::string(
+        "ibv_query_port failed on every port of every device after ") +
+        std::to_string(kPortQueryAttempts) + " attempts (errno " +
+        std::to_string(err) + " " + std::strerror(err) +
+        "). This is NOT a down link -- the ports were never successfully "
+        "read. Check for a device opened twice in one process, or an "
+        "exhausted fd/resource limit, before looking at the fabric.";
+  }
+  return "no RDMA device has an ACTIVE port. Check the fabric before running: "
+         "every arm needs it, and a down link is not a slow link.";
+}
+
 /// Index of the device to open. Prints the survey and the choice, because a
 /// wrong NIC is invisible in every other line of the log.
 inline size_t pickDevice(std::vector<ctrl::OpenDevice> &devices) {
@@ -181,8 +242,15 @@ inline size_t pickDevice(std::vector<ctrl::OpenDevice> &devices) {
 
   std::cout << "RDMA devices:";
   for (auto const &c : survey) {
-    std::cout << " [" << c.index << "]" << c.name
-              << (c.active ? " ACTIVE " : " down ") << c.rate << "G";
+    char const *what = c.active            ? " ACTIVE "
+                       : (c.ports_seen > 0) ? " down "
+                                            : " UNQUERYABLE ";
+    std::cout << " [" << c.index << "]" << c.name << what << c.rate << "G";
+    if (c.ports_seen == 0 && c.ports_failed > 0) {
+      std::cout << "(" << c.ports_failed << " port(s) failed ibv_query_port, "
+                << "errno " << c.last_errno << " " << std::strerror(c.last_errno)
+                << ")";
+    }
   }
   std::cout << std::endl;
 
@@ -213,8 +281,7 @@ inline size_t pickDevice(std::vector<ctrl::OpenDevice> &devices) {
   }
   if (!found) {
     throw std::runtime_error(
-        "no RDMA device has an ACTIVE port. Check the fabric before running: "
-        "every arm needs it, and a down link is not a slow link.");
+        errmsg(survey));
   }
   std::cout << "RDMA device: " << survey[best].name << " (index " << best
             << ", " << survey[best].rate << "G, ACTIVE)" << std::endl;
@@ -230,9 +297,31 @@ inline size_t pickDevice(std::vector<ctrl::OpenDevice> &devices) {
 ///   error: redefinition of 'dory::race::{anonymous}::pickRdmaDevice()'
 /// One inline definition in the shared header is the fix.
 inline ctrl::OpenDevice openBestDevice() {
+  // COPY, DO NOT MOVE. `devs` is static, so one device list serves the whole
+  // process -- and std::move'ing the chosen entry OUT of it left a moved-from
+  // OpenDevice behind: OpenDevice's move ctor sets `o.ctx = nullptr`. The
+  // SECOND call in the same process then surveyed a list whose best entry had
+  // a null context, never entered the port loop at all (ports_seen == 0 AND
+  // ports_failed == 0), printed the device as UNQUERYABLE 0G and threw "no
+  // RDMA device has an ACTIVE port. Check the fabric".
+  //
+  // It was never the fabric. That message cost 2026-09-22 two power cycles
+  // and several hours: link_downed read 0 on a freshly booted host while
+  // ibstat reported Active/56G, and the fusee log showed the throw arriving
+  // THIRTY-SIX SECONDS AFTER the same process had opened the device,
+  // registered an RDMA buffer and connected its queue pairs.
+  //
+  // Only fusee hit it, because only fusee calls this twice per process
+  // (race/client_index.hpp and race/server_index.hpp each open their own).
+  // disco-skip calls pickDevice on its own list in main.cpp and never comes
+  // here, which is why it was immune and why this looked workload-specific.
+  //
+  // The copy ctor re-opens the device (ibv_open_device) and throws if that
+  // fails, so every caller gets its own live context and the static list
+  // keeps valid contexts and valid ibv_device pointers for the next call.
   static ctrl::Devices devs;
   auto &list = devs.list();
-  return std::move(list.at(pickDevice(list)));
+  return list.at(pickDevice(list));
 }
 
 }  // namespace dory::rdmasel
