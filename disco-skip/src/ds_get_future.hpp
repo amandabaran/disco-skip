@@ -44,6 +44,7 @@ enum class GetStep : uint8_t {
   Idle,
   AwaitHintHeader,  ///< reading the node the cache pointed at
   AwaitHintVec,     ///< that node looked right, so its entries are needed
+  AwaitHintOldVer,  ///< reading the version an in-flight write superseded
   Traversing,       ///< the hint missed or was stale; resolving remotely
   Done,
 };
@@ -80,6 +81,7 @@ class GetOperation {
     switch (step_) {
       case GetStep::AwaitHintHeader: return onHintHeader();
       case GetStep::AwaitHintVec:    return onHintVec();
+      case GetStep::AwaitHintOldVer: return onHintOldVer();
       case GetStep::Traversing:      return onTraversing();
       case GetStep::Idle:
       case GetStep::Done:
@@ -226,6 +228,37 @@ class GetOperation {
       ++stats_.hop_reconciles;
       ++stats_.reconciles;
     }
+    // THE SAME RULE THE TRAVERSAL USES, so a cache hit and a descent resolve
+    // a race with an in-flight write identically: answer from the version that
+    // write superseded, ordering this read before it. The fast path hops but
+    // does NOT post the repair -- that would spend a round trip on the thing
+    // the cache exists to make cheap, and the traversal posts it anyway.
+    //
+    // With no earlier version to read (the created half of a split) this
+    // descends, and the traversal settles that node as it always did.
+    if (tsIsPending(vec_, ops_.tsMode()) || !node_.isStable()) {
+      if (vec_.old_ver == kNullVec) {
+        ++stats_.cache_misses;
+        return beginTraversal();
+      }
+      step_ = GetStep::AwaitHintOldVer;
+      ++stats_.rt_hint;
+      return ops_.postVec(static_cast<VecOffset>(vec_.old_ver));
+    }
+    return finishFromHint();
+  }
+
+  /// The superseded version arrived. Answer from it.
+  size_t onHintOldVer() {
+    if (!ops_.resolveVec(vec_)) {
+      ++stats_.cache_misses;
+      return beginTraversal();
+    }
+    ++stats_.vec_reads;
+    return finishFromHint();
+  }
+
+  size_t finishFromHint() {
     int const idx = findLte(vec_, k_);
     out_.resolved = true;
     if (idx >= 0 && vec_.keyAt(idx) == k_) {

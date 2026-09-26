@@ -222,9 +222,15 @@ static void checkC4IsDetectedNotMisanswered() {
               (unsigned long long)stats.kmin_mismatch);
 }
 
-static void checkGetHelpsInFlightWrites() {
-  // A Get that lands on a node whose write is still in flight must complete it
-  // rather than wait, and must still return the right answer.
+static void checkGetLinearizesBeforeInFlightWrites() {
+  // A Get that lands on a node whose write is still in flight does NOT wait
+  // for it and does not depend on it completing. It reads the version that
+  // write superseded, which orders this read before the write -- legal because
+  // a version is stamped before its writer returns, so an unstamped version
+  // belongs to a writer still in flight and the two operations overlap.
+  //
+  // It still POSTS the repair the in-flight update needs, once and without
+  // waiting, so later operations do not rediscover the same open window.
   FakeOps ops = buildInitialArena(kLayers);
   (void)seedChain(ops, /*nodes=*/4, /*per_node=*/4);
   SplitFixture const f = stageMidSplitOn(ops, ds::RemoteAddr{ds::kInitialDataId},
@@ -239,12 +245,38 @@ static void checkGetHelpsInFlightWrites() {
 
   ds::GetStats stats;
   ds::Getter<FakeOps, ds::CacheAdapter> g(ops, cache, kLayers, stats);
-  ds::GetResult const r = g.get(f.stay_key);
-  CHECK(r.resolved && r.found, "a Get through an in-flight write resolves");
-  CHECK(stats.helped > 0, "having helped the writer finish");
-  CHECK(ops.node(f.existing).isStable(), "and left the node settled");
+
+  // stay_key exists ONLY in the version the in-flight write published. A read
+  // ordered before that write must not see it -- this is the linearization
+  // point the design turns on, not an incidental absence.
+  //
+  // PROBED FIRST, AND ON ITS OWN FIXTURE. The read posts the repair on its way
+  // past, so a second probe of the same arena meets a SETTLED node and
+  // correctly sees the write. That is the design working, not a regression,
+  // but it means each probe needs its own in-flight state.
+  ds::GetResult const r2 = g.get(f.stay_key);
+  CHECK(r2.resolved, "a key only the in-flight write introduces resolves");
+  CHECK(!r2.found, "as absent, placing the read before that write");
+
+  CHECK(ops.node(f.existing).isStable(), "the repair still left the node settled");
   CHECK(!ops.vecOf(f.existing).isPending(), "with its timestamp fixed");
-  std::printf("  a Get completes an in-flight write rather than waiting\n");
+
+  // A key the pre-split version already held resolves to its pre-write value,
+  // on a fixture whose window is still open.
+  FakeOps ops2 = buildInitialArena(kLayers);
+  auto const oracle2 = seedChain(ops2, /*nodes=*/4, /*per_node=*/4);
+  (void)stageMidSplitOn(ops2, ds::RemoteAddr{ds::kInitialDataId},
+                        /*pending_ts=*/true);
+  ds::SkipVec sv2(&cfg);
+  ds::bootstrapHeads(sv2, ds::headAddrs(kLayers));
+  ds::CacheAdapter cache2(sv2, kLayers);
+  ds::GetStats stats2;
+  ds::Getter<FakeOps, ds::CacheAdapter> g2(ops2, cache2, kLayers, stats2);
+  ds::Key const settled_key = oracle2.begin()->first;
+  ds::GetResult const r = g2.get(settled_key);
+  CHECK(r.resolved && r.found && r.value == oracle2.at(settled_key),
+        "and a pre-existing key resolves to its superseded value");
+  std::printf("  a Get orders itself before an in-flight write, without waiting\n");
 }
 
 int main() {
@@ -252,7 +284,7 @@ int main() {
   checkGetAgainstOracleWithCache();
   checkCacheActuallyReducesWork();
   checkC4IsDetectedNotMisanswered();
-  checkGetHelpsInFlightWrites();
+  checkGetLinearizesBeforeInFlightWrites();
   std::printf("%s\n", g_failures == 0 ? "ALL PASS" : "FAILURES");
   return g_failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

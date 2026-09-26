@@ -244,6 +244,92 @@ bool settleNode(Ops &ops, RemoteAddr addr, NodeRecord &node, VecRecord &vec,
   return false;
 }
 
+/// Post the repair an in-flight update needs, ONCE, without waiting for it.
+///
+/// settleNode() submits the same chain and then re-reads in a bounded retry
+/// loop, because its callers need the node settled before they use it. A point
+/// read does not: it takes its answer from old_ver instead. But the repair is
+/// still worth posting, because propagating the split descriptor is what stops
+/// every later reader and writer rediscovering the same open window -- the
+/// traversal has the node and the vector in hand, so the batch is free beyond
+/// the doorbell.
+///
+/// Fire-and-forget is what keeps the read wait-free: no re-read, no retry, no
+/// dependence on the CAS landing. Every CAS here ignores its result anyway,
+/// because a failure means somebody else already performed that step.
+template <class Ops>
+void postInFlightRepair(Ops &ops, RemoteAddr addr, NodeRecord const &node,
+                        VecRecord const &vec, HelpCounters &c) {
+  bool const pending = tsIsPending(vec, ops.tsMode());
+  bool const unstable = !node.isStable();
+  if (!pending && !unstable) return;
+
+  Batch b;
+  if (pending) {
+    // The local modes can stamp here. Faa cannot -- its value is not available
+    // locally and claiming one needs a second submission to write it back,
+    // which is exactly the wait this function exists to avoid. A Faa-mode
+    // version is left for the writer to stamp on its way out, or for a range
+    // to settle; neither this read nor its answer depends on it.
+    if (!tsIsRemote(ops.tsMode())) {
+      b.casTs(node.handle.offset(), kNullTs, ops.now());
+      ++c.helped_ts;
+    }
+  }
+  if (unstable && vec.hasSplitDescriptor()) {
+    if (node.next_k_min != vec.k_min_next) {
+      b.casNextKMin(addr, node.next_k_min, vec.k_min_next);
+    }
+    if (node.next_id != vec.next_id) {
+      b.casNextId(addr, node.next_id, vec.next_id);
+    }
+  }
+  if (unstable) {
+    b.casTailWord(addr, packTailWord(node.level, node.tail_struct_ver),
+                  packTailWord(node.level, node.handle.structVer()));
+    ++c.helped_splits;
+  }
+  if (b.size() > 0) {
+    ++c.batches;
+    ops.submit(b);
+  }
+}
+
+/// Step back to the version this node held before any in-flight update.
+///
+/// A POINT READ MAY LINEARIZE BEFORE A PENDING WRITE, and doing so costs one
+/// read where settling costs a CAS chain plus a re-read, retried up to
+/// kMaxSettleAttempts. The write path stamps a version before its operation
+/// returns (ds_put_future.hpp onInsert: "a reader starting afterwards cannot
+/// be ordered before it"), so a version found UNSTAMPED belongs to a writer
+/// still in flight. The two operations overlap in real time, linearizability
+/// permits ordering them either way, and reading old_ver puts this read first.
+///
+/// ONE HOP, NEVER A CHAIN. old_ver is always stamped when it exists: the write
+/// path settles a pending version BEFORE staging over it (afterFetch), and a
+/// writer working from a read that predates the publish loses its own
+/// publishing CAS and re-reads. So no version is ever published on top of an
+/// unstamped one.
+///
+/// MID-SPLIT IS THE SAME WINDOW. A split stages both vectors and publishes the
+/// handle in one batch, then stamps and propagates the header in a second, so
+/// an unstable node's current version is unstamped too. The pre-split version
+/// carries the WIDER range and still holds every entry the split moved, so a
+/// read that lands on it finds k if k was ever there.
+///
+/// Returns false only when there is nothing earlier to read: the CREATED half
+/// of a split starts with old_ver = kNullVec, because at any point before the
+/// split it did not exist. The caller settles in that case.
+template <class Ops>
+bool readBeforePending(Ops &ops, NodeRecord const &node, VecRecord &vec,
+                       HelpCounters &c) {
+  if (!tsIsPending(vec, ops.tsMode()) && node.isStable()) return true;
+  if (vec.old_ver == kNullVec) return false;
+  if (!ops.readVec(static_cast<VecOffset>(vec.old_ver), vec)) return false;
+  ++c.vec_reads;
+  return true;
+}
+
 template <class Ops>
 class Traversal {
  public:
@@ -301,9 +387,28 @@ class Traversal {
     // hops along, which is exactly interface-doc §7a's third case.
     bool have_vec = false;
     if (!seek(cur, k, node, vec, have_vec, res)) return res;
-    if (!settle(cur, node, vec, res)) {
-      res.status = TraversalStatus::ReadFailed;
-      return res;
+    // A POINT READ DOES NOT HELP AT THE DATA LEVEL. It linearizes before an
+    // in-flight update by reading the version that update superseded, which
+    // is one round trip against settling's CAS chain, re-read, and up to
+    // kMaxSettleAttempts retries -- and it removes the settle guard from a
+    // get's failure modes entirely. Only when there is no earlier version to
+    // read does it fall back to helping. Ranges still settle: walking to
+    // old_ver there would drop a committed write from the snapshot.
+    {
+      HelpCounters c;
+      // Post the repair without waiting on it, then answer from the version
+      // the in-flight update superseded. The repair keeps later operations
+      // from rediscovering the same open window; the old_ver read is what
+      // makes this operation independent of the writer's progress.
+      postInFlightRepair(ops_, cur, node, vec, c);
+      if (readBeforePending(ops_, node, vec, c)) {
+        res.vec_reads += c.vec_reads;
+        res.helped_ts += c.helped_ts;
+        res.helped_splits += c.helped_splits;
+      } else if (!settle(cur, node, vec, res)) {
+        res.status = TraversalStatus::ReadFailed;
+        return res;
+      }
     }
 
     res.data_addr = cur;

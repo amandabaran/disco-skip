@@ -179,6 +179,25 @@ class Getter {
         if (in_range && have_vec) {
           // ── 2. The hint was good. Answer from this node alone. ──────────
           ++stats_.cache_hits;
+          // SAME RULE AS THE TRAVERSAL, so the two paths resolve a race with
+          // an in-flight write the same way: post its repair once, then answer
+          // from the version it superseded. The fast path used to read
+          // straight through, which ordered the read AFTER the write -- also
+          // legal, but it made a cache hit and a descent disagree about the
+          // same concurrent state, and the differential test does not cover
+          // that case.
+          // THE FAST PATH HOPS BUT DOES NOT REPAIR. Posting the repair here
+          // would spend a round trip on a cache hit, which is the thing the
+          // cache exists to make cheap; the traversal posts it instead, and it
+          // is already paying L trips. With no earlier version to read -- the
+          // created half of a split -- this descends, and the traversal
+          // settles that node as it always did.
+          HelpCounters hc;
+          if (!readBeforePending(ops_, node, vec, hc)) {
+            ++stats_.cache_misses;
+            goto descend;
+          }
+          stats_.vec_reads += hc.vec_reads;
           int const idx = findLte(vec, k);
           out.resolved = true;
           if (idx >= 0 && vec.keyAt(idx) == k) {
@@ -201,6 +220,7 @@ class Getter {
     }
 
     // ── 3. Resolve remotely, and teach the cache what we saw ───────────────
+  descend:
     PathStep path[kMaxLayers];
     ++stats_.traversals;
     Traversal<Ops> d(ops_);

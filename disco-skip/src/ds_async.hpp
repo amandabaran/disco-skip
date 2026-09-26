@@ -57,6 +57,7 @@ enum class TraversalStep : uint8_t {
   AwaitHelp,      ///< a helping batch is outstanding
   AwaitHelpStamp, ///< Faa mode only: writing the ts that batch claimed
   AwaitRepair,    ///< an L2 read repair is outstanding
+  AwaitOldVer,    ///< reading the version an in-flight write superseded
   Done,
 };
 
@@ -88,6 +89,10 @@ class TraversalFuture {
     hops_ = 0;
     settle_tries_ = 0;
     repairs_ = 0;
+    // A future is reused across operations, so a hop left armed by a traversal
+    // that failed before consuming it would send the NEXT operation to a
+    // superseded version of an unrelated node.
+    hop_old_ver_ = kNullVec;
     return postHeaders();
   }
 
@@ -100,6 +105,7 @@ class TraversalFuture {
       case TraversalStep::AwaitHelp:    return onHelp();
       case TraversalStep::AwaitHelpStamp: return onHelpStamp();
       case TraversalStep::AwaitRepair:  return onRepair();
+      case TraversalStep::AwaitOldVer:  return onOldVer();
       case TraversalStep::Idle:
       case TraversalStep::Done:
         break;
@@ -128,6 +134,7 @@ class TraversalFuture {
       case TraversalStep::AwaitHelp:    st = "AwaitHelp";    break;
       case TraversalStep::AwaitHelpStamp: st = "AwaitHelpStamp"; break;
       case TraversalStep::AwaitRepair:  st = "AwaitRepair";  break;
+      case TraversalStep::AwaitOldVer:  st = "AwaitOldVer";  break;
       case TraversalStep::Done:         st = "Done";         break;
     }
     return std::string("trav=") + st +
@@ -231,21 +238,59 @@ class TraversalFuture {
       }
     }
     helped_ts_ = false;
-    // A helping batch changes the node, so re-read rather than trusting what we
-    // had. Same as the blocking settleNode's loop.
-    have_vec_ = false;
-    return postHeaders();
+    return afterHelp();
   }
 
   /// The Faa stamp landed. Re-read, as onHelp() would have.
   size_t onHelpStamp() {
     // Result ignored on purpose: a lost CAS means another helper got there.
     (void)ops_.resolveBatch(help_batch_);
+    return afterHelp();
+  }
+
+  /// Where a helping batch returns to.
+  ///
+  /// A data-level read goes to the superseded version and is then DONE with
+  /// this node -- it never re-reads and never loops, which is what removes the
+  /// settle guard from a point read's failure modes. An index level re-reads,
+  /// as the blocking settleNode's loop does, because a helping batch changed
+  /// the node and its entries are what the descent is about to follow.
+  size_t afterHelp() {
+    if (hop_old_ver_ != kNullVec) {
+      VecOffset const off = hop_old_ver_;
+      step_ = TraversalStep::AwaitOldVer;
+      ++res_.round_trips;
+      return ops_.postVec(off);
+    }
     have_vec_ = false;
     return postHeaders();
   }
 
+  /// The superseded version arrived. Answer from it.
+  size_t onOldVer() {
+    if (!ops_.resolveVec(vec_)) return fail(TraversalStatus::ReadFailed);
+    ++res_.vec_reads;
+    hop_old_ver_ = kNullVec;
+    have_vec_ = true;
+    settle_tries_ = 0;
+    return finishAtData();
+  }
+
   // ── The decisions, all borrowed from the blocking path ────────────────────
+
+  /// The data node. Report it, and whether k is actually here.
+  size_t finishAtData() {
+    res_.data_addr = cur_;
+    res_.data_k_min = node_.k_min;
+    int const idx = findLte(vec_, k_);
+    if (idx >= 0 && vec_.keyAt(idx) == k_) {
+      res_.found = true;
+      res_.value = vec_.valAt(idx);
+    }
+    res_.status = TraversalStatus::Ok;
+    step_ = TraversalStep::Done;
+    return 0;
+  }
 
   /// Right-walk or traverse, given whatever we currently hold for `cur_`.
   size_t decide() {
@@ -296,7 +341,24 @@ class TraversalFuture {
     bool const pending = tsIsPending(vec_, ops_.tsMode());
     bool const unstable = !node_.isStable();
     if (pending || unstable) {
-      if (++settle_tries_ > static_cast<uint32_t>(detail::kMaxSettleAttempts)) {
+      // AT THE DATA LEVEL A POINT READ DOES NOT WAIT FOR THE WRITER. It posts
+      // the repair once and then answers from the version the in-flight write
+      // superseded, which orders this read before that write -- legal because
+      // a version is stamped before its writer returns, so an unstamped one
+      // belongs to a writer still in flight. See readBeforePending() in
+      // ds_traverse.hpp for the argument and for why old_ver is never itself
+      // pending.
+      //
+      // The index levels still settle: their entries are routing pointers, and
+      // a descent through a superseded index version has not been shown here
+      // to land somewhere the right-walk can recover from. Narrowing that is
+      // separate work.
+      //
+      // Without an old_ver there is nothing earlier to read -- the created
+      // half of a split -- so that case settles as before.
+      if (at_data_ && vec_.old_ver != kNullVec) {
+        hop_old_ver_ = static_cast<VecOffset>(vec_.old_ver);
+      } else if (++settle_tries_ > static_cast<uint32_t>(detail::kMaxSettleAttempts)) {
         res_.gave_up = TraversalGaveUp::SettleStuck;
         return fail(TraversalStatus::ReadFailed);
       }
@@ -339,19 +401,7 @@ class TraversalFuture {
     }
     settle_tries_ = 0;
 
-    if (at_data_) {
-      // The data node. Report it, and whether k is actually here.
-      res_.data_addr = cur_;
-      res_.data_k_min = node_.k_min;
-      int const idx = findLte(vec_, k_);
-      if (idx >= 0 && vec_.keyAt(idx) == k_) {
-        res_.found = true;
-        res_.value = vec_.valAt(idx);
-      }
-      res_.status = TraversalStatus::Ok;
-      step_ = TraversalStep::Done;
-      return 0;
-    }
+    if (at_data_) return finishAtData();
 
     // An index level. Record what it saw, then step down.
     uint32_t const L = level_;
@@ -386,6 +436,7 @@ class TraversalFuture {
   PathStep *path_ = nullptr;
 
   TraversalStep step_ = TraversalStep::Idle;
+  VecOffset hop_old_ver_ = kNullVec;  ///< superseded version to read, if any
   uint32_t level_ = 0;       ///< the index level being traversed
   bool at_data_ = false;     ///< past level 0: `cur_` is a data node
   RemoteAddr cur_{};
